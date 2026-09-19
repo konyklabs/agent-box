@@ -4,14 +4,22 @@
     "SessionStart": [
       {
         "hooks": [
-          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook SessionStart", "timeout": 10}
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook SessionStart 2>/dev/null || exit 0",
+            "timeout": 10
+          }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook UserPromptSubmit", "timeout": 10}
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook UserPromptSubmit 2>/dev/null || exit 0",
+            "timeout": 10
+          }
         ]
       }
     ]
