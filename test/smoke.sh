@@ -1958,6 +1958,89 @@ fi
 guest tmux kill-session -t '=shell' 2>/dev/null || true
 
 # ---- slot:8g-kind (owner W) ----
+printf -- '\n--- 8g-kind: a session row says which session did the work ---\n'
+#
+# Three sessions, one of each kind: the tmux session of a run, a session with a
+# session directory of its own, and one that is neither. The run and the tracked
+# session are given the SAME status bytes, `exit:0`, so the two vocabularies are
+# genuinely being told apart and not merely echoed: the run reads `done` from the
+# run vocabulary, the session reads `ended` from its own.
+KIND_RUNID=20260102-030405
+KIND_BRANCH=agent/example-kinds-20260102-030405
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${KIND_RUNID}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${KIND_RUNID}","model":"sonnet","branch":"${KIND_BRANCH}","brief":"kinds","started_at":"2026-01-02T03:04:05Z","tmux":"run-${KIND_RUNID}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+s="\$HOME/.agent-box/sessions/kindsess"
+rm -rf "\$s"; mkdir -p "\$s"; chmod 700 "\$s"
+printf 'exit:0\n' > "\$s/status"
+tmux new-session -d -s "run-${KIND_RUNID}" -- sleep 600
+tmux new-session -d -s kindsess -- sleep 600
+tmux new-session -d -s shell -- sleep 600
+sleep 1
+SH
+KINDJ="${TMP_ROOT}/sessions-kind.json"
+"$AGENTBOX" sessions "$CLEAN_REPO" --json > "$KINDJ" 2>&1
+cat "$KINDJ"
+# The vacuity guard: without all three rows every assertion below would pass on
+# an empty selection.
+if jq -e '[.[] | select(.name == "run-'"${KIND_RUNID}"'" or .name == "kindsess" or .name == "shell")] | length == 3' "$KINDJ" >/dev/null 2>&1; then
+    ok "all three planted sessions are listed"
+else
+    bad "the planted sessions are not all listed; the assertions below prove nothing"
+fi
+if jq -e --arg b "$KIND_BRANCH" '[.[] | select(.name == "run-'"${KIND_RUNID}"'")][0] | .kind == "run" and .runid == "'"${KIND_RUNID}"'" and .state == "done" and .produced.branch == $b' "$KINDJ" >/dev/null 2>&1; then
+    ok "the run's session says kind=run, its run id, state=done and the branch it produced"
+else
+    bad "the run's session row is not as documented: $(jq -c '[.[] | select(.name == "run-'"${KIND_RUNID}"'")][0]' "$KINDJ" 2>/dev/null)"
+fi
+if jq -e '[.[] | select(.name == "kindsess")][0] | .kind == "session" and .runid == null and .state == "ended" and .produced == null' "$KINDJ" >/dev/null 2>&1; then
+    ok "the tracked session says kind=session and maps its own exit:0 to ended"
+else
+    bad "the tracked session row is not as documented: $(jq -c '[.[] | select(.name == "kindsess")][0]' "$KINDJ" 2>/dev/null)"
+fi
+if jq -e '[.[] | select(.name == "shell")][0] | .kind == "other" and .state == "unknown" and .runid == null and .produced == null' "$KINDJ" >/dev/null 2>&1; then
+    ok "a session that is neither says kind=other and claims no state"
+else
+    bad "the other row is not as documented: $(jq -c '[.[] | select(.name == "shell")][0]' "$KINDJ" 2>/dev/null)"
+fi
+# raw_state is the shell's working note on the way to the mapping. A consumer
+# that saw it would have two states to choose between, one of them unmapped.
+if jq -e '[.[] | select(has("raw_state"))] | length == 0' "$KINDJ" >/dev/null 2>&1; then
+    ok "no row carries the raw status word onward"
+else
+    bad "a row carries raw_state to the host"
+fi
+KIND_OUT="${TMP_ROOT}/sessions-kind.out"
+"$AGENTBOX" sessions "$CLEAN_REPO" > "$KIND_OUT" 2>&1
+cat "$KIND_OUT"
+if grep -qE '^SESSION +KIND +STATE +AGE +LAST EVENT' "$KIND_OUT"; then
+    ok "the sessions table has the KIND and STATE columns"
+else
+    bad "the sessions table is missing the KIND or STATE column"
+fi
+if grep -qE "^run-${KIND_RUNID} +run +done " "$KIND_OUT"; then
+    ok "the table's run row reads run and done in the new columns"
+else
+    bad "the table's run row does not read run and done"
+fi
+# status --json reports the same rows: one producer, two readers.
+KIND_STATUSJ="${TMP_ROOT}/status-kind.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$KIND_STATUSJ" 2>&1
+if jq -e '[.boxes[0].sessions[] | select(.name == "run-'"${KIND_RUNID}"'")][0] | .kind == "run" and .state == "done"' "$KIND_STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the same kind and state for the run's session"
+else
+    bad "status --json does not carry the run session's kind and state: $(jq -c '.boxes[0].sessions' "$KIND_STATUSJ" 2>/dev/null)"
+fi
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+tmux kill-session -t "=run-${KIND_RUNID}" 2>/dev/null || true
+tmux kill-session -t '=kindsess' 2>/dev/null || true
+tmux kill-session -t '=shell' 2>/dev/null || true
+rm -rf "\$HOME/.agent-box/runs/${KIND_RUNID}" "\$HOME/.agent-box/sessions/kindsess"
+SH
 # ---- end slot:8g-kind ----
 
 # ===========================================================================

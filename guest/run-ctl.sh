@@ -436,6 +436,13 @@ newest_running() {
 # The raw list, as JSON, built by jq so that a session name containing a quote
 # or a brace cannot forge or erase an entry. Printing is somebody else's job:
 # see cmd_sessions.
+#
+# Seven fields per row, because "this box has three tmux sessions" does not say
+# which of them did the work: `kind` and `runid` name the row's owner, `produced`
+# names what a run left behind, and `raw_state` is the status file's own word,
+# mapped to the reported vocabulary by run-format.py. Every one of them arrives
+# through --arg or --argjson: the name is agent-chosen, and the only reason a
+# name full of JSON cannot forge a row is that nothing here concatenates.
 sessions_json() {
     local now raw name created fmt first=1
     now=$(date +%s)
@@ -454,9 +461,16 @@ sessions_json() {
         [ "$first" -eq 1 ] || printf ','
         first=0
         jq -cn --arg name "$name" \
+               --arg kind "$(session_kind "$name")" \
+               --arg runid "$(session_runid "$name")" \
+               --arg raw_state "$(session_raw_state "$name")" \
                --argjson age "$((now - created))" \
                --argjson last "$(last_event_json "$name")" \
-               '{name: $name, age_s: $age, last_event: $last}'
+               --argjson produced "$(session_produced_json "$name")" \
+               '{name: $name, kind: $kind,
+                 runid: (if $runid == "" then null else $runid end),
+                 raw_state: $raw_state, age_s: $age, last_event: $last,
+                 produced: $produced}'
     done <<< "$raw"
     printf ']'
 }
@@ -494,6 +508,74 @@ last_event_json() {
     [ -n "$f" ] && [ -s "$f" ] || { printf 'null'; return 0; }
     out=$(tail -1 "$f" | jq -c '{ts: .ts, event: .event}' 2>/dev/null) || out=""
     [ -n "$out" ] || out="null"
+    printf '%s' "$out"
+}
+
+# Did this session do the work, or does it only share the disk? Three answers,
+# and the same prefix routing session_hooks_file above already does:
+#
+#   run      the session a run started: `run-` and a valid run id, so there is a
+#            run directory with a status, a brief and a branch behind it
+#   session  a name with a session directory of its own under ~/.agent-box —
+#            the standing session, and anything else agent-box itself tracks
+#   other    neither: a shell somebody opened, a devserver the agent started
+#
+# A name is checked before it is used to build a path, and `run-` wins over a
+# session directory of the same name: a run id is the more specific claim.
+session_kind() {
+    local name="${1:?}"
+    case "$name" in
+        run-*)
+            if abx_valid_runid "${name#run-}"; then printf 'run'; return 0; fi ;;
+    esac
+    if abx_valid_session_name "$name" && [ -d "$(abx_session_dir "$name")" ]; then
+        printf 'session'
+        return 0
+    fi
+    printf 'other'
+}
+
+# The run id behind a `run-` session, or nothing at all. Nothing becomes `null`
+# in the row, which is the honest answer for a session that is not a run's.
+session_runid() {
+    local name="${1:?}"
+    case "$name" in
+        run-*) abx_valid_runid "${name#run-}" && printf '%s' "${name#run-}" ;;
+    esac
+    return 0
+}
+
+# The status FILE's word for whichever directory the row names, not a derived
+# state: `running`, `exit:<code>`, `exit:stopped`, `exit:lost` or `unknown`,
+# through abx_status_read, so bytes that are none of those are never echoed.
+#
+# The mapping to what a caller reads lives in run-format.py, in one place for
+# both vocabularies. For a `session` row that raw word is all there is, and it
+# maps to running / ended / unknown. For a `run` row run-format.py reads the run
+# directory itself instead of trusting this, because the two markers that turn
+# an exit code into `stopped` or `waiting` are files beside the status that no
+# single word can carry.
+session_raw_state() {
+    local name="${1:?}" dir
+    case "$(session_kind "$name")" in
+        run)     dir=$(abx_run_dir "${name#run-}") ;;
+        session) dir=$(abx_session_dir "$name") ;;
+        *)       printf 'unknown'; return 0 ;;
+    esac
+    printf '%s' "$(abx_status_read "$dir")"
+}
+
+# What a run produced, which is the branch its work is on: the one fact that
+# tells a finished run apart from a session that merely ran in the same box.
+# `null` for every other kind of row, and always valid JSON, so --argjson
+# cannot lose the whole row to a missing meta.json (the last_event_json rule).
+session_produced_json() {
+    local name="${1:?}" runid out
+    runid=$(session_runid "$name")
+    [ -n "$runid" ] || { printf 'null'; return 0; }
+    out=$(jq -cn --arg b "$(meta_field "$(abx_run_dir "$runid")" branch)" \
+        '{branch: (if $b == "" then null else $b end)}' 2>/dev/null) || out=""
+    [ -n "$out" ] || out='null'
     printf '%s' "$out"
 }
 
