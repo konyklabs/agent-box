@@ -67,7 +67,7 @@ install_file() {
         return 0
     fi
     # 0600: the config directory holds nothing another account needs to read,
-    # and one of these files may hold a governor budget or personal prose.
+    # and one of these files may hold a supervisor budget or personal prose.
     install -m 0600 "$src" "$dest" || die "could not write ${dest}"
     log "copied    ${dest#"$DEST"/}"
 }

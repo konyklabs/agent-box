@@ -138,7 +138,7 @@ plugin_installed() {
 import json, sys
 
 # The CLI reports installed plugins as "<name>@<marketplace>". When the spec
-# names a marketplace, that whole identity must match: a governor installed
+# names a marketplace, that whole identity must match: a supervisor installed
 # from somewhere else is a different plugin wearing the same name, and calling
 # it "already installed" means the guest quietly runs code from a source the
 # operator did not ask for. A bare-name spec has no marketplace to compare, so

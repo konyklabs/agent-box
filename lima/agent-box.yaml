@@ -138,7 +138,8 @@ mounts:
 #   ca.pem               a corporate TLS-intercept root
 #   plugins.txt          marketplaces to register and plugins to install
 #   plugin-dir/<name>/   plugin roots loaded per session with --plugin-dir
-#   claude/              CLAUDE.md, settings.json, governor.json, rules/*.md,
+#   claude/              CLAUDE.md, settings.json, supervisor.json, rules/*.md
+#                        (and governor.json, the pre-2.0 name, still carried),
 #                        copied into the guest's config directory by
 #                        guest/sync-claude-config.sh — an allowlist of names
 #                        with settings.json filtered, not a mirror. What

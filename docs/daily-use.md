@@ -489,7 +489,8 @@ Everything site-specific lives here and nothing of it is ever committed:
     claude/                  files copied into the guest's config directory
       CLAUDE.md
       settings.json
-      governor.json
+      supervisor.json
+      governor.json          legacy: the pre-2.0 name, still carried
       rules/*.md
 ```
 
@@ -506,7 +507,8 @@ Carried over, by name, on every launch:
 |---|---|
 | `claude/CLAUDE.md` | `$CLAUDE_CONFIG_DIR/CLAUDE.md` — your standing instructions |
 | `claude/settings.json` | user settings for the guest CLI, **filtered** — see below |
-| `claude/governor.json` | governor configuration, if you use that plugin |
+| `claude/supervisor.json` | supervisor configuration, if you use that plugin |
+| `claude/governor.json` | the pre-2.0 name, still carried, with a nag |
 | `claude/rules/*.md` | `$CLAUDE_CONFIG_DIR/rules/` |
 
 `rules/` is the one directory the sync owns outright, so it is the one place a
