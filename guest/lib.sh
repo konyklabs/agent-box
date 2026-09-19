@@ -47,11 +47,28 @@ ABX_WORK_DIR="${AGENT_BOX_WORK:-/work}"
 # stream is the model's own output, and /work is the host's disk: a transcript
 # written there would land in the host's filesystem and its backups. Only the
 # scrubbed summary crosses.
+#
+# Two things on the mount are stated exceptions, because they exist to be read
+# on the other side: `learnings.md`, and the channel under
+# `<repo>/.agent-box/channel/`. Both are written by a sanctioned path that
+# scrubs the bytes on the way in, so what lands on the host's disk has already
+# been through the redaction this file's scrubber performs. Nothing else the
+# model produces goes there.
 
 ABX_STATE_DIR="${ABX_STATE_DIR:-${HOME}/.agent-box}"
 ABX_RUNS_DIR="${ABX_RUNS_DIR:-${ABX_STATE_DIR}/runs}"
 ABX_SESSIONS_DIR="${ABX_SESSIONS_DIR:-${ABX_STATE_DIR}/sessions}"
 ABX_BRIEFS_DIR="${ABX_BRIEFS_DIR:-${ABX_STATE_DIR}/briefs}"
+
+# The channel's two directories live under the mount; see the exception above.
+# The standing interactive session has a fixed name, so the host can address it
+# without being told which session is the one that receives requests.
+ABX_CHANNEL_DIR="${ABX_WORK_DIR}/.agent-box/channel"
+# Not overridable from the environment, unlike the paths above: the host
+# addresses this session by name, and a name the guest could change is a name
+# the host cannot rely on.
+# shellcheck disable=SC2034  # read by claude-session.sh and channel.sh, which source this file.
+ABX_STANDING_SESSION="claude"
 
 # The hooks block that turns tool activity into hooks.jsonl. Passed with
 # --settings, which merges rather than replaces, so nothing the operator
@@ -60,7 +77,13 @@ ABX_HOOK_SETTINGS="${ABX_HOOK_SETTINGS:-/opt/agent-box/guest/hooks.settings.json
 
 # The native installer puts claude in ~/.local/bin, which a non-login shell
 # does not pick up. `limactl shell <inst> -- <script>` is such a shell.
-export PATH="${HOME}/.local/bin:${PATH}"
+#
+# The checkout's own `guest/bin` comes next, so `abx` and `toolcheck` are on the
+# path of every run and every session in every existing box without a
+# provisioner edit — the mount is the checkout, so an upgrade of the host
+# checkout is the upgrade. `/opt/npm-global/bin` carries the toolchain's
+# node-installed tools, and is harmless on a box that has none.
+export PATH="${HOME}/.local/bin:/opt/agent-box/guest/bin:/opt/npm-global/bin:${PATH}"
 
 if ! declare -F die >/dev/null 2>&1; then
     printf 'lib.sh: the sourcing script must define die() before sourcing this file\n' >&2
@@ -180,6 +203,28 @@ abx_assert_environment() {
             *)    die "the egress firewall is not active; refusing to run an agent with unrestricted network" ;;
         esac
     fi
+}
+
+# ---------------------------------------------------------------------------
+# The toolchain report
+# ---------------------------------------------------------------------------
+#
+# Where this repository pins a tool at a version this box does not have. Text,
+# for a caller that is about to start work: agent-run.sh puts it in front of the
+# brief, claude-session.sh prints it before the CLI takes over.
+#
+# Warn-only by contract — a toolchain finding never blocks a run, see
+# docs/decisions.md. So every failure path here is silence: a box whose
+# toolcheck script is missing or not executable is a box from before the
+# toolchain existed, and nothing about that is worth a message in front of every
+# brief. Capped, because the findings come from scanning /work, which is the
+# host's disk and its contents are the untrusted half of this design.
+abx_toolchain_report() {
+    local script="${ABX_LIB_DIR:-/opt/agent-box/guest}/toolcheck.sh" out=""
+    [ -x "$script" ] || return 0
+    out=$("$script" --project-only --findings-only 2>/dev/null | head -60) || true
+    [ -n "$out" ] || return 0
+    printf '%s\n' "$out"
 }
 
 # ---------------------------------------------------------------------------
@@ -341,6 +386,52 @@ abx_valid_session_name() {
     esac
 }
 
+# A channel message id: the writer's UTC second plus a two-digit sequence,
+# `YYYYMMDD-HHMMSS-NN`. The same shape three implementations check — valid_msgid
+# in bin/agentbox and MSGID_RE in run-format.py are the other two — because the
+# id is a file name on a shared mount and either side may have written it.
+abx_valid_msgid() {
+    case "${1:-}" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# A git branch name, as strictly as this project needs it: the shape that may
+# appear in a message header or be handed to `git rev-parse`. First character
+# alphanumeric, then the ordinary branch alphabet, no `..` (a revision range),
+# no `//`, no trailing `/` or `.lock` (git's own refusals), 200 characters.
+#
+# It is a shape test and nothing more: that a branch exists is `git rev-parse`'s
+# answer, not this function's.
+abx_valid_branch() {
+    local b="${1:-}"
+    [ -n "$b" ] || return 1
+    [ "${#b}" -le 200 ] || return 1
+    case "$b" in
+        [!A-Za-z0-9]*)      return 1 ;;
+        *[!A-Za-z0-9._/-]*) return 1 ;;
+        *..*|*//*|*/)       return 1 ;;
+        *.lock)             return 1 ;;
+    esac
+    return 0
+}
+
+# `tcp:<port>` or `udp:<port>`, and nothing else. A port reference is built in
+# the guest from /proc's hex, so it cannot arrive carrying anything else — and
+# it is checked anyway, because it crosses to the host, where it is printed.
+#
+# Digits only: a caller that needs a number uses $((10#$port)), so a leading
+# zero cannot be read as octal.
+abx_valid_port_ref() {
+    local ref="${1:-}" port
+    case "$ref" in tcp:*|udp:*) ;; *) return 1 ;; esac
+    port="${ref#*:}"
+    case "$port" in ''|*[!0-9]*) return 1 ;; esac
+    [ "${#port}" -le 5 ] || return 1
+    return 0
+}
+
 abx_run_dir() {
     abx_valid_runid "${1:?}" || die "not a run id: ${1}"
     printf '%s/%s' "$ABX_RUNS_DIR" "$1"
@@ -349,6 +440,26 @@ abx_run_dir() {
 abx_session_dir() {
     abx_valid_session_name "${1:?}" || die "not a session name: ${1}"
     printf '%s/%s' "$ABX_SESSIONS_DIR" "$1"
+}
+
+# Is the session of that name actually running? `sessions/NAME/pid` plus the
+# cmdline of that pid, and both halves are needed: the pid file survives a hard
+# VM stop, and after a reboot that number is somebody else's process. A pid that
+# is alive but is not a claude-session.sh reads as dead, which is the truth about
+# the session.
+#
+# Returns non-zero rather than dying for a name that is not a session name: the
+# callers ask about a name they were given (the host, a settings file) and the
+# answer to "is that session alive" for a name that cannot exist is no.
+abx_session_alive() {
+    local name="${1:-}" dir pid
+    abx_valid_session_name "$name" || return 1
+    dir="${ABX_SESSIONS_DIR}/${name}"
+    [ -f "${dir}/pid" ] || return 1
+    pid=$(head -1 "${dir}/pid" 2>/dev/null)
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/${pid}/cmdline" ] || return 1
+    tr '\0' ' ' < "/proc/${pid}/cmdline" 2>/dev/null | grep -qF 'claude-session.sh'
 }
 
 # `running`, then `exit:<code>` or `exit:stopped`. Written whole, never
@@ -360,6 +471,9 @@ abx_status_write() {
     chmod 600 "${d}/status" 2>/dev/null || true
 }
 
+# The FILE's vocabulary. Derived state is wider — see bin/agentbox:valid_run_state
+# and run-ctl.sh:derived_state.
+#
 # The five shapes a status may have, and nothing else.
 #
 # The status file is an ordinary file in the guest user's home and the agent
@@ -402,4 +516,167 @@ abx_claude_supports_flag() {
     local flag="${1:?}"
     command -v claude >/dev/null 2>&1 || return 1
     claude --help 2>/dev/null | grep -q -- "$flag"
+}
+
+# ---------------------------------------------------------------------------
+# The mounted repository
+# ---------------------------------------------------------------------------
+
+# Keep the box's own bookkeeping out of the repository's tracked files, by way of
+# the one exclude file that is not committed. Every caller that is about to write
+# under `<repo>/.agent-box/` calls this first — a run, a session, the channel —
+# because a box where only `agentbox session` was ever used otherwise shows the
+# directory as untracked in the repository the host is about to commit from.
+#
+# A directory that is not a git repository is left completely alone: no mkdir, no
+# touch, exit 0. The guard is `git rev-parse --git-dir` answering, not the
+# presence of a `.git` entry, so a worktree (whose `.git` is a file) is handled
+# and a plain directory is not written into. That matters because this is the
+# host's disk: creating `info/exclude` in something that is not a repository
+# leaves litter in the operator's tree.
+abx_exclude_state_dir() {
+    local dir="${1:-$ABX_WORK_DIR}" git_dir=""
+    git_dir=$(git -C "$dir" rev-parse --git-dir 2>/dev/null) || return 0
+    [ -n "$git_dir" ] || return 0
+    case "$git_dir" in /*) ;; *) git_dir="${dir}/${git_dir}" ;; esac
+    mkdir -p "${git_dir}/info" 2>/dev/null || return 0
+    touch "${git_dir}/info/exclude" 2>/dev/null || return 0
+    grep -qxF '/.agent-box/' "${git_dir}/info/exclude" 2>/dev/null \
+        || printf '/.agent-box/\n' >> "${git_dir}/info/exclude"
+    return 0
+}
+
+# The channel's directories, created if they are not there and refused if they
+# are anything but a directory this side may write into.
+#
+# The containment is hook-event.sh's: every level is checked for being a symlink
+# before it is used, because each one is on a mount the host also writes to and a
+# symlink there would redirect a message — or a reservation — outside the tree
+# both sides agreed on. The check is worth doing in the guest even though the
+# host has its own: a link planted inside the box resolves inside the box.
+#
+# Never as root. root creating these would leave the guest user unable to publish
+# into its own mailbox, and the failure would arrive later, in a hook, where it
+# is hardest to read.
+abx_channel_dirs() {
+    local d
+    [ "$(id -u)" -ne 0 ] || return 1
+    for d in "${ABX_WORK_DIR}/.agent-box" "$ABX_CHANNEL_DIR" \
+             "${ABX_CHANNEL_DIR}/to-host" "${ABX_CHANNEL_DIR}/to-box"; do
+        [ ! -L "$d" ] || return 1
+        if [ -e "$d" ]; then
+            [ -d "$d" ] || return 1
+            continue
+        fi
+        # 700 by umask rather than a chmod afterwards: between the two there is a
+        # moment when the directory is group- and world-readable.
+        ( umask 077; mkdir "$d" 2>/dev/null ) || return 1
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Processes and sockets
+# ---------------------------------------------------------------------------
+
+# Depth-first pid list under a root pid, children before parents.
+abx_descendants_deepest_first() {
+    local root="${1:?}" child
+    # shellcheck disable=SC2046  # one pid per line is exactly what is wanted.
+    for child in $(pgrep -P "$root" 2>/dev/null); do
+        abx_descendants_deepest_first "$child"
+    done
+    printf '%s\n' "$root"
+}
+
+# When a process started, in clock ticks since boot — /proc/PID/stat field 22.
+# Digits, or nothing at all.
+#
+# It is read the long way round because field 2 is the executable's name in
+# parentheses and the name is chosen by whoever started the process: a program
+# called `x) R 1 1 1` would otherwise shift every field after it. Stripping
+# through the LAST `)` cannot be fooled that way, since the name is the only
+# parenthesised field and nothing after it contains one.
+#
+# What it is for: a pid alone does not identify a process. A pid recorded during
+# a run and the pid of that number after the run are the same number and may be
+# different processes, so a sweep compares the start time as well.
+abx_proc_starttime() {
+    local pid="${1:-}" raw rest tick
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/${pid}/stat" ] || return 1
+    raw=$(head -1 "/proc/${pid}/stat" 2>/dev/null) || return 1
+    rest="${raw##*\)}"
+    # shellcheck disable=SC2086  # deliberate splitting: stat's fields are single words.
+    set -- $rest
+    # Field 22 of the line is field 20 of what follows the name.
+    tick="${20:-}"
+    case "$tick" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s\n' "$tick"
+    return 0
+}
+
+# Every bound socket in this box: `<tcp|udp> <port> <loopback|any|other> <inode>`,
+# one per line.
+#
+# From /proc, because `ss`, `lsof` and `netstat` are in no package this project
+# installs and adding one would reopen a box's provisioning network window for a
+# listing. /proc/net/tcp and tcp6 are filtered to state 0A (LISTEN); every row of
+# udp and udp6 is a bound socket. The inode is what maps a socket to a process,
+# by walking /proc/<pid>/fd for a bounded set of candidate pids — that walk is
+# the caller's, because who the candidates are is the caller's question.
+#
+# The hex is decoded with $((16#…)) in the shell rather than in awk: mawk, which
+# is what a Debian guest has, has no strtonum.
+abx_listeners() {
+    local f proto laddr state inode hexaddr hexport port scope v4
+    for f in /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6; do
+        [ -r "$f" ] || continue
+        case "$f" in *udp*) proto=udp ;; *) proto=tcp ;; esac
+        # Fields: 1 sl, 2 local_address, 4 st, 10 inode. The header line is
+        # skipped by the shape tests below, like any other line that does not
+        # parse — nothing here trusts the file's layout without checking it.
+        while read -r _ laddr _ state _ _ _ _ _ inode _; do
+            if [ "$proto" = tcp ] && [ "$state" != "0A" ]; then
+                continue
+            fi
+            case "$laddr" in *:*) ;; *) continue ;; esac
+            hexaddr="${laddr%:*}"
+            hexport="${laddr##*:}"
+            case "$hexaddr" in ''|*[!0-9A-Fa-f]*) continue ;; esac
+            case "$hexport" in
+                [0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]) ;;
+                *) continue ;;
+            esac
+            case "$inode" in ''|*[!0-9]*) continue ;; esac
+            port=$((16#$hexport))
+            # Port 0 is a socket in the middle of being set up, not a listener.
+            [ "$port" -gt 0 ] || continue
+
+            # Each 32-bit word is printed host-endian, so 127.0.0.1 reads
+            # `0100007F` and the first octet is the word's LAST byte. Only the
+            # two IPv6 addresses that mean something here are named; a real IPv6
+            # address is `other`, which is what it is.
+            scope=other
+            v4=""
+            case "${#hexaddr}" in
+                8) v4="$hexaddr" ;;
+                32)
+                    case "$hexaddr" in
+                        # ::ffff:a.b.c.d — the IPv4 half is the last word.
+                        0000000000000000[Ff][Ff][Ff][Ff]0000*) v4="${hexaddr:24:8}" ;;
+                        00000000000000000000000000000000)      scope=any ;;
+                        00000000000000000000000001000000)      scope=loopback ;;
+                    esac ;;
+            esac
+            if [ -n "$v4" ]; then
+                if [ "$((16#$v4))" -eq 0 ]; then
+                    scope=any
+                elif [ "$((16#${v4:6:2}))" -eq 127 ]; then
+                    scope=loopback
+                fi
+            fi
+            printf '%s %s %s %s\n' "$proto" "$port" "$scope" "$inode"
+        done < "$f"
+    done
 }
