@@ -2148,7 +2148,557 @@ EOF
 # Which box can be paused or removed, and what exists only inside each one. The
 # second half is the one that matters: a box holding work that is nowhere else is
 # a box nothing may stop, whatever the memory pressure says.
-cmd_triage() { die "triage: not built in this checkout"; }
+#
+# Two passes over the same cheap host data — one to total the fleet and decide
+# what is scarce, one to print a row per box — and ONE `limactl shell` per
+# RUNNING box. Nothing loops and there is no `--watch`: this costs strictly more
+# per box than `status`, which already refuses a watch across boxes nobody named.
+#
+# The division of labour is the one the security boundary forces. The verdict
+# needs the run state, which is a guest fact, so the guest computes the verdict
+# for a running box and the host splices the finished object without reading a
+# field of it. The host's own facts (a one-word scarcity and a few counts) go IN
+# as arguments. A STOPPED box's object is built here instead, entirely from host
+# state — which is what the watermark exists for.
+
+# The instances, with everything the fleet report needs: name|status|repo|cpus|
+# memory|disk|dir. A SECOND function rather than a wider `list_boxes`, because
+# three callers read that one's three fields and `render_status`'s here-document
+# must not move.
+list_boxes_wide() {
+    local only="${1:-}" names
+    names=$("$LIMACTL" list --quiet 2>/dev/null | grep '^agent-box-' || true)
+    if [ -n "$only" ]; then
+        names=$(printf '%s\n' "$names" | grep -xF "$only" || true)
+    fi
+    [ -n "$names" ] || return 0
+    # shellcheck disable=SC2086  # one instance name per word is the point.
+    "$LIMACTL" list $names \
+        --format '{{.Name}}|{{.Status}}|{{(index .Config.Mounts 0).Location}}|{{.CPUs}}|{{.Memory}}|{{.Disk}}|{{.Dir}}' \
+        2>/dev/null
+}
+
+# What a box really occupies on this disk, in bytes, or nothing.
+#
+# `du -sk`, never `{{.Disk}}`: measured on this host, a box's disk image reads
+# 5655472 KiB allocated against an apparent size of the configured 32212254720
+# bytes. Reporting the configured size as the footprint would say every box costs
+# the same and that four 40GiB boxes had filled a 340GiB disk.
+dir_footprint_bytes() {
+    local dir="${1:-}" kib
+    [ -n "$dir" ] && [ -d "$dir" ] || return 0
+    kib=$(du -sk "$dir" 2>/dev/null | awk 'NR==1{print $1}')
+    case "$kib" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$((kib * 1024))"
+}
+
+# `-P` because a long device name wraps the default output onto two lines, and
+# field 4 of line 2 is then a mount point rather than a number.
+host_disk_free_bytes() {
+    local dir="${1:-}" kib
+    [ -n "$dir" ] || return 0
+    kib=$(df -Pk "$dir" 2>/dev/null | awk 'NR==2{print $4}')
+    case "$kib" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$((kib * 1024))"
+}
+
+# The Mac's own memory and cpus, with the Linux forms behind them: the CLI runs
+# on macOS today and nothing here needs it to stay that way.
+host_memory_bytes() {
+    local v=""
+    v=$(sysctl -n hw.memsize 2>/dev/null) || v=""
+    case "$v" in
+        ''|*[!0-9]*)
+            v=$(awk '/^MemTotal:/{print $2 * 1024; exit}' /proc/meminfo 2>/dev/null) || v="" ;;
+    esac
+    case "$v" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$v"
+}
+
+host_cpus() {
+    local v=""
+    v=$(sysctl -n hw.ncpu 2>/dev/null) || v=""
+    case "$v" in
+        ''|*[!0-9]*) v=$(nproc 2>/dev/null) || v="" ;;
+    esac
+    case "$v" in ''|*[!0-9]*) return 0 ;; esac
+    printf '%s' "$v"
+}
+
+# A Lima size field to bytes. `{{.Memory}}` and `{{.Disk}}` print a byte count on
+# limactl 2.2.0 (UNVERIFIED — nobody ran it for this slice), so both shapes are
+# accepted and anything else is reported as null rather than guessed at. A bare
+# number here is BYTES, unlike `normalise_size`, whose input is what a person
+# typed after `--disk` and means GiB.
+size_to_bytes() {
+    local v="${1:-}" n unit=""
+    case "$v" in
+        ''|*[!0-9KMGTiB]*) return 0 ;;
+        *[0-9]) printf '%s' "$v"; return 0 ;;
+    esac
+    n="${v%%[KMGT]*}"
+    unit="${v#"$n"}"
+    case "$n" in ''|*[!0-9]*) return 0 ;; esac
+    case "$unit" in
+        K|KiB|KB) printf '%s' "$((n * 1024))" ;;
+        M|MiB|MB) printf '%s' "$((n * 1024 * 1024))" ;;
+        G|GiB|GB) printf '%s' "$((n * 1024 * 1024 * 1024))" ;;
+        T|TiB|TB) printf '%s' "$((n * 1024 * 1024 * 1024 * 1024))" ;;
+        *) return 0 ;;
+    esac
+}
+
+# A JSON number, or the literal null. Every number printed by this command goes
+# through it, so a reading that failed is `null` and never `0` — the two mean
+# different things and an operator acts differently on each.
+json_num() {
+    case "${1:-}" in
+        ''|*[!0-9]*) printf 'null' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# Bytes as a short human string, in integer arithmetic so the text output needs
+# nothing but bash: `1.1G`, `412M`, `0B`, or `?` when the reading failed.
+human_bytes() {
+    local n="${1:-}" tenths
+    case "$n" in ''|*[!0-9]*) printf '?'; return 0 ;; esac
+    # A tebibyte tier, because `--disk 1TiB` parses and a footer reading
+    # "1024G free" is a footer somebody has to do arithmetic on.
+    if [ "$n" -ge 1099511627776 ]; then
+        tenths=$(((n * 10 + 549755813888) / 1099511627776))
+        if [ "$tenths" -ge 100 ]; then
+            printf '%dT' "$((tenths / 10))"
+        else
+            printf '%d.%dT' "$((tenths / 10))" "$((tenths % 10))"
+        fi
+    elif [ "$n" -ge 1073741824 ]; then
+        tenths=$(((n * 10 + 536870912) / 1073741824))
+        if [ "$tenths" -ge 100 ]; then
+            printf '%dG' "$((tenths / 10))"
+        else
+            printf '%d.%dG' "$((tenths / 10))" "$((tenths % 10))"
+        fi
+    elif [ "$n" -ge 1048576 ]; then
+        printf '%dM' "$(((n + 524288) / 1048576))"
+    elif [ "$n" -ge 1024 ]; then
+        printf '%dK' "$(((n + 512) / 1024))"
+    else
+        printf '%dB' "$n"
+    fi
+}
+
+# Commits on `agent/*` branches that are on no remote, as the `unexported`
+# object, plus their total in REPO_UNEXPORTED_TOTAL for the guest call. Two
+# globals rather than two return values, the way `split_args` does it.
+#
+# These commits are NOT box-only and the text never says they are: `/work` IS
+# this directory, so a destroy leaves every one of them where it is. They are a
+# reason to finish the work, not a reason to keep a VM — the one operator
+# misunderstanding this command exists to prevent.
+#
+# Host git on a host directory, but through `repo_git`: the repository is mounted
+# writable into a box that can rewrite `.git/config`, so `core.fsmonitor`,
+# `core.hooksPath` and `pager.<verb>` are all closed even for the three read-only
+# verbs used here. At most 20 branches are examined, because `rev-list` per
+# branch is the one unbounded cost in this command.
+REPO_UNEXPORTED_JSON='{"known":false,"branches":[]}'
+REPO_UNEXPORTED_TOTAL=0
+repo_unexported() {
+    local repo="${1:-}" b n rows="" first=1 seen=0
+    REPO_UNEXPORTED_JSON='{"known":false,"branches":[]}'
+    REPO_UNEXPORTED_TOTAL=0
+    [ -n "$repo" ] && [ -d "$repo" ] || return 0
+    repo_git "$repo" rev-parse --git-dir >/dev/null 2>&1 || return 0
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        [ "$seen" -lt 20 ] || break
+        seen=$((seen + 1))
+        n=$(repo_git "$repo" rev-list --count "$b" --not --remotes 2>/dev/null | tr -d '\r\n') || n=""
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -gt 0 ] || continue
+        [ "$first" -eq 1 ] || rows="${rows},"
+        first=0
+        # A branch name is chosen by the agent, so it is clipped and escaped even
+        # though it came off this host's own disk.
+        rows="${rows}{\"name\":$(json_str "$(host_clip "$b" 120)"),\"commits\":${n}}"
+        REPO_UNEXPORTED_TOTAL=$((REPO_UNEXPORTED_TOTAL + n))
+    done <<EOF
+$(repo_git "$repo" for-each-ref --format='%(refname:short)' refs/heads/agent 2>/dev/null || true)
+EOF
+    REPO_UNEXPORTED_JSON="{\"known\":true,\"branches\":[${rows}]}"
+}
+
+# ok | missing | not-git, for the guest's reason codes. One word, never a path.
+repo_state_word() {
+    local repo="${1:-}"
+    if [ -z "$repo" ] || [ ! -d "$repo" ]; then printf 'missing'; return 0; fi
+    if repo_git "$repo" rev-parse --git-dir >/dev/null 2>&1; then
+        printf 'ok'
+    else
+        printf 'not-git'
+    fi
+}
+
+# The bench, as the `bench` object and as the guest's one-word `--bench`.
+# `present` is whether the recorded directory is there; `stale` is whether its
+# checkout sits on a different commit from the branch it was made for, which is
+# the cheap honest question — null when either side cannot be read. The bench is
+# outside every mount, so nothing in it is guest-written; `repo_git` is used on
+# it anyway, for uniformity.
+BENCH_JSON='{"present":false,"stale":null}'
+BENCH_WORD="no"
+bench_facts() {
+    local inst="${1:?}" repo="${2:-}" bench branch here there
+    BENCH_JSON='{"present":false,"stale":null}'
+    BENCH_WORD="no"
+    bench=$(read_instance_meta_raw "$inst" bench 2>/dev/null || true)
+    [ -n "$bench" ] && [ -d "$bench" ] || return 0
+    BENCH_JSON='{"present":true,"stale":null}'
+    BENCH_WORD="yes"
+    branch=$(read_instance_meta_raw "$inst" bench_branch 2>/dev/null || true)
+    [ -n "$branch" ] && [ -n "$repo" ] && [ -d "$repo" ] || return 0
+    here=$(repo_git "$bench" rev-parse --verify --quiet HEAD 2>/dev/null || true)
+    there=$(repo_git "$repo" rev-parse --verify --quiet "refs/heads/${branch}" 2>/dev/null || true)
+    [ -n "$here" ] && [ -n "$there" ] || return 0
+    if [ "$here" = "$there" ]; then
+        BENCH_JSON='{"present":true,"stale":false}'
+    else
+        BENCH_JSON='{"present":true,"stale":true}'
+        BENCH_WORD="stale"
+    fi
+}
+
+# One count out of the channel's own host-computed counts object, or 0.
+#
+# Host-written JSON read by the host, so this is not the guest boundary; it is
+# still read by a pattern that can only yield digits, because the channel slice
+# owns that object's shape and this command must not break when it grows a key.
+# A checkout whose channel is not built prints `null`, and every count is 0.
+channel_count_of() {
+    local key="${1:?}" json="${2:-}" v
+    v=$(printf '%s' "$json" \
+        | sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\([0-9]\{1,9\}\).*/\1/p" | head -1)
+    case "$v" in ''|*[!0-9]*) printf '0' ;; *) printf '%s' "$v" ;; esac
+}
+
+# The watermark: the ONE thing the host reads back out of a triage call.
+#
+# `boxonly=yes|no bytes=<digits>` and nothing else is accepted — a `case` into
+# host literals for the word, digits for the number, twenty digits at most. A box
+# can write whatever it likes on that line; what it cannot do is put anything but
+# `yes`, `no` or a number into this host's record, and neither value is ever
+# executed, compared with `-eq`, or echoed back when it was refused. The reading
+# is the host's clock, not the guest's.
+#
+# Three keys in ONE read-modify-write, under the lock. Three separate writes are
+# three full rewrites of a file a concurrent `keepalive on` or `egress` is also
+# rewriting, and the key most likely to disappear is `keepalive=on` — after which
+# the watchdog silently stops restarting that box and nothing says why.
+record_boxonly_watermark() {
+    local inst="${1:?}" line="${2:-}" word="" digits=""
+    case "$line" in
+        "boxonly=yes bytes="*) word="yes"; digits="${line#boxonly=yes bytes=}" ;;
+        "boxonly=no bytes="*)  word="no";  digits="${line#boxonly=no bytes=}" ;;
+        *) return 0 ;;
+    esac
+    case "$digits" in ''|*[!0-9]*) return 0 ;; esac
+    [ "${#digits}" -le 20 ] || return 0
+    write_instance_meta_multi "$inst" \
+        "boxonly=${word}" \
+        "boxonly_bytes=${digits}" \
+        "boxonly_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+cmd_triage() {
+    local as_json=0 only="" opt
+    split_args "" "$@"
+    check_operands 0 1 "triage [repo|name] [--json]"
+    for opt in ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}; do
+        case "$opt" in
+            --json) as_json=1 ;;
+            *) die "unknown option: ${opt} (usage: ${PROG} triage [repo|name] [--json])" ;;
+        esac
+    done
+    if [ "${#ABX_POSV[@]}" -gt 0 ]; then
+        only=$(instance_name "$(operand 0)")
+    fi
+    # Before anything reaches for the fleet: a host with no Lima at all is told
+    # that, rather than being told it has no boxes.
+    require_limactl
+    render_triage "$as_json" "$only"
+}
+
+render_triage() {
+    local as_json="$1" only="${2:-}"
+    local name state repo cpus memory disk dir
+    local committed=0 total_fp=0 largest=0 partial=0 boxes=0 running=0
+    local lima_dir="" fp_map="|" mb db fp
+    local disk_free mem_total cpus_host scarce="none" scarce_note="" sd=0 sc=0
+
+    # Pass one: every box on the host, whatever was named, because scarcity is a
+    # property of the Mac and not of the box somebody asked about.
+    while IFS='|' read -r name state repo cpus memory disk dir; do
+        [ -n "$name" ] || continue
+        boxes=$((boxes + 1))
+        if [ -z "$lima_dir" ] && [ -n "$dir" ]; then
+            lima_dir=$(dirname "$dir")
+        fi
+        mb=$(size_to_bytes "$memory")
+        db=$(size_to_bytes "$disk")
+        fp=$(dir_footprint_bytes "$dir")
+        fp_map="${fp_map}${name}=${fp}|"
+        if [ -n "$fp" ]; then
+            total_fp=$((total_fp + fp))
+        else
+            partial=1
+        fi
+        if [ -n "$db" ] && [ "$db" -gt "$largest" ]; then
+            largest="$db"
+        fi
+        if [ "$state" = "Running" ]; then
+            running=$((running + 1))
+            if [ -n "$mb" ]; then committed=$((committed + mb)); fi
+        fi
+    done <<EOF
+$(list_boxes_wide)
+EOF
+
+    [ -n "$lima_dir" ] || lima_dir="${LIMA_HOME:-${HOME}/.lima}"
+    disk_free=$(host_disk_free_bytes "$lima_dir")
+    mem_total=$(host_memory_bytes)
+    cpus_host=$(host_cpus)
+
+    # The two derived lines, each printed with the numbers it came from so the
+    # operator can disagree with the verdict:
+    #   disk     you could not create another box of the largest size you use
+    #   compute  the Mac has promised the VMs more memory than it has
+    # UNVERIFIED: whether `vz` commits that memory up front or grows into it. The
+    # line is therefore about commitment, never about measured residency.
+    if [ -n "$disk_free" ] && [ "$largest" -gt 0 ] && [ "$disk_free" -lt "$largest" ]; then sd=1; fi
+    if [ -n "$mem_total" ] && [ "$committed" -gt 0 ] && [ "$committed" -ge "$mem_total" ]; then sc=1; fi
+    if [ -z "$mem_total" ]; then
+        scarce_note="this Mac's memory could not be read, so compute pressure is not judged"
+    fi
+    if [ "$sd" -eq 1 ] && [ "$sc" -eq 1 ]; then
+        scarce="both"
+    elif [ "$sd" -eq 1 ]; then
+        scarce="disk"
+    elif [ "$sc" -eq 1 ]; then
+        scarce="compute"
+    fi
+
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"generated_at":%s,"scarce":%s,"host":{"platform":%s,"cpus":%s,"memory_bytes":%s,"lima_dir":%s,"disk_free_bytes":%s,"memory_committed_bytes":%s,"disk_footprint_bytes":%s,"largest_configured_disk_bytes":%s},"boxes":[' \
+            "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+            "$(json_str "$scarce")" \
+            "$(json_str "$(uname -s | tr '[:upper:]' '[:lower:]')")" \
+            "$(json_num "$cpus_host")" \
+            "$(json_num "$mem_total")" \
+            "$(json_str "$lima_dir")" \
+            "$(json_num "$disk_free")" \
+            "$(json_num "$committed")" \
+            "$(json_num "$total_fp")" \
+            "$(json_num "$largest")"
+    else
+        printf '%-30s %-9s %-10s %-10s %-7s %-9s %s\n' \
+            'BOX' 'VM' 'FOOTPRINT' 'VERDICT' 'ACTION' 'BOX-ONLY' 'WHY'
+    fi
+
+    # Pass two: one row per box, one `limactl shell` per RUNNING box. The guest
+    # call is inside the loop, which is safe only because `guest_shell` redirects
+    # its stdin from /dev/null: `limactl shell` is ssh, ssh reads its own stdin,
+    # and a call in here without that would eat the rest of the box list and drop
+    # every box after the first (smoke step 9f exists for that bug).
+    local first=1 state_lc guest obj wmline fragment
+    local repo_word handoffs requests counts verdict action reasons boxonly_col why
+    local wm wm_at wm_when as_of_json keepalive egress
+    local -a gargs=()
+    while IFS='|' read -r name state repo cpus memory disk dir; do
+        [ -n "$name" ] || continue
+        state_lc=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
+        # The footprint pass one measured, looked up rather than measured again.
+        # Quoted inside the expansion, or an instance name with a glob character
+        # in it would be matched as a pattern.
+        fp="${fp_map#*|"${name}"=}"
+        fp="${fp%%|*}"
+
+        repo_unexported "$repo"
+        repo_word=$(repo_state_word "$repo")
+        bench_facts "$name" "$repo"
+        counts=$(channel_counts_json "$repo" "$name" 2>/dev/null || true)
+        handoffs=$(channel_count_of to_host_unread "$counts")
+        requests=$(channel_count_of to_box_queued "$counts")
+
+        obj=""
+        fragment=""
+        if [ "$state" = "Running" ]; then
+            gargs=(--scarce "$scarce" --repo "$repo_word" --bench "$BENCH_WORD"
+                   --unexported-commits "$REPO_UNEXPORTED_TOTAL"
+                   --handoffs-unread "$handoffs" --requests-queued "$requests")
+            [ "$as_json" -eq 1 ] || gargs+=(--text)
+            guest=$(guest_shell "$name" "${GUEST_BIN}/box-triage.sh" "${gargs[@]}" 2>/dev/null) || guest=""
+            # Line 1 is the answer, line 2 the watermark, and the watermark is the
+            # only line whose content this host looks at.
+            obj=$(printf '%s\n' "$guest" | sed -n '1p')
+            wmline=$(printf '%s\n' "$guest" | sed -n '2p')
+            record_boxonly_watermark "$name" "$wmline"
+
+            # A running box that did not answer is `unknown`/`ask`/`box-silent`,
+            # with every key present. It is never dropped from the listing: a box
+            # must not disappear because the thing that describes it failed.
+            if [ "$as_json" -eq 1 ]; then
+                case "$obj" in
+                    \{\}) obj="" ;;
+                    \{*\}) ;;
+                    *) obj="" ;;
+                esac
+                [ -n "$obj" ] || obj='{"verdict":"unknown","action":"ask","reasons":[{"code":"box-silent","text":"the box did not answer the triage call"}],"box_only":{"known":false,"as_of":null,"state_bytes":null,"claude_state_bytes":null,"transcripts":null,"docker_images":null,"docker_volumes":null,"guest_repos":null},"dirty_files":null}'
+            else
+                fragment="$obj"
+                [ -n "$fragment" ] || fragment=$(printf '%-10s %-7s %-9s %s' \
+                    unknown ask '?' 'the box did not answer the triage call')
+            fi
+        else
+            # A stopped box, answered entirely from host state. The watermark is
+            # what makes that possible: without one there is nothing to say, and
+            # the honest answer is `unknown`, never a guess.
+            wm=$(read_instance_meta "$name" boxonly 2>/dev/null || true)
+            case "$wm" in yes|no) ;; *) wm="" ;; esac
+            wm_at=$(read_instance_meta_raw "$name" boxonly_at 2>/dev/null || true)
+            case "$wm_at" in
+                [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z) ;;
+                *) wm_at="" ;;
+            esac
+            [ -n "$wm_at" ] || wm=""
+            reasons=""
+            why=""
+            if [ "$state" != "Stopped" ]; then
+                # `Broken`, `Unknown`, anything Lima invents later: not running,
+                # so nothing can be asked, and not stopped either, so the
+                # watermark would be describing a box in a state nobody
+                # understands. unknown/ask, and say which state it is in.
+                verdict="unknown"
+                action="ask"
+                why="the VM is neither running nor stopped ($(host_clip "$state_lc" 20)); nothing can be read from it"
+                reasons="{\"code\":\"box-silent\",\"text\":$(json_str "$why")}"
+                boxonly_col="?"
+            elif [ -z "$wm" ]; then
+                verdict="unknown"
+                action="ask"
+                reasons='{"code":"no-reading","text":"never triaged while running; start it to see"}'
+                boxonly_col="?"
+                why="never triaged while running; start it to see"
+            elif [ "$wm" = "yes" ] || [ "$REPO_UNEXPORTED_TOTAL" -gt 0 ]; then
+                verdict="parked"
+                action="ask"
+                wm_when="${wm_at%T*}"
+                wm_when="${wm_when#[0-9][0-9][0-9][0-9]-}"
+                if [ "$wm" = "yes" ]; then
+                    why="the last reading found work only inside this box (${wm_when})"
+                    reasons="{\"code\":\"box-only-state\",\"text\":\"${why}\"}"
+                    boxonly_col="? ${wm_when}"
+                else
+                    boxonly_col="0"
+                fi
+                if [ "$REPO_UNEXPORTED_TOTAL" -gt 0 ]; then
+                    [ -z "$reasons" ] || reasons="${reasons},"
+                    reasons="${reasons}{\"code\":\"unexported-commits\",\"text\":\"${REPO_UNEXPORTED_TOTAL} commits on agent branches are on no remote\"}"
+                    [ -n "$why" ] || why="${REPO_UNEXPORTED_TOTAL} commits on agent branches are on no remote"
+                fi
+            else
+                verdict="spent"
+                case "$scarce" in
+                    disk|both) action="remove" ;;
+                    *) action="keep" ;;
+                esac
+                boxonly_col="0"
+                why="nothing is only inside this box"
+            fi
+            if [ "$repo_word" = "missing" ]; then
+                [ -z "$reasons" ] || reasons="${reasons},"
+                reasons="${reasons}{\"code\":\"repo-gone\",\"text\":\"the repository directory is not on the host any more\"}"
+            elif [ "$repo_word" = "not-git" ]; then
+                [ -z "$reasons" ] || reasons="${reasons},"
+                reasons="${reasons}{\"code\":\"not-git\",\"text\":\"the mounted directory is not a git repository\"}"
+            fi
+            if [ "$BENCH_WORD" = "stale" ]; then
+                [ -z "$reasons" ] || reasons="${reasons},"
+                reasons="${reasons}{\"code\":\"bench-stale\",\"text\":\"the bench is behind the branch this box is on\"}"
+            fi
+            as_of_json=$(json_str "$wm_at")
+            [ -n "$wm_at" ] || as_of_json="null"
+            obj="{\"verdict\":\"${verdict}\",\"action\":\"${action}\",\"reasons\":[${reasons}],\"box_only\":{\"known\":false,\"as_of\":${as_of_json},\"state_bytes\":null,\"claude_state_bytes\":null,\"transcripts\":null,\"docker_images\":null,\"docker_volumes\":null,\"guest_repos\":null},\"dirty_files\":null}"
+            fragment=$(printf '%-10s %-7s %-9s %s' "$verdict" "$action" "$boxonly_col" "$why")
+        fi
+
+        if [ "$as_json" -eq 1 ]; then
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            # Both record values are validated even though the record is
+            # host-written and never mounted: it costs one line each and it keeps
+            # the rule uniform.
+            keepalive=$(read_instance_meta "$name" keepalive 2>/dev/null || true)
+            case "$keepalive" in on|off) ;; *) keepalive="off" ;; esac
+            egress=$(read_instance_meta "$name" egress 2>/dev/null || true)
+            valid_egress_mode "$egress" || egress="unknown"
+            # Host keys AFTER the guest object, like `status --json`: jq and
+            # Python are last-key-wins, so a box that emitted its own `"name"` or
+            # `"resources"` cannot override this host's answer.
+            printf '%s,"name":%s,"instance":%s,"repo":%s,"state":%s,"unexported":%s,"resources":{"cpus":%s,"memory_bytes":%s,"disk_configured_bytes":%s,"disk_footprint_bytes":%s},"bench":%s,"keepalive":%s,"egress":%s}' \
+                "${obj%\}}" \
+                "$(json_str "${name#agent-box-}")" \
+                "$(json_str "$name")" \
+                "$(json_str "$repo")" \
+                "$(json_str "$state_lc")" \
+                "$REPO_UNEXPORTED_JSON" \
+                "$(json_num "$cpus")" \
+                "$(json_num "$(size_to_bytes "$memory")")" \
+                "$(json_num "$(size_to_bytes "$disk")")" \
+                "$(json_num "$fp")" \
+                "$BENCH_JSON" \
+                "$(json_str "$keepalive")" \
+                "$(json_str "$egress")"
+        else
+            printf '%-30s %-9s %-10s %s\n' \
+                "$name" "$state_lc" "$(human_bytes "$fp")" "$fragment"
+        fi
+    done <<EOF
+$(list_boxes_wide "$only")
+EOF
+
+    if [ "$as_json" -eq 1 ]; then
+        printf ']}\n'
+        return 0
+    fi
+
+    # The footer is the host's own arithmetic and nothing else. There is no fleet
+    # total of the guests' box-only bytes: the per-box number is the actionable
+    # unit and a fleet byte total drives no decision.
+    printf '\nhost: %s cpus, %s memory, %s free on %s\n' \
+        "${cpus_host:-?}" "$(human_bytes "$mem_total")" "$(human_bytes "$disk_free")" "$lima_dir"
+    local partial_note=""
+    [ "$partial" -eq 0 ] || partial_note=" (partial: a box directory could not be read)"
+    printf 'committed: %s of guest memory in %s running boxes; %s of disk in %s boxes%s\n' \
+        "$(human_bytes "$committed")" "$running" "$(human_bytes "$total_fp")" "$boxes" \
+        "$partial_note"
+    case "$scarce" in
+        none)
+            printf 'scarce: none — neither the disk nor the memory is under pressure\n' ;;
+        disk)
+            printf 'scarce: disk — %s free is less than the %s the largest box here is configured for\n' \
+                "$(human_bytes "$disk_free")" "$(human_bytes "$largest")" ;;
+        compute)
+            printf 'scarce: compute — %s of guest memory is promised to running boxes and this Mac has %s\n' \
+                "$(human_bytes "$committed")" "$(human_bytes "$mem_total")" ;;
+        both)
+            printf 'scarce: both — %s free is less than the %s the largest box is configured for, and %s of guest memory is promised against %s\n' \
+                "$(human_bytes "$disk_free")" "$(human_bytes "$largest")" \
+                "$(human_bytes "$committed")" "$(human_bytes "$mem_total")" ;;
+    esac
+    [ -z "$scarce_note" ] || printf 'note: %s\n' "$scarce_note"
+    return 0
+}
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

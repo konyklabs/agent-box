@@ -3705,6 +3705,157 @@ for b in d["boxes"]:
 fi
 
 # ---- slot:9f-triage (owner H3) ----
+printf -- '\n--- agentbox triage --json across every box ---\n'
+#
+# triage makes one guest call per RUNNING box from inside a loop that reads the
+# box list from a here-document — the shape that once made `status` drop every
+# box after the first. Every assertion here is a FILTER, never a count: the
+# boxes on this machine that this suite did not create are none of its business.
+#
+# 9f's second box is destroyed above, before this slot, so the "no box is
+# dropped" half is checked by comparing the SET of instances triage reports with
+# the set `status --json` reports at the same moment, whatever is on the host.
+# Two boxes of this run's own would have been the stronger form; the slot's
+# position is fixed and the destroy above is not this slice's line to move.
+#
+# The POSITIVE box-only answer is planted first: a git repository in the guest's
+# home, outside the mount, is the real work-loss risk a destroy takes, and it has
+# to be reported BY CATEGORY rather than as a byte count. The paired control is
+# at the end of the slot — the plant is removed and the category goes away.
+PLANT_OUT="${TMP_ROOT}/triage-plant.out"
+# shellcheck disable=SC2016  # $HOME is the guest's, expanded in there.
+guest bash -lc '
+mkdir -p "$HOME/keepme-example" || exit 1
+cd "$HOME/keepme-example" || exit 1
+git init -q . || exit 1
+printf "work that exists on no host disk\n" > note.txt
+git add note.txt || exit 1
+git -c user.email=smoke@example.invalid -c user.name=smoke commit -q -m "box-only work" || exit 1
+echo PLANTED_OK' > "$PLANT_OUT" 2>&1
+cat "$PLANT_OUT"
+if grep -qx 'PLANTED_OK' "$PLANT_OUT"; then
+    ok "a git repository was planted in the box's home, outside the mount"
+else
+    bad "the box-only plant failed; the positive assertions below would prove nothing"
+fi
+
+TRIAGEJ="${TMP_ROOT}/triage.json"
+TRIAGE_STATUSJ="${TMP_ROOT}/triage-status.json"
+"$AGENTBOX" triage --json > "$TRIAGEJ" 2>/dev/null || true
+"$AGENTBOX" status --json > "$TRIAGE_STATUSJ" 2>/dev/null || true
+"$PY" -c '
+import json, sys
+VERDICTS = {"active","waiting","attention","idle","parked","spent","unknown"}
+ACTIONS  = {"keep","pause","remove","ask"}
+tri = json.load(open(sys.argv[1]))
+sta = json.load(open(sys.argv[2]))
+inst = sys.argv[3]
+tset = {b["instance"] for b in tri["boxes"]}
+sset = {b["instance"] for b in sta["boxes"]}
+print("LISTED=" + " ".join(sorted(tset)))
+print("SETDIFF=" + (",".join(sorted(tset ^ sset)) or "none"))
+print("MISSING=" + ("none" if inst in tset else inst))
+wrong = [b["instance"] for b in tri["boxes"]
+         if b["verdict"] not in VERDICTS or b["action"] not in ACTIONS]
+print("VOCAB=" + (",".join(wrong) or "ok"))
+h = tri["host"]
+print("SCARCE=%s free=%r largest=%r committed=%r memory=%r" % (
+    tri["scarce"], h["disk_free_bytes"], h["largest_configured_disk_bytes"],
+    h["memory_committed_bytes"], h["memory_bytes"]))
+for b in tri["boxes"]:
+    if b["instance"] != inst:
+        continue
+    r, bo = b["resources"], b["box_only"]
+    fp, cfg = r["disk_footprint_bytes"], r["disk_configured_bytes"]
+    measured = (isinstance(fp, int) and fp > 0
+                and isinstance(cfg, int) and fp < cfg)
+    print("OURS verdict=%s action=%s known=%s repos=%r transcripts=%r codes=%s "
+          "footprint=%s fp=%r cfg=%r" % (
+        b["verdict"], b["action"], bo["known"], bo["guest_repos"], bo["transcripts"],
+        "+".join(x["code"] for x in b["reasons"]) or "-",
+        "measured" if measured else "not-measured", fp, cfg))
+' "$TRIAGEJ" "$TRIAGE_STATUSJ" "$INSTANCE" > "${TMP_ROOT}/triage-filter.txt" 2>&1 || true
+cat "${TMP_ROOT}/triage-filter.txt"
+
+if grep -q '^MISSING=none' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage listed the box this run created (MISSING=none)"
+else
+    bad "triage did not list the box this run created"
+fi
+if grep -q '^SETDIFF=none' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage and status agree on WHICH boxes exist, so the guest call in the loop ate no box"
+else
+    bad "triage and status disagree about the fleet: $(sed -n 's/^SETDIFF=//p' "${TMP_ROOT}/triage-filter.txt")"
+fi
+if grep -qx 'VOCAB=ok' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage gave every box it listed a verdict and an action from the documented sets"
+else
+    bad "a verdict or action outside the documented sets: $(sed -n 's/^VOCAB=//p' "${TMP_ROOT}/triage-filter.txt")"
+fi
+if grep -q '^OURS .* footprint=measured ' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage reported a disk footprint measured on the host, not the configured size"
+else
+    bad "the footprint was not measured: $(grep '^OURS' "${TMP_ROOT}/triage-filter.txt")"
+fi
+if grep -q '^OURS .* known=True ' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage answered box_only for the running box it could reach"
+else
+    bad "triage did not answer box_only for a running box"
+fi
+if grep -qE '^OURS .* repos=[1-9][0-9]* .*codes=.*guest-repo' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "and it reported the planted repository as box-only work, by category"
+else
+    bad "the planted box-only work was not reported by category: $(grep '^OURS' "${TMP_ROOT}/triage-filter.txt")"
+fi
+if grep -qE '^SCARCE=(none|disk|compute|both) free=[0-9]+ largest=[0-9]+ committed=[0-9]+ memory=[0-9]+$' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "triage named the scarce resource with both numbers it used"
+else
+    bad "the scarcity line is missing a number: $(sed -n 's/^SCARCE=//p' "${TMP_ROOT}/triage-filter.txt")"
+fi
+
+TRIAGET="${TMP_ROOT}/triage-text.out"
+"$AGENTBOX" triage > "$TRIAGET" 2>/dev/null || true
+cat "$TRIAGET"
+TRI_TEXT_ROWS=$(grep -cE '^agent-box-' "$TRIAGET" || true)
+TRI_JSON_ROWS=$(sed -n 's/^LISTED=//p' "${TMP_ROOT}/triage-filter.txt" | wc -w | tr -d ' ')
+TRI_OURS_ROWS=$(grep -cE "^${INSTANCE} " "$TRIAGET" || true)
+printf 'text rows: %s; json rows: %s; rows for this box: %s\n' \
+    "$TRI_TEXT_ROWS" "$TRI_JSON_ROWS" "$TRI_OURS_ROWS"
+if [ "$TRI_TEXT_ROWS" -eq "$TRI_JSON_ROWS" ] && [ "$TRI_OURS_ROWS" -eq 1 ]; then
+    ok "the triage text listing put every box on one line and dropped none"
+else
+    bad "the text listing and the JSON disagree about how many boxes there are"
+fi
+if grep -q '^scarce: ' "$TRIAGET" && grep -q '^host: ' "$TRIAGET"; then
+    ok "and the text footer states the host's own numbers"
+else
+    bad "the text footer is missing"
+fi
+
+# The paired control: with the plant gone, the category goes away. Its vacuity
+# guard is the `repos=` assertion above, which has already passed.
+printf -- '\n--- and with the planted repository removed, the category is gone ---\n'
+# shellcheck disable=SC2016  # $HOME is the guest's.
+guest bash -lc 'rm -rf "$HOME/keepme-example" && echo REMOVED_OK' \
+    > "${TMP_ROOT}/triage-unplant.out" 2>&1
+cat "${TMP_ROOT}/triage-unplant.out"
+"$AGENTBOX" triage --json > "${TMP_ROOT}/triage2.json" 2>/dev/null || true
+"$PY" -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for b in doc["boxes"]:
+    if b["instance"] == sys.argv[2]:
+        print("AFTER repos=%r codes=%s" % (
+            b["box_only"]["guest_repos"],
+            "+".join(x["code"] for x in b["reasons"]) or "-"))
+' "${TMP_ROOT}/triage2.json" "$INSTANCE" > "${TMP_ROOT}/triage-after.txt" 2>&1 || true
+cat "${TMP_ROOT}/triage-after.txt"
+if grep -q '^AFTER repos=0 ' "${TMP_ROOT}/triage-after.txt" \
+   && ! grep -q 'guest-repo' "${TMP_ROOT}/triage-after.txt"; then
+    ok "the box-only answer follows what is actually in the box, in both directions"
+else
+    bad "the removed repository is still reported: $(cat "${TMP_ROOT}/triage-after.txt")"
+fi
 # ---- end slot:9f-triage ----
 
 # ===========================================================================
@@ -3908,6 +4059,129 @@ fi
 guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
 
 # ---- slot:9i (owner H3) ----
+# ===========================================================================
+step "9i. the triage watermark: how a stopped box can answer at all"
+# ===========================================================================
+#
+# The one genuinely new mechanism in the triage slice. A stopped box cannot be
+# asked anything, so every successful triage of a RUNNING box records what it
+# found — `boxonly`, `boxonly_bytes`, `boxonly_at` — in the host's own instance
+# file, and a stopped box's verdict is built from that reading. With no reading
+# the answer is `unknown`/`ask`, never a guess: the failure this prevents is an
+# operator being told a box holds nothing when nobody ever looked.
+#
+# It costs one stop and one start on the box this step already has. The record is
+# restored inline, because step 10 destroys this box and 11-13 must not inherit a
+# fixture.
+
+TRIAGE_REC="${AGENT_BOX_CONFIG_DIR}/instances/${INSTANCE}"
+printf -- '--- triage while running records the reading ---\n'
+"$AGENTBOX" triage "$CLEAN_REPO" --json > "${TMP_ROOT}/wm-running.json" 2>/dev/null || true
+cat "$TRIAGE_REC"
+if grep -qE '^boxonly=(yes|no)$' "$TRIAGE_REC" \
+   && grep -qE '^boxonly_bytes=[0-9]+$' "$TRIAGE_REC" \
+   && grep -qE '^boxonly_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "$TRIAGE_REC"; then
+    ok "triage of a running box recorded a box-only reading in the host's instance file"
+else
+    bad "triage of a running box recorded no reading"
+fi
+if grep -qx 'egress=deny' "$TRIAGE_REC"; then
+    ok "and the keys that were already in the record survived the watermark write"
+else
+    bad "the watermark write lost the box's recorded egress mode"
+fi
+WM_AT=$(sed -n 's/^boxonly_at=//p' "$TRIAGE_REC" | tail -1)
+cp "$TRIAGE_REC" "${TMP_ROOT}/wm-record.bak"
+
+printf -- '\n--- stopped: the answer comes from that reading ---\n'
+if "$AGENTBOX" stop "$CLEAN_REPO"; then
+    ok "agentbox stop exited 0"
+else
+    bad "agentbox stop did not exit 0"
+fi
+"$AGENTBOX" triage "$CLEAN_REPO" --json > "${TMP_ROOT}/wm-stopped.json" 2>/dev/null || true
+"$AGENTBOX" triage "$CLEAN_REPO" > "${TMP_ROOT}/wm-stopped.txt" 2>/dev/null || true
+cat "${TMP_ROOT}/wm-stopped.txt"
+"$PY" -c '
+import json, sys
+VERDICTS = {"active","waiting","attention","idle","parked","spent","unknown"}
+ACTIONS  = {"keep","pause","remove","ask"}
+doc = json.load(open(sys.argv[1]))
+for b in doc["boxes"]:
+    if b["instance"] != sys.argv[2]:
+        continue
+    bo = b["box_only"]
+    print("STOPPED state=%s verdict=%s action=%s known=%s as_of=%s codes=%s "
+          "vocab=%s as_of_matches=%s" % (
+        b["state"], b["verdict"], b["action"], bo["known"], bo["as_of"],
+        "+".join(x["code"] for x in b["reasons"]) or "-",
+        "ok" if b["verdict"] in VERDICTS and b["action"] in ACTIONS else "bad",
+        bo["as_of"] == sys.argv[3]))
+' "${TMP_ROOT}/wm-stopped.json" "$INSTANCE" "$WM_AT" > "${TMP_ROOT}/wm-stopped-filter.txt" 2>&1 || true
+cat "${TMP_ROOT}/wm-stopped-filter.txt"
+if grep -q '^STOPPED state=stopped .* known=False .* as_of_matches=True$' "${TMP_ROOT}/wm-stopped-filter.txt"; then
+    ok "triage of the stopped box said box_only.known=false and carried the reading's date"
+else
+    bad "the stopped box's box_only is wrong: $(cat "${TMP_ROOT}/wm-stopped-filter.txt")"
+fi
+if grep -q '^STOPPED .* vocab=ok ' "${TMP_ROOT}/wm-stopped-filter.txt" \
+   && grep -qE '^STOPPED .* verdict=(parked|spent|unknown) action=(ask|remove|keep) ' "${TMP_ROOT}/wm-stopped-filter.txt"; then
+    ok "the stopped box's verdict came from the documented set and its action with it"
+else
+    bad "the stopped box's verdict or action is outside the documented sets"
+fi
+if grep -qE "^${INSTANCE} +stopped +[0-9.]+[KMGB]" "${TMP_ROOT}/wm-stopped.txt"; then
+    ok "and the text row still measures the stopped box's footprint on the host"
+else
+    bad "the stopped box's text row is wrong: $(grep "^${INSTANCE}" "${TMP_ROOT}/wm-stopped.txt")"
+fi
+
+printf -- '\n--- and with no reading at all, it says so instead of guessing ---\n'
+grep -v '^boxonly' "${TMP_ROOT}/wm-record.bak" > "$TRIAGE_REC"
+cat "$TRIAGE_REC"
+"$AGENTBOX" triage "$CLEAN_REPO" --json > "${TMP_ROOT}/wm-noread.json" 2>/dev/null || true
+"$PY" -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for b in doc["boxes"]:
+    if b["instance"] == sys.argv[2]:
+        print("NOREAD verdict=%s action=%s codes=%s as_of=%s" % (
+            b["verdict"], b["action"],
+            "+".join(x["code"] for x in b["reasons"]) or "-",
+            b["box_only"]["as_of"]))
+' "${TMP_ROOT}/wm-noread.json" "$INSTANCE" > "${TMP_ROOT}/wm-noread.txt" 2>&1 || true
+cat "${TMP_ROOT}/wm-noread.txt"
+if grep -q '^NOREAD verdict=unknown action=ask codes=no-reading as_of=None$' "${TMP_ROOT}/wm-noread.txt"; then
+    ok "a box with no reading at all is reported unknown/ask/no-reading rather than guessed at"
+else
+    bad "the no-reading case is wrong: $(cat "${TMP_ROOT}/wm-noread.txt")"
+fi
+
+printf -- '\n--- the box comes back up and still answers ---\n'
+cp "${TMP_ROOT}/wm-record.bak" "$TRIAGE_REC"
+"$AGENTBOX" start "$CLEAN_REPO"
+rc=$?
+if [ "$rc" -eq 0 ]; then ok "agentbox start exited 0 after the watermark step"; else bad "agentbox start exited ${rc}"; fi
+if wait_for_guest 180; then
+    ok "the guest answers again"
+else
+    bad "the guest did not come back"
+fi
+"$AGENTBOX" triage "$CLEAN_REPO" --json > "${TMP_ROOT}/wm-again.json" 2>/dev/null || true
+"$PY" -c '
+import json, sys
+doc = json.load(open(sys.argv[1]))
+for b in doc["boxes"]:
+    if b["instance"] == sys.argv[2]:
+        print("AGAIN state=%s verdict=%s known=%s" % (
+            b["state"], b["verdict"], b["box_only"]["known"]))
+' "${TMP_ROOT}/wm-again.json" "$INSTANCE" > "${TMP_ROOT}/wm-again.txt" 2>&1 || true
+cat "${TMP_ROOT}/wm-again.txt"
+if grep -q '^AGAIN state=running .* known=True$' "${TMP_ROOT}/wm-again.txt"; then
+    ok "triage of the restarted box takes a fresh reading again"
+else
+    bad "the restarted box did not answer triage: $(cat "${TMP_ROOT}/wm-again.txt")"
+fi
 # ---- end slot:9i ----
 
 # ===========================================================================
