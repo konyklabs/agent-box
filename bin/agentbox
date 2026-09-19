@@ -2085,7 +2085,11 @@ bench_list() {
                 printf '{%s}' "$(bench_json_fields "$inst" "$repo" "$bench" "$branch" "$head" "$dirty" "$ahead")"
             else
                 state=""
-                [ "${dirty:-0}" = "0" ] || state="${dirty} modified"
+                if [ -z "$dirty" ]; then
+                    state="unreadable"
+                elif [ "$dirty" != "0" ]; then
+                    state="${dirty} modified"
+                fi
                 if [ -z "$ahead" ]; then
                     state="${state}${state:+, }no upstream"
                 elif [ "$ahead" != "0" ]; then
