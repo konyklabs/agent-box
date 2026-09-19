@@ -598,6 +598,13 @@ abx_descendants_deepest_first() {
 # through the LAST `)` cannot be fooled that way, since the name is the only
 # parenthesised field and nothing after it contains one.
 #
+# The WHOLE file is read, not its first line: /proc prints the name unescaped,
+# so a name containing a newline splits the record across lines and `head -1`
+# would cut it before the closing `)`, leaving nothing after the strip and no
+# start time for a process that is running perfectly well. The strip and the
+# field split both span newlines, so reading it all costs nothing and the
+# answer is the same for every ordinary name.
+#
 # What it is for: a pid alone does not identify a process. A pid recorded during
 # a run and the pid of that number after the run are the same number and may be
 # different processes, so a sweep compares the start time as well.
@@ -605,7 +612,7 @@ abx_proc_starttime() {
     local pid="${1:-}" raw rest tick
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     [ -r "/proc/${pid}/stat" ] || return 1
-    raw=$(head -1 "/proc/${pid}/stat" 2>/dev/null) || return 1
+    raw=$(cat "/proc/${pid}/stat" 2>/dev/null) || return 1
     rest="${raw##*\)}"
     # shellcheck disable=SC2086  # deliberate splitting: stat's fields are single words.
     set -- $rest
