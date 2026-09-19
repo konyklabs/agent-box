@@ -24,6 +24,8 @@ Modes:
   run-format.py --summary [RUNID]            that run's scrubbed summary
   run-format.py --list [--json]              every run, newest first
   run-format.py --sessions-in [--json]       format a session list from stdin
+  run-format.py --channel-list [--json]      what this box said to the host
+  run-format.py --channel-read ID [--json]   one of those messages, scrubbed
   run-format.py --box-json ...               one JSON line describing this box
   run-format.py --box-text ...               the same, as one line of text
 """
@@ -34,6 +36,7 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
 import time
 from datetime import datetime, timezone
@@ -1081,16 +1084,385 @@ def cmd_list(args):
 # shape-checked and scrubbed before anything prints them. `read_message`,
 # `cmd_channel_list` and `cmd_channel_read` belong to the channel slice; the
 # skeleton owns the caps above, the names, and the dispatch.
+#
+# Both modes read the `to-host` direction: the host asks this program what the
+# box said, because the box's bytes must be scrubbed before they cross. The
+# guest's own inbox (`to-box`, which the host wrote) is read by guest/channel.sh
+# in shell, so that the delivery hook depends on nothing but bash -- the
+# direction parameter below is what keeps that asymmetry visible rather than
+# built into the path.
+
+# The same shape as abx_valid_msgid in guest/lib.sh and valid_msgid in
+# bin/agentbox: the writer's UTC second plus a two-digit sequence. Three
+# implementations because the id is a file name on a mount either side may have
+# written, and each side checks it before it becomes a path.
+MSGID_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[0-9]{2}$")
+
+CHANNEL_DIR = os.path.join(WORK_DIR, ".agent-box", "channel")
+
+# One header line of the message format: a short lower-case key, a colon, a
+# space, and at most 200 characters that do not include a newline.
+_HEADER_LINE_RE = re.compile(r"^([a-z]{2,12}): (.{0,200})$")
+# The header block's own bounds. A file whose first 12 lines or 2048 bytes do
+# not reach a blank line is not carrying headers this reader will find, which is
+# the honest answer for something the sanctioned writer did not produce.
+CHANNEL_HEADER_LINES = 12
+CHANNEL_HEADER_BYTES = 2048
+# What a listing shows, newest first. The host counts up to 1000 names itself;
+# this is how many of them are opened and rendered.
+CHANNEL_LIST_LIMIT = 50
+CHANNEL_SUBJECT_LIMIT = 120
+
+_ISO_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
+_TYPE_RE = re.compile(r"^(handoff|question|note|request)$")
+# `claude` is the standing session, `run-<runid>` a headless run, `shell`
+# anything else in the box. Nothing else can be written by the sanctioned path:
+# claude-session.sh exports the name only for the standing session.
+_SESSION_RE = re.compile(r"^(claude|shell|run-[0-9]{8}-[0-9]{6})$")
+_COMMIT_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
+_DIRTY_RE = re.compile(r"^[0-9]{1,6}$")
+_VERDICT_RE = re.compile(r"^(accepted|changes)$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 
 
-def cmd_channel_list(_args):
-    print("run-format: the channel listing is not built in this checkout", file=sys.stderr)
-    return 1
+def _valid_branch(value):
+    """git's refusals, as far as this reader needs them.
+
+    The same shape as abx_valid_branch in guest/lib.sh. It matters here because
+    the host hands a branch name from a message to `git rev-parse`: a value that
+    fails this reads as null, and a null branch is what makes the host say the
+    message names no usable branch instead of running git on the box's bytes.
+    """
+    if not _BRANCH_RE.match(value or ""):
+        return False
+    return not (
+        ".." in value or "//" in value or value.endswith("/") or value.endswith(".lock")
+    )
 
 
-def cmd_channel_read(_args):
-    print("run-format: the channel reader is not built in this checkout", file=sys.stderr)
-    return 1
+def _valid_subject(value):
+    return bool(value) and len(value) <= CHANNEL_SUBJECT_LIMIT
+
+
+# key -> the test its value must pass. A known key whose value fails reads as
+# null and is named in the row's `invalid` list: never silently dropped, and
+# never echoed. An unknown key is dropped without comment -- the format is
+# allowed to grow on the other side of the mount without this reader failing.
+_HEADER_RULES = (
+    ("created", lambda v: bool(_ISO_RE.match(v))),
+    ("type", lambda v: bool(_TYPE_RE.match(v))),
+    ("session", lambda v: bool(_SESSION_RE.match(v))),
+    ("branch", _valid_branch),
+    ("commit", lambda v: bool(_COMMIT_RE.match(v))),
+    ("dirty", lambda v: bool(_DIRTY_RE.match(v))),
+    ("re", lambda v: bool(MSGID_RE.match(v))),
+    ("verdict", lambda v: bool(_VERDICT_RE.match(v))),
+    ("subject", _valid_subject),
+)
+_HEADER_KEYS = tuple(key for key, _ in _HEADER_RULES)
+_HEADER_RULE_MAP = dict(_HEADER_RULES)
+
+# The row's key order is the contract's (docs/daily-use.md, the `untrusted`
+# object): id first, then the headers, then the two facts this reader adds.
+_ROW_KEYS = ("id",) + _HEADER_KEYS + ("bytes", "invalid")
+
+
+def _empty_row(msgid):
+    row = {key: None for key in _ROW_KEYS}
+    row["id"] = msgid
+    row["invalid"] = []
+    row["body"] = ""
+    row["truncated"] = False
+    return row
+
+
+def _unreadable_row(msgid, reason):
+    """A file that is not a message, as a row that says so and shows nothing.
+
+    The reason travels inside `invalid` rather than in a key of its own, so the
+    row keys stay exactly the ones the contract lists. It is one of five fixed
+    strings written here, never anything read from the file.
+    """
+    row = _empty_row(msgid)
+    row["invalid"] = ["file:%s" % reason]
+    return row
+
+
+def _parse_headers(head, row):
+    """Fill `row` from the header block. False when this is not one.
+
+    First occurrence wins, unknown keys are dropped, and the block is bounded
+    both ways: a file that arrives with 4000 bytes of `a: b` lines gets the
+    first 12 of them read and the rest ignored.
+    """
+    seen = set()
+    total = 0
+    parsed = 0
+    for index, line in enumerate(head.split("\n")):
+        if index >= CHANNEL_HEADER_LINES:
+            break
+        total += len(line.encode("utf-8", errors="replace")) + 1
+        if total > CHANNEL_HEADER_BYTES:
+            break
+        match = _HEADER_LINE_RE.match(line)
+        if not match:
+            continue
+        key, value = match.group(1), match.group(2)
+        if key in seen:
+            continue
+        seen.add(key)
+        if key not in _HEADER_KEYS:
+            continue
+        parsed += 1
+        if _HEADER_RULE_MAP[key](value):
+            row[key] = int(value) if key == "dirty" else value
+        elif key not in row["invalid"]:
+            row["invalid"].append(key)
+    # `type` is structural, not decoration: without it nobody can say what the
+    # file is, and a reader that printed its body anyway would be printing bytes
+    # nothing vouches for. A bad `branch` is the other case -- the message is
+    # real and one of its claims is not, which is what `invalid` is for.
+    return parsed > 0 and row["type"] is not None
+
+
+def read_message(direction, msgid, body_limit=CHANNEL_BODY_LIMIT):
+    """One message file, read the only way a file on this mount may be read.
+
+    `O_NOFOLLOW`, so a symlink named like a message cannot make this open the
+    token file; `O_NONBLOCK`, so a FIFO with a message's name answers at once
+    instead of hanging the reader, and `fstat` then refuses it for not being a
+    regular file; one bounded read, so a file too large to be a message is
+    recognised rather than read whole.
+
+    Always returns a row. A file that cannot be read is a row whose `invalid`
+    says which of five fixed things went wrong and whose every content field is
+    null: no byte of such a file reaches the caller.
+    """
+    row = _empty_row(msgid)
+    if not MSGID_RE.match(msgid or ""):
+        # The id is not echoed: it arrived as an argument, and an argument that
+        # failed its shape is exactly the text not to put back on a terminal.
+        return _unreadable_row("", "not a message id")
+    if direction not in ("to-host", "to-box"):
+        return _unreadable_row(msgid, "not a direction")
+    path = os.path.join(CHANNEL_DIR, direction, msgid + ".md")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return _unreadable_row(msgid, "no such message")
+    except OSError:
+        # ELOOP for a symlink under O_NOFOLLOW, ENXIO or EISDIR for the rest.
+        # `islink` only words the answer; the refusal already happened, and it
+        # happened without following anything.
+        return _unreadable_row(
+            msgid, "not a regular file" if os.path.islink(path) else "unreadable"
+        )
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return _unreadable_row(msgid, "not a regular file")
+        if info.st_size > CHANNEL_FILE_LIMIT:
+            return _unreadable_row(msgid, "too large")
+        if info.st_size == 0:
+            # A reservation whose content never arrived, or a crash mid-send.
+            # Its writer sweeps it; a reader treats it as nothing.
+            return _unreadable_row(msgid, "empty")
+        data = b""
+        while len(data) < info.st_size:
+            chunk = os.read(fd, info.st_size - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return _unreadable_row(msgid, "unreadable")
+    finally:
+        os.close(fd)
+
+    row["bytes"] = info.st_size
+    text = data.decode("utf-8", errors="replace").replace("\r\n", "\n").replace("\r", "\n")
+    head, _, body = text.partition("\n\n")
+    if not _parse_headers(head, row):
+        return _unreadable_row(msgid, "bad header")
+    # The body's cap is in bytes, so it is cut in bytes and decoded afterwards:
+    # cutting the string would count a multibyte character as one.
+    body_bytes = body.encode("utf-8", errors="replace")
+    row["truncated"] = len(body_bytes) > body_limit
+    row["body"] = body_bytes[:body_limit].decode("utf-8", errors="replace")
+    return row
+
+
+def _message_row(row):
+    """The row as the contract lists it: no body, no truncation flag."""
+    return {key: row[key] for key in _ROW_KEYS}
+
+
+def _standing_or_none():
+    """The standing session's object, once the status slice builds it.
+
+    `standing_object()` belongs to that slice, because it is the same object
+    `status --json` carries and two producers would eventually disagree about
+    it. Until it lands the channel listing says `null`, which is the contract's
+    word for "nobody could answer" -- not a second, differently shaped copy.
+    Contract for the status slice: `standing_object()`, no arguments, a dict
+    with the keys of spec 2.1 or None.
+    """
+    builder = globals().get("standing_object")
+    return builder() if builder is not None else None
+
+
+def _standing_line(standing):
+    """The standing object as the one line the text listing carries.
+
+    The host prints it behind its bar, so it holds what the operator needs to
+    see without a JSON parser: who, what state, since when, the declared task,
+    the last tool and the last thing the session said.
+    """
+    if not isinstance(standing, dict):
+        return "none"
+    parts = [
+        str(standing.get("name") or "claude"),
+        str(standing.get("state") or "unknown"),
+    ]
+    if standing.get("since"):
+        parts.append("since %s" % standing["since"])
+    for label, key, limit in (
+        ("task:", "task", 200),
+        ("last:", "last_tool", DETAIL_LIMIT),
+        ("said:", "last_text", TEXT_LIMIT),
+    ):
+        value = first_line(standing.get(key), limit)
+        if value:
+            parts.append("%s %s" % (label, value))
+    return scrub(" ".join(parts))
+
+
+def _channel_names(direction):
+    """Message ids in one direction, newest first. Names only.
+
+    The same rule as the host's `channel_ids`: a name that is not
+    `<id>.md` is not a message, a symlink with that name is not a message, and a
+    zero-byte file is a reservation in flight. None of the rejects is echoed --
+    the caller is told nothing about them, because a name is guest-chosen text.
+    """
+    out = []
+    try:
+        entries = os.scandir(os.path.join(CHANNEL_DIR, direction))
+    except OSError:
+        return out
+    with entries:
+        for entry in entries:
+            name = entry.name
+            if not name.endswith(".md") or not MSGID_RE.match(name[:-3]):
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_size == 0:
+                    continue
+            except OSError:
+                continue
+            out.append(name[:-3])
+    out.sort(reverse=True)
+    return out
+
+
+def cmd_channel_list(args):
+    """What this box has said to the host, and how the standing session is.
+
+    The `to-host` direction only: this is the host's view of the box. The box's
+    own inbox is `abx inbox`, which reads `to-box` in shell.
+    """
+    rows = [
+        read_message("to-host", msgid)
+        for msgid in _channel_names("to-host")[:CHANNEL_LIST_LIMIT]
+    ]
+    standing = _standing_or_none()
+    if args.json:
+        obj = {
+            "standing": scrub_obj(standing),
+            "messages": [scrub_obj(_message_row(row)) for row in rows],
+        }
+        print(json.dumps(obj, separators=(",", ":")))
+        return 0
+    print("STANDING %s" % _standing_line(standing))
+    for row in rows:
+        if row["invalid"] and row["invalid"][0].startswith("file:"):
+            # The id, the word, and one of this file's own five reasons. The
+            # message is listed rather than dropped, and nothing of it printed.
+            print("%s invalid - - %s" % (row["id"], row["invalid"][0][len("file:"):]))
+            continue
+        print(
+            "%s %s %s %s %s"
+            % (
+                row["id"],
+                scrub(row["type"] or "-"),
+                scrub(row["session"] or "-"),
+                scrub(row["branch"] or "-"),
+                scrub(first_line(row["subject"], CHANNEL_SUBJECT_LIMIT) or "-"),
+            )
+        )
+    return 0
+
+
+def _leaking_sender(row):
+    """The runid of a leak-flagged sender, or None.
+
+    A run whose leak check found the token wrote its handoff before the check
+    ran. Printing it hands the operator the credential on the terminal the
+    exit-3 path exists to protect, so it is refused the way `logs` and `ask`
+    refuse that run's other output.
+    """
+    session = row.get("session") or ""
+    if not session.startswith("run-"):
+        return None
+    runid = session[len("run-"):]
+    try:
+        run = Run(runid)
+    except BadRunid:
+        return None
+    return runid if run.status == "exit:3" else None
+
+
+def cmd_channel_read(args):
+    """One message from the box, as a parseable line and then its body.
+
+    Line 1 is `META key=value ...`, the `read_live_egress` shape: the host picks
+    the values out with `sed` and validates each one, so a value it does not
+    recognise is dropped rather than printed. Every line after it is body, which
+    the host prints behind its bar.
+    """
+    row = read_message("to-host", args.channel_read or "")
+    if row["invalid"] and row["invalid"][0].startswith("file:"):
+        print("invalid: %s" % row["invalid"][0][len("file:"):])
+        return 1
+    runid = _leaking_sender(row)
+    if runid and not args.force_unsafe:
+        print(LEAK_BANNER % runid, file=sys.stderr, flush=True)
+        print("invalid: the sending run's leak check found the token")
+        return 1
+    if args.json:
+        obj = _message_row(row)
+        obj["body"] = row["body"]
+        obj["truncated"] = row["truncated"]
+        print(json.dumps(scrub_obj(obj), separators=(",", ":")))
+        return 0
+    print(
+        "META type=%s session=%s branch=%s commit=%s dirty=%s created=%s bytes=%d truncated=%d"
+        % (
+            scrub(row["type"] or "-"),
+            scrub(row["session"] or "-"),
+            scrub(row["branch"] or "-"),
+            scrub(row["commit"] or "-"),
+            "-" if row["dirty"] is None else row["dirty"],
+            scrub(row["created"] or "-"),
+            row["bytes"] or 0,
+            1 if row["truncated"] else 0,
+        )
+    )
+    print("")
+    for line in row["body"].split("\n"):
+        print(scrub(line))
+    return 0
 
 
 def cmd_box_json(args):
