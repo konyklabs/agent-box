@@ -848,8 +848,45 @@ start_port_check() { :; }
 #           the status and the last lines say it is not at baseline)
 #   start   prints them as a WARNING, and the caller drops the status so an
 #           existing box still starts and exits 0
-# Returning 0 until TB lands, so neither command's behaviour changes yet.
-report_toolchain_readiness() { return 0; }
+#
+# `--box-only`, so this is about the box and never about the repository: a
+# project that pins a different version is the agent's business — it reaches the
+# brief and the session card — and is no reason to call a create unsuccessful.
+# And a live sweep rather than the boot snapshot, because this runs once per
+# create or start and the question is what is installed NOW.
+#
+# Fail-soft in every direction but the one that matters: a guest that cannot
+# answer at all (an older checkout with no toolcheck.sh, a shell that failed)
+# gets one note and status 0. Only a box that answered, and answered that a tool
+# is missing or off its pin, changes an exit status.
+report_toolchain_readiness() {
+    local inst="${1:?}" mode="${2:?}" out rc=0 line
+    out=$(guest_shell "$inst" "${GUEST_BIN}/toolcheck.sh" --box-only --findings-only 2>/dev/null) || rc=$?
+    case "$rc" in
+        0)
+            info "every baseline tool is at its pin"
+            return 0 ;;
+        10) ;;
+        *)
+            info "NOTE: the toolchain could not be checked in ${inst} (toolcheck exited ${rc}); run '${PROG} toolcheck <repo>'"
+            return 0 ;;
+    esac
+    # Guest bytes: each line is printed and never evaluated, and it arrived
+    # already scrubbed and control-stripped by run-format.py inside the guest.
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        if [ "$mode" = "create" ]; then
+            printf '%s: NOT READY: %s\n' "$PROG" "$line" >&2
+        else
+            printf '%s: WARNING: %s\n' "$PROG" "$line" >&2
+        fi
+    done <<EOF
+$out
+EOF
+    [ "$mode" != "create" ] || printf '%s: the box is up and usable, but not at the baseline above; fix it and run %s toolcheck <repo>\n' \
+        "$PROG" "$PROG" >&2
+    return 10
+}
 
 cmd_create() {
     local repo inst
@@ -2446,7 +2483,37 @@ cmd_firewall_check() {
 # Every baseline tool at its pin, and where this repository pins one
 # differently. The exit status is the answer a script reads: 10 for a box that is
 # not at baseline, 11 for a box that is clean where the project disagrees.
-cmd_toolcheck() { die "toolcheck: not built in this checkout"; }
+#
+# The whole report is assembled and scrubbed in the guest, so this forwards bytes
+# and a status and does nothing else with either. It does not parse the JSON,
+# build a command out of it, or compare a version: the only host-side use of the
+# result is the exit code, which is what keeps a dozen programs' version output
+# and a scan of a guest-writable repository from becoming host-side input.
+cmd_toolcheck() {
+    local inst as_json=0 project_only=0
+    split_args "" "$@"
+    check_operands 1 1 "toolcheck <repo|name> [--json] [--project-only]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)         as_json=1; shift ;;
+            --project-only) project_only=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    inst=$(instance_name "${ABX_POSV[0]}")
+    require_limactl
+    require_instance "$inst"
+
+    local -a gargs=("${GUEST_BIN}/toolcheck.sh")
+    [ "$as_json" -eq 0 ]      || gargs+=(--json)
+    [ "$project_only" -eq 0 ] || gargs+=(--project-only)
+    # `rc=$?` on the `||`, not an `if !`: a command's status inside an `if` is
+    # the `if`'s, which is always 0 — the same trap cmd_firewall_check documents.
+    local rc=0
+    guest_shell "$inst" "${gargs[@]}" || rc=$?
+    return "$rc"
+}
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
