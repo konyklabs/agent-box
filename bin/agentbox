@@ -875,16 +875,18 @@ report_toolchain_readiness() {
     # already scrubbed and control-stripped by run-format.py inside the guest.
     while IFS= read -r line; do
         [ -n "$line" ] || continue
+        # `info … >&2` is this file's own shape for a warning (cmd_firewall_check
+        # does the same): the house helpers, on the stream a warning belongs on.
         if [ "$mode" = "create" ]; then
-            printf '%s: NOT READY: %s\n' "$PROG" "$line" >&2
+            info "NOT READY: ${line}" >&2
         else
-            printf '%s: WARNING: %s\n' "$PROG" "$line" >&2
+            info "WARNING: ${line}" >&2
         fi
     done <<EOF
 $out
 EOF
-    [ "$mode" != "create" ] || printf '%s: the box is up and usable, but not at the baseline above; fix it and run %s toolcheck <repo>\n' \
-        "$PROG" "$PROG" >&2
+    [ "$mode" != "create" ] \
+        || info "the box is up and usable, but not at the baseline above; fix it and run ${PROG} toolcheck <repo>" >&2
     return 10
 }
 
