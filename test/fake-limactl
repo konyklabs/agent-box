@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+#
+# A stand-in for limactl, so that the host half of agentbox can be tested without
+# building a VM. bin/agentbox honours $LIMACTL, so a check runs as
+#
+#   LIMACTL="${BOX_DIR}/test/fake-limactl" FAKE_LIMA_DIR="$tmp" \
+#   AGENT_BOX_CONFIG_DIR="$tmp/config" agentbox ports app --json
+#
+# and a hermetic config dir is not optional: without it the check reads and
+# rewrites the operator's real ~/.config/agent-box.
+#
+# State is one file, $FAKE_LIMA_DIR/instances, with one instance per line:
+#
+#   name|Status|repo|cpus|memory|disk|dir
+#
+# A missing file means a host with no boxes, which is a state worth testing.
+#
+# Three forms are implemented, which are the three bin/agentbox uses:
+#
+#   list --quiet [names...]              the names, one per line
+#   list --format FMT [names...]         FMT with the seven fields substituted;
+#                                        a PortForwards template prints name=[]
+#   shell --workdir W INST -- CMD...     exec $FAKE_LIMA_SHELL INST CMD...
+#
+# Everything else exits 1 on purpose: a fake that silently answered `start`,
+# `create` or `delete` would let a check pass while proving nothing. The handler
+# named by $FAKE_LIMA_SHELL is what makes a guest answer — it may, for instance,
+# map /opt/agent-box/guest/run-format.py to the checkout's own copy with
+# AGENT_BOX_WORK and ABX_STATE_DIR set, so the Python reader is exercised on the
+# host. Guest bash scripts are not run on the host.
+
+set -uo pipefail
+
+[ -n "${FAKE_LIMA_DIR:-}" ] || { printf 'fake-limactl: FAKE_LIMA_DIR is not set\n' >&2; exit 1; }
+STATE="${FAKE_LIMA_DIR}/instances"
+
+cmd="${1:-}"
+[ $# -eq 0 ] || shift
+
+case "$cmd" in
+    list)
+        quiet=0 fmt="" names=" "
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --quiet|-q) quiet=1; shift ;;
+                --format)   fmt="${2:-}"; shift 2 ;;
+                --json)     printf 'fake-limactl: list --json is not implemented\n' >&2; exit 1 ;;
+                -*)         shift ;;
+                *)          names="${names}${1} "; shift ;;
+            esac
+        done
+        [ -r "$STATE" ] || exit 0
+        while IFS='|' read -r name status repo cpus memory disk dir; do
+            [ -n "$name" ] || continue
+            [ "$names" = " " ] || case "$names" in *" ${name} "*) ;; *) continue ;; esac
+            if [ "$quiet" -eq 1 ]; then
+                printf '%s\n' "$name"
+                continue
+            fi
+            # The forwards template asks Lima for a list this fake does not
+            # model; every box it describes has none, said in the template's own
+            # shape so the caller's parser is the thing under test.
+            case "$fmt" in
+                "") printf '%s\n' "$name"; continue ;;
+                *PortForwards*) printf '%s=[]\n' "$name"; continue ;;
+            esac
+            out="$fmt"
+            out=${out//'{{.Name}}'/$name}
+            out=${out//'{{.Status}}'/$status}
+            out=${out//'{{(index .Config.Mounts 0).Location}}'/$repo}
+            out=${out//'{{.CPUs}}'/$cpus}
+            out=${out//'{{.Memory}}'/$memory}
+            out=${out//'{{.Disk}}'/$disk}
+            out=${out//'{{.Dir}}'/$dir}
+            printf '%s\n' "$out"
+        done < "$STATE"
+        ;;
+    shell)
+        inst=""
+        while [ $# -gt 0 ]; do
+            case "$1" in
+                --workdir) shift 2 ;;
+                --) shift; break ;;
+                -*) shift ;;
+                *)  [ -n "$inst" ] || inst="$1"; shift ;;
+            esac
+        done
+        [ -n "$inst" ] || { printf 'fake-limactl: shell without an instance\n' >&2; exit 1; }
+        if [ -n "${FAKE_LIMA_SHELL:-}" ] && [ -x "${FAKE_LIMA_SHELL}" ]; then
+            exec "$FAKE_LIMA_SHELL" "$inst" "$@"
+        fi
+        printf 'fake-limactl: no FAKE_LIMA_SHELL handler; the guest cannot answer\n' >&2
+        exit 1
+        ;;
+    *)
+        printf 'fake-limactl: %s is not implemented (only list --quiet, list --format and shell are)\n' \
+            "${cmd:-<no subcommand>}" >&2
+        exit 1
+        ;;
+esac
