@@ -125,11 +125,11 @@ run options:
                       on model M that reviews the diff against the brief,
                       fixes real defects in their own commits, and writes
                       .agent-box/review.md. M must differ from --model.
-  --no-review         cancel a `review:` default from the config file
+  --no-review         cancel a \`review:\` default from the config file
 
   Standing defaults for --model, --max-budget-usd, --heal and --review go in
-  ${HOST_CONFIG_DIR}/config as `model: sonnet`, `max_budget_usd: 5`,
-  `heal: 1`, `review: opus`; the command line overrides each.
+  ${HOST_CONFIG_DIR}/config as \`model: sonnet\`, \`max_budget_usd: 5\`,
+  \`heal: 1\`, \`review: opus\`; the command line overrides each.
 
 create options — all off by default, all fixed for the life of the instance
 except the sizing, which 'resize' can change:
