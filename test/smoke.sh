@@ -744,6 +744,227 @@ else
 fi
 
 # ---- slot:5c (owner TA) ----
+# ===========================================================================
+step "5c. the baseline toolchain, at its pins, on a box created with no flags"
+# ===========================================================================
+#
+# $INSTANCE is created with no extra flags (see step 3), which is the whole
+# point: "baseline" means every box, not a profile. Every assertion here runs
+# on that box, and it is also the only place they CAN run — step 10 destroys
+# $INSTANCE long before step 12b.
+#
+# Nothing here calls `agentbox toolcheck`: that command and its by-name report
+# are slots 5d-5f. This step reads the committed pins on the host and asks the
+# guest what it actually has, so it holds on a checkout where toolcheck.sh does
+# not exist yet.
+
+PINS="${BOX_DIR}/guest/toolchain.pins"
+
+printf -- '--- every pin is in the committed file ---\n'
+if [ -f "$PINS" ]; then
+    ok "guest/toolchain.pins exists"
+else
+    bad "guest/toolchain.pins is missing; the rest of this step proves nothing"
+fi
+for tc_key in UV RUFF BASEDPYRIGHT MISE NODE PLAYWRIGHT SEMGREP TRUFFLEHOG ACTIONLINT DPRINT; do
+    # Read back with the idiom at :4167, never restated here.
+    tc_pin=$(sed -n "s/^${tc_key}_VERSION=\"\\(.*\\)\"\$/\\1/p" "$PINS" | head -1)
+    if [ -n "$tc_pin" ]; then
+        ok "toolchain.pins carries ${tc_key}_VERSION=${tc_pin}"
+    else
+        bad "no ${tc_key}_VERSION in guest/toolchain.pins"
+    fi
+done
+for tc_key in NODE_NPM_VERSION PLAYWRIGHT_CHROMIUM_REVISION CLAUDE_CODE_VERSION; do
+    tc_pin=$(sed -n "s/^${tc_key}=\"\\(.*\\)\"\$/\\1/p" "$PINS" | head -1)
+    if [ -n "$tc_pin" ]; then
+        ok "toolchain.pins carries ${tc_key}=${tc_pin}"
+    else
+        bad "no ${tc_key} in guest/toolchain.pins"
+    fi
+done
+# A digest that is not a digest is a download this box would refuse, so the
+# committed file is checked for shape before the box is asked anything.
+PINS_SHA_OUT="${TMP_ROOT}/pins-sha.out"
+grep -E '^[A-Z0-9_]+_SHA256_(ARM64|AMD64)="' "$PINS" > "$PINS_SHA_OUT" 2>&1 || true
+SHA_TOTAL=$(grep -c . "$PINS_SHA_OUT" 2>/dev/null || true)
+SHA_OK=$(grep -cE '^[A-Z0-9_]+_SHA256_(ARM64|AMD64)="[0-9a-f]{64}"$' "$PINS_SHA_OUT" 2>/dev/null || true)
+printf '%s digest lines, %s of them 64 hex characters\n' "${SHA_TOTAL:-0}" "${SHA_OK:-0}"
+if [ "${SHA_TOTAL:-0}" -ge 14 ] && [ "${SHA_TOTAL:-0}" = "${SHA_OK:-0}" ]; then
+    ok "every pinned digest is a sha256 (${SHA_OK} of them, two per binary tool)"
+else
+    bad "a pinned digest is not 64 hex characters (${SHA_OK:-0} of ${SHA_TOTAL:-0})"
+fi
+if grep -q '…' "$PINS"; then
+    bad "guest/toolchain.pins still carries a placeholder"
+else
+    ok "no placeholder is left in guest/toolchain.pins"
+fi
+
+printf -- '\n--- the installs happened AFTER the firewall came up, on the first boot ---\n'
+# The reason the whole toolchain is installed in §4b rather than in the open
+# window: under the standing deny, a create is a live test of every allowlist
+# entry. This is that ordering, read out of the guest's own journal.
+PROV_ORDER="${TMP_ROOT}/prov-order.out"
+guest sudo bash -c 'journalctl -b 0 --no-pager 2>/dev/null | grep -nE "Enabling the egress firewall|Installing the baseline toolchain from" | head -10' \
+    > "$PROV_ORDER" 2>&1 || true
+cat "$PROV_ORDER"
+FW_LINE=$(sed -n 's/^\([0-9]\{1,\}\):.*Enabling the egress firewall.*/\1/p' "$PROV_ORDER" | head -1)
+TC_LINE=$(sed -n 's/^\([0-9]\{1,\}\):.*Installing the baseline toolchain from.*/\1/p' "$PROV_ORDER" | head -1)
+case "${FW_LINE:-x}${TC_LINE:-x}" in
+    *[!0-9]*) bad "the first boot's journal does not carry both markers; the ordering is unproven" ;;
+    *)
+        if [ "$TC_LINE" -gt "$FW_LINE" ]; then
+            ok "the toolchain install ran after the firewall was enabled, so it crossed the allowlist"
+        else
+            bad "the toolchain install ran before the firewall was enabled"
+        fi ;;
+esac
+
+printf -- '\n--- every tool answers with the pinned version, in the guest ---\n'
+TC_VERS="${TMP_ROOT}/toolchain-versions.out"
+# One guest call, not twelve: a login shell, the way an agent's shell is.
+# `-version` as well as `--version` because actionlint's flag is single-dashed.
+# shellcheck disable=SC2016  # the loop must run in the guest, not on the host.
+guest bash -lc '
+for t in uv ruff node npm mise trufflehog actionlint dprint basedpyright semgrep playwright; do
+    printf "%s=" "$t"
+    { "$t" --version 2>&1 || "$t" -version 2>&1; } | head -1
+done' > "$TC_VERS" 2>&1 || true
+cat "$TC_VERS"
+for spec in uv:UV_VERSION ruff:RUFF_VERSION node:NODE_VERSION npm:NODE_NPM_VERSION \
+            mise:MISE_VERSION trufflehog:TRUFFLEHOG_VERSION actionlint:ACTIONLINT_VERSION \
+            dprint:DPRINT_VERSION basedpyright:BASEDPYRIGHT_VERSION semgrep:SEMGREP_VERSION \
+            playwright:PLAYWRIGHT_VERSION; do
+    tc_tool="${spec%%:*}"
+    tc_key="${spec#*:}"
+    tc_pin=$(sed -n "s/^${tc_key}=\"\\(.*\\)\"\$/\\1/p" "$PINS" | head -1)
+    tc_line=$(grep "^${tc_tool}=" "$TC_VERS" | head -1)
+    if [ -n "$tc_pin" ] && printf '%s' "$tc_line" | grep -qF -- "$tc_pin"; then
+        ok "toolchain: ${tc_tool} ${tc_pin} matches the pin"
+    else
+        bad "toolchain: ${tc_tool} is not at the pinned ${tc_pin:-<unread>} (${tc_line:-<no answer>})"
+    fi
+done
+
+printf -- '\n--- and each one is on PATH in a NON-login shell, which limactl shell is ---\n'
+TC_PATH="${TMP_ROOT}/toolchain-path.out"
+guest sh -c 'command -v uv uvx ruff node npm npx mise trufflehog actionlint dprint basedpyright semgrep playwright' \
+    > "$TC_PATH" 2>&1 || true
+cat "$TC_PATH"
+for tc_tool in uv ruff node npm mise trufflehog actionlint dprint basedpyright semgrep playwright; do
+    if grep -qE "/${tc_tool}\$" "$TC_PATH"; then
+        ok "toolchain: ${tc_tool} is on PATH in a non-login shell"
+    else
+        bad "toolchain: ${tc_tool} is not on PATH in a non-login shell"
+    fi
+done
+
+printf -- '\n--- one marker per tool, holding the version that was installed ---\n'
+TC_MARK="${TMP_ROOT}/toolchain-markers.out"
+guest bash -c 'ls -1 /var/lib/agent-box/toolchain/ 2>&1; echo "--- uv ---"; cat /var/lib/agent-box/toolchain/uv.installed 2>&1' \
+    > "$TC_MARK" 2>&1 || true
+cat "$TC_MARK"
+for m in uv ruff node mise trufflehog actionlint dprint basedpyright semgrep playwright \
+         playwright-deps chromium; do
+    if grep -qx "${m}.installed" "$TC_MARK"; then
+        ok "toolchain: a marker records ${m}"
+    else
+        bad "toolchain: no marker for ${m}, so its next start re-downloads it"
+    fi
+done
+UV_PIN=$(sed -n 's/^UV_VERSION="\(.*\)"$/\1/p' "$PINS" | head -1)
+if grep -qE "^${UV_PIN} [0-9a-f]{64} [0-9]{4}-" "$TC_MARK"; then
+    ok "toolchain: uv's marker carries the version, the digest and a timestamp"
+else
+    bad "toolchain: uv's marker is not '<version> <sha256> <iso8601>'"
+fi
+
+printf -- '\n--- Chromium, at the shared path, at the revision the installed Playwright names ---\n'
+CHROM_REV=$(sed -n 's/^PLAYWRIGHT_CHROMIUM_REVISION="\(.*\)"$/\1/p' "$PINS" | head -1)
+CHROM_OUT="${TMP_ROOT}/chromium-baseline.out"
+# shellcheck disable=SC2016  # $PLAYWRIGHT_BROWSERS_PATH must expand in the guest.
+guest bash -lc 'echo "BROWSERS_PATH=${PLAYWRIGHT_BROWSERS_PATH:-<unset>}"
+                ls -d "${PLAYWRIGHT_BROWSERS_PATH}"/chromium-* 2>&1
+                test -w "${PLAYWRIGHT_BROWSERS_PATH}" && echo BROWSERS_WRITABLE
+                find "${PLAYWRIGHT_BROWSERS_PATH}" -maxdepth 4 -type f -name "chrome" -o -maxdepth 4 -type f -name "headless_shell" 2>/dev/null | head -3' \
+    > "$CHROM_OUT" 2>&1 || true
+cat "$CHROM_OUT"
+if grep -q 'BROWSERS_PATH=/opt/ms-playwright' "$CHROM_OUT"; then
+    ok "toolchain: PLAYWRIGHT_BROWSERS_PATH is the shared path in a login shell"
+else
+    bad "toolchain: PLAYWRIGHT_BROWSERS_PATH is not /opt/ms-playwright in the guest"
+fi
+if [ -n "$CHROM_REV" ] && grep -q "chromium-${CHROM_REV}" "$CHROM_OUT"; then
+    ok "toolchain: chromium-${CHROM_REV} is installed at the shared browser path"
+else
+    bad "toolchain: no chromium-${CHROM_REV:-<unread>} at the shared browser path"
+fi
+if grep -q 'BROWSERS_WRITABLE' "$CHROM_OUT"; then
+    ok "toolchain: the agent can write there, so a project's own browser build fits"
+else
+    bad "toolchain: the shared browser path is not writable by the agent"
+fi
+if grep -qE 'chrome$|headless_shell$' "$CHROM_OUT"; then
+    ok "toolchain: a Chromium binary is on disk, so the download crossed the allowlist"
+else
+    bad "toolchain: no Chromium binary under the shared browser path"
+fi
+
+printf -- '\n--- and it launches: a downloaded browser that cannot start is a download ---\n'
+SHOT_OUT="${TMP_ROOT}/chromium-launch.out"
+run_bounded 300 "$SHOT_OUT" "$LIMACTL" shell --workdir /work "$INSTANCE" -- bash -lc '
+rm -f /tmp/abx-shot.png
+cd /tmp && playwright screenshot --browser chromium about:blank /tmp/abx-shot.png 2>&1 | tail -5
+ls -l /tmp/abx-shot.png 2>&1 | tail -1'
+cat "$SHOT_OUT"
+if grep -q '/tmp/abx-shot.png' "$SHOT_OUT" && ! grep -qi 'no such file' "$SHOT_OUT"; then
+    ok "toolchain: the baseline Chromium launches and renders on a no-flag box"
+else
+    bad "toolchain: the baseline Chromium did not launch on a no-flag box"
+fi
+guest rm -f /tmp/abx-shot.png || true
+
+printf -- '\n--- the system libraries and the Python plumbing the installer put there ---\n'
+TC_DEPS="${TMP_ROOT}/toolchain-deps.out"
+# shellcheck disable=SC2016  # the package loop must expand in the guest.
+guest bash -c 'dpkg -s libnss3 2>&1 | grep -E "^(Package|Status):"
+               python3 -m venv --help >/dev/null 2>&1 && echo VENV_OK
+               python3 -m pip --version 2>&1 | head -1
+               for p in xz-utils unzip zip python3-venv python3-pip; do
+                   printf "%s " "$p"
+                   dpkg-query -W -f="\${Status}\n" "$p" 2>&1
+               done' > "$TC_DEPS" 2>&1 || true
+cat "$TC_DEPS"
+if grep -q 'Status: install ok installed' "$TC_DEPS"; then
+    ok "toolchain: libnss3 is installed, so 'playwright install-deps' really ran"
+else
+    bad "toolchain: libnss3 is not installed"
+fi
+if grep -q 'VENV_OK' "$TC_DEPS"; then
+    ok "toolchain: python3 -m venv is available"
+else
+    bad "toolchain: python3 -m venv is not available"
+fi
+if grep -q '^pip ' "$TC_DEPS"; then
+    ok "toolchain: python3 -m pip is available"
+else
+    bad "toolchain: python3 -m pip is not available"
+fi
+for p in xz-utils unzip zip python3-venv python3-pip; do
+    if grep -q "^${p} install ok installed" "$TC_DEPS"; then
+        ok "toolchain: the installer's own package ${p} is installed"
+    else
+        bad "toolchain: ${p} is missing, so a tool that needs it was skipped"
+    fi
+done
+
+printf -- '\n--- what the baseline costs, on the guest disk (the measurement the PR owes) ---\n'
+# Printed, not asserted: the numbers in the design are ESTIMATES and this is
+# where the real ones come from.
+guest bash -c 'df -h / | tail -2
+               du -sh /opt/node /opt/abx-tools /opt/ms-playwright /usr/local/bin 2>/dev/null
+               du -sh /opt/abx-tools/* 2>/dev/null' 2>&1 || true
 # ---- end slot:5c ----
 
 # ---- slot:5d (owner TB) ----
@@ -3089,6 +3310,66 @@ cat "$FW_OUT2"
 if [ "$rc" -eq 0 ]; then ok "firewall-check still passes after the rebuild"; else bad "firewall-check failed after the rebuild"; fi
 
 # ---- slot:9-tc (owner TA) ----
+# ===========================================================================
+step "9-tc. the second boot installed nothing and never reopened the firewall"
+# ===========================================================================
+#
+# The load-bearing idempotency assertion for the toolchain. A tool whose
+# presence check silently never matches would cost a firewall window and a
+# download on EVERY start — provision.sh's own reasoning about optional
+# packages, applied to a new class of work — and nothing else would notice.
+#
+# Two independent proofs, because the log text and the filesystem can disagree:
+# what the provisioner said on this boot, and whether any marker was rewritten
+# after the restart began.
+
+BOOT2_LOG="${TMP_ROOT}/boot2-provision.out"
+guest sudo bash -c 'journalctl -b 0 --no-pager 2>/dev/null | grep -E "\[agent-box provision\]|\[agent-box toolchain\]" | tail -40' \
+    > "$BOOT2_LOG" 2>&1 || true
+cat "$BOOT2_LOG"
+# Vacuity guard: without the provisioner's own lines this step asserts nothing.
+if grep -q '\[agent-box provision\]' "$BOOT2_LOG"; then
+    ok "the second boot's provisioning log was read out of the guest journal"
+else
+    bad "no provisioning log for this boot; the toolchain idempotency is unproven"
+fi
+if grep -q 'All toolchain pins already satisfied' "$BOOT2_LOG"; then
+    ok "the second boot found every pin already installed"
+else
+    bad "the second boot did not report every pin already satisfied"
+fi
+if grep -q 'for the duration of the downloads' "$BOOT2_LOG"; then
+    bad "the second boot reopened the firewall — a toolchain install is not idempotent"
+else
+    ok "the second boot never reopened the firewall"
+fi
+if grep -qE '\[agent-box toolchain\] (uv|ruff|node|mise|dprint|semgrep|chromium)[^:]* installed at' "$BOOT2_LOG"; then
+    bad "the second boot installed a tool that was already at its pin"
+else
+    ok "the second boot installed nothing"
+fi
+
+printf -- '\n--- and no marker was rewritten after the restart began ---\n'
+# RESTART_TS is the host clock just before `agentbox start`, above. A marker
+# newer than that is a tool this boot re-downloaded.
+MARK_TS="${TMP_ROOT}/marker-mtimes.out"
+# shellcheck disable=SC2016  # the glob and $f must expand in the guest.
+guest bash -c 'for f in /var/lib/agent-box/toolchain/*.installed; do stat -c "%Y %n" "$f" 2>/dev/null; done' \
+    > "$MARK_TS" 2>&1 || true
+cat "$MARK_TS"
+NEWEST_MARK=$(awk '{print $1}' "$MARK_TS" | sort -n | tail -1)
+# Guest bytes: shape-checked before any arithmetic, never compared with -eq raw.
+case "${NEWEST_MARK:-x}" in
+    *[!0-9]*|"")
+        bad "no readable marker timestamps in the guest; nothing can be concluded" ;;
+    *)
+        printf 'newest marker %s, restart began %s\n' "$NEWEST_MARK" "$RESTART_TS"
+        if [ "$NEWEST_MARK" -lt "$RESTART_TS" ]; then
+            ok "every toolchain marker predates the restart, so nothing was reinstalled"
+        else
+            bad "a toolchain marker was rewritten during the second boot"
+        fi ;;
+esac
 # ---- end slot:9-tc ----
 
 # ===========================================================================
@@ -4374,52 +4655,83 @@ done
 step "12b. Node, Playwright and Rosetta"
 # ===========================================================================
 
-printf -- '--- node and npx ---\n'
+printf -- '--- the baseline reached a box created WITH flags too ---\n'
+# The toolchain is no longer a profile: --playwright is a deprecated no-op and
+# this box gets the same tools as the no-flag one. 5c is where the baseline is
+# proved in full, on $INSTANCE; here the point is only that a box created with
+# --docker --playwright --rosetta carries the same pinned versions — and that
+# the pin is read from guest/toolchain.pins, the one file that holds it.
+PINS="${BOX_DIR}/guest/toolchain.pins"
+NODE_PIN=$(sed -n 's/^NODE_VERSION="\(.*\)"$/\1/p' "$PINS" | head -1)
+NPM_PIN=$(sed -n 's/^NODE_NPM_VERSION="\(.*\)"$/\1/p' "$PINS" | head -1)
+PLAYWRIGHT_PIN=$(sed -n 's/^PLAYWRIGHT_VERSION="\(.*\)"$/\1/p' "$PINS" | head -1)
+printf 'pins: node %s, npm %s, playwright %s\n' \
+    "${NODE_PIN:-<unread>}" "${NPM_PIN:-<unread>}" "${PLAYWRIGHT_PIN:-<unread>}"
+if [ -n "$NODE_PIN" ] && [ -n "$NPM_PIN" ] && [ -n "$PLAYWRIGHT_PIN" ]; then
+    ok "guest/toolchain.pins carries the Node, npm and Playwright pins"
+else
+    bad "a pin is missing from guest/toolchain.pins; the rest of this step proves nothing"
+fi
+
 NODE_OUT="${TMP_ROOT}/node.out"
-"$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -lc 'node --version; npm --version' > "$NODE_OUT" 2>&1
+dguest bash -lc 'node --version; npm --version; command -v node npm npx' > "$NODE_OUT" 2>&1 || true
 cat "$NODE_OUT"
-if grep -qE '^v22\.' "$NODE_OUT"; then
-    ok "node --version is 22.x"
+if grep -qx "v${NODE_PIN}" "$NODE_OUT"; then
+    ok "node is at the pinned ${NODE_PIN} on the docker box"
 else
-    bad "node --version is not 22.x"
+    bad "node is not at the pinned ${NODE_PIN} on the docker box"
+fi
+if grep -qx "$NPM_PIN" "$NODE_OUT"; then
+    ok "npm is the ${NPM_PIN} the tarball bundles"
+else
+    bad "npm is not the pinned ${NPM_PIN}"
+fi
+if grep -qx '/usr/local/bin/npx' "$NODE_OUT"; then
+    ok "npx is on PATH from the pinned Node"
+else
+    bad "npx is not on PATH"
 fi
 
-# The pin, read from the provisioner rather than restated here, so the two can
-# never drift. `npx --yes playwright --version` resolves the `latest` dist-tag
-# again at test time, so on its own it asserts nothing about the pin and would
-# keep passing after 1.63.0 stopped being latest.
-PLAYWRIGHT_PIN=$(sed -n 's/^PLAYWRIGHT_VERSION="\(.*\)"$/\1/p' "${BOX_DIR}/guest/provision.sh" | head -1)
-printf 'the pin in guest/provision.sh is %s\n' "${PLAYWRIGHT_PIN:-<unread>}"
-if [ -n "$PLAYWRIGHT_PIN" ]; then
-    ok "guest/provision.sh carries a pinned Playwright version"
-else
-    bad "no PLAYWRIGHT_VERSION pin found in guest/provision.sh"
-fi
-
+printf -- '\n--- Playwright: the LOCAL install answers, not a fresh npx resolve ---\n'
+# `npx --yes playwright@<pin> --version` used to stand here. It resolves from
+# the registry at test time, so it asserted nothing about what the box installed
+# — the same argument the old comment made about the `latest` dist-tag, applied
+# one level up. The pinned local install is what a run actually uses.
 PW_OUT="${TMP_ROOT}/playwright.out"
 run_bounded 300 "$PW_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
-    bash -lc "npx --yes playwright@${PLAYWRIGHT_PIN} --version"
+    bash -lc 'command -v playwright; playwright --version'
 cat "$PW_OUT"
 if grep -qiE "Version ${PLAYWRIGHT_PIN}" "$PW_OUT"; then
-    ok "the pinned Playwright ${PLAYWRIGHT_PIN} resolves and runs in the guest"
+    ok "the locally installed Playwright reports the pinned ${PLAYWRIGHT_PIN}"
 else
-    bad "playwright@${PLAYWRIGHT_PIN} did not report version ${PLAYWRIGHT_PIN}"
+    bad "the installed playwright did not report version ${PLAYWRIGHT_PIN}"
+fi
+if grep -q '/usr/local/bin/playwright' "$PW_OUT"; then
+    ok "and it is the one on PATH, out of /opt/abx-tools"
+else
+    bad "playwright is not on PATH from the pinned install"
 fi
 
-# And that the pin is what provisioning actually used: the marker file
-# install_playwright_deps writes names the version it ran.
+# And that the pin is what provisioning actually used: the marker
+# install-toolchain.sh writes names the version it ran.
 PWMARK_OUT="${TMP_ROOT}/playwright-marker.out"
-dguest bash -c 'cat /var/lib/agent-box/playwright-deps-installed 2>&1' > "$PWMARK_OUT" 2>&1
+dguest bash -c 'cat /var/lib/agent-box/toolchain/playwright-deps.installed 2>&1;
+                ls /var/lib/agent-box/playwright-deps-installed 2>&1' > "$PWMARK_OUT" 2>&1 || true
 cat "$PWMARK_OUT"
-if grep -q "playwright@${PLAYWRIGHT_PIN} install-deps" "$PWMARK_OUT"; then
+if grep -q "^${PLAYWRIGHT_PIN} " "$PWMARK_OUT"; then
     ok "install-deps was run from the pinned version, per its own marker"
 else
-    bad "the install-deps marker does not name playwright@${PLAYWRIGHT_PIN}"
+    bad "the install-deps marker does not name playwright ${PLAYWRIGHT_PIN}"
+fi
+if grep -q 'No such file' "$PWMARK_OUT"; then
+    ok "and the npx-era marker was removed when its replacement was written"
+else
+    bad "the old playwright-deps-installed marker is still there"
 fi
 
 printf -- '\n--- a Playwright system library is installed ---\n'
 NSS_OUT="${TMP_ROOT}/libnss3.out"
-dguest bash -c 'dpkg -s libnss3 2>&1 | grep -E "^(Package|Status):"' > "$NSS_OUT" 2>&1
+dguest bash -c 'dpkg -s libnss3 2>&1 | grep -E "^(Package|Status):"' > "$NSS_OUT" 2>&1 || true
 cat "$NSS_OUT"
 if grep -q 'Status: install ok installed' "$NSS_OUT"; then
     ok "libnss3 is installed, so install-deps really ran"
@@ -4430,15 +4742,24 @@ fi
 printf -- '\n--- and a real browser download, through the allowlist, in deny mode ---\n'
 # Installing the system libraries proves apt reached the archive. It does not
 # prove the browser can be fetched, and those are different hosts: Playwright
-# 1.63 asks cdn.playwright.dev and is answered 307 to storage.googleapis.com,
-# which was off-list until a real download found it. Only a real download
-# finds a redirect, so the suite now does one.
+# asks cdn.playwright.dev and is answered 307 to storage.googleapis.com, which
+# was off-list until a real download found it. Only a real download finds a
+# redirect, so the suite still does one.
 #
-# `--with-deps` is deliberately NOT used: the deps are already installed and it
-# would turn this into an apt test as well.
+# Into a throwaway browser directory, not the shared /opt/ms-playwright: the
+# baseline install is already there and deleting it to re-download it would take
+# the box off baseline for every later step. `--with-deps` is deliberately not
+# used: the deps are installed and it would turn this into an apt test as well.
 BROWSER_OUT="${TMP_ROOT}/browser-download.out"
-run_bounded 900 "$BROWSER_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
-    bash -lc "rm -rf ~/.cache/ms-playwright && npx --yes playwright@${PLAYWRIGHT_PIN} install chromium 2>&1 | tail -20; echo \"INSTALL_RC=\${PIPESTATUS[0]}\""
+# shellcheck disable=SC2016  # every expansion below belongs to the guest shell.
+run_bounded 900 "$BROWSER_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- bash -lc '
+export PLAYWRIGHT_BROWSERS_PATH="${HOME}/abx-browser-probe"
+rm -rf "$PLAYWRIGHT_BROWSERS_PATH"
+playwright install chromium 2>&1 | tail -20
+echo "INSTALL_RC=${PIPESTATUS[0]}"
+find "$PLAYWRIGHT_BROWSERS_PATH" -maxdepth 4 -type f -name chrome -o -maxdepth 4 -type f -name headless_shell 2>/dev/null | head -3
+du -sh "$PLAYWRIGHT_BROWSERS_PATH" 2>/dev/null | tail -1
+rm -rf "$PLAYWRIGHT_BROWSERS_PATH"'
 browser_rc=$BOUNDED_RC
 cat "$BROWSER_OUT"
 if [ "$browser_rc" -eq 0 ] && grep -q '^INSTALL_RC=0' "$BROWSER_OUT"; then
@@ -4446,41 +4767,12 @@ if [ "$browser_rc" -eq 0 ] && grep -q '^INSTALL_RC=0' "$BROWSER_OUT"; then
 else
     bad "playwright install chromium failed under the standing deny (exit ${browser_rc})"
 fi
-# The binary, not just a zero exit: a cached or skipped install would also
-# exit 0, and the point is that the bytes crossed the allowlist.
-BROWSER_BIN_OUT="${TMP_ROOT}/browser-bin.out"
-dguest bash -lc 'find ~/.cache/ms-playwright -maxdepth 3 -type f -name headless_shell -o -maxdepth 3 -type f -name chrome 2>/dev/null | head -3; du -sh ~/.cache/ms-playwright 2>/dev/null | tail -1' > "$BROWSER_BIN_OUT" 2>&1
-cat "$BROWSER_BIN_OUT"
-if grep -qE 'chrome|headless_shell' "$BROWSER_BIN_OUT"; then
+# The binary, not just a zero exit: a cached or skipped install would also exit
+# 0, and the point is that the bytes crossed the allowlist.
+if grep -qE 'chrome$|headless_shell$' "$BROWSER_OUT"; then
     ok "a Chromium binary is on disk, so the download really crossed the allowlist"
 else
     bad "no Chromium binary after the install"
-fi
-# And it runs. A downloaded browser that cannot start is a download, not a
-# browser, and this is the one thing the Playwright half never proved.
-BROWSER_RUN_OUT="${TMP_ROOT}/browser-run.out"
-run_bounded 300 "$BROWSER_RUN_OUT" "$LIMACTL" shell --workdir /work "$DOCKER_INSTANCE" -- \
-    bash -lc "cd /tmp && npx --yes playwright@${PLAYWRIGHT_PIN} screenshot --browser chromium about:blank /tmp/abx-shot.png 2>&1 | tail -5; ls -l /tmp/abx-shot.png 2>&1 | tail -1"
-cat "$BROWSER_RUN_OUT"
-if grep -q '/tmp/abx-shot.png' "$BROWSER_RUN_OUT" && ! grep -qi 'no such file' "$BROWSER_RUN_OUT"; then
-    ok "the downloaded Chromium actually launches and renders"
-else
-    bad "the downloaded Chromium did not launch"
-fi
-
-printf -- '\n--- python3-venv and pip, for pytest-playwright ---\n'
-PY3_OUT="${TMP_ROOT}/py3.out"
-dguest bash -c 'python3 -m venv --help >/dev/null 2>&1 && echo VENV_OK; python3 -m pip --version 2>&1 | head -1' > "$PY3_OUT" 2>&1
-cat "$PY3_OUT"
-if grep -q 'VENV_OK' "$PY3_OUT"; then
-    ok "python3 -m venv is available"
-else
-    bad "python3 -m venv is not available"
-fi
-if grep -q '^pip ' "$PY3_OUT"; then
-    ok "python3 -m pip is available"
-else
-    bad "python3 -m pip is not available"
 fi
 
 printf -- '\n--- Rosetta runs a linux/amd64 image ---\n'
