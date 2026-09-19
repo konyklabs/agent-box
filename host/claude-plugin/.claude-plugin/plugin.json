@@ -1,0 +1,17 @@
+{
+  "name": "agentbox-channel",
+  "version": "0.1.0",
+  "description": "Reminds a host Claude Code session about the agent-box channel: an unread handoff from a box's standing session, or a request still open, printed as a host-authored line naming the box and the command to read it. Nothing from inside a box reaches the session through this plugin's hooks — only validated ids and agentbox's own text.",
+  "author": {
+    "name": "Oleg Konyk",
+    "url": "https://olegkonyk.com"
+  },
+  "homepage": "https://github.com/konyklabs/agent-box",
+  "repository": "https://github.com/konyklabs/agent-box",
+  "license": "MIT",
+  "keywords": [
+    "agent-box",
+    "channel",
+    "hooks"
+  ]
+}

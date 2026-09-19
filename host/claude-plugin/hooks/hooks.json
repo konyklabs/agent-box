@@ -1,0 +1,19 @@
+{
+  "description": "agentbox-channel: on SessionStart and UserPromptSubmit, asks 'bin/agentbox channel-hook <Event>' whether any box this session is working in has something open in its channel, and if so prints one host-authored line naming it.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook SessionStart", "timeout": 10}
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {"type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/../../bin/agentbox\" channel-hook UserPromptSubmit", "timeout": 10}
+        ]
+      }
+    ]
+  }
+}
