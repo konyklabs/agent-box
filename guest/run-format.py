@@ -63,11 +63,13 @@ REASON_LIMIT = 120
 CHANNEL_BODY_LIMIT = 16384
 CHANNEL_FILE_LIMIT = 65536
 
-# A mode whose block is not built in this checkout. The shell side says the same
-# thing from `die` in its stubs, for the same reason: a dispatched mode with an
-# empty body must fail loudly rather than print nothing and exit 0, which every
-# caller would read as "there is nothing to report".
-NOT_BUILT = "run-format: %s is not built in this checkout"
+# A mode whose block this checkout does not carry fails loudly from its own
+# stub, which prints its message and returns 1: a dispatched mode with an empty
+# body that printed nothing and exited 0 would read to every caller as "there is
+# nothing to report". The shell side's `die` in its stubs says the same for the
+# same reason. Each message is written out inside its stub rather than shared
+# from here, so the last stub to be replaced takes the last of that wording with
+# it -- the finish slice greps this file for the phrase and expects none left.
 
 # System events the CLI emits for its own bookkeeping, several per turn, that
 # tell an operator nothing: token-count estimates while the model thinks,
@@ -1025,7 +1027,7 @@ def cmd_sessions(args):
 
 
 def cmd_survivors(_args):
-    print(NOT_BUILT % "the leftovers reader", file=sys.stderr)
+    print("run-format: the leftovers reader is not built in this checkout", file=sys.stderr)
     return 1
 
 
@@ -1082,12 +1084,12 @@ def cmd_list(args):
 
 
 def cmd_channel_list(_args):
-    print(NOT_BUILT % "the channel listing", file=sys.stderr)
+    print("run-format: the channel listing is not built in this checkout", file=sys.stderr)
     return 1
 
 
 def cmd_channel_read(_args):
-    print(NOT_BUILT % "the channel reader", file=sys.stderr)
+    print("run-format: the channel reader is not built in this checkout", file=sys.stderr)
     return 1
 
 
@@ -1161,7 +1163,7 @@ def cmd_box_text(args):
 
 
 def cmd_box_triage(_args):
-    print(NOT_BUILT % "the box triage", file=sys.stderr)
+    print("run-format: the box triage is not built in this checkout", file=sys.stderr)
     return 1
 
 
@@ -1200,9 +1202,15 @@ def main(argv=None):
     parser.add_argument(
         "--channel-list", action="store_true", help="list this box's channel messages"
     )
+    # The default is None, not "", because this flag both SELECTS the mode and
+    # carries its argument. An empty id is a caller bug, and the mode that was
+    # asked for is the one that must answer for it: dispatching on truthiness
+    # would send `--channel-read ""` to the log printer instead, which prints a
+    # run's console output and exits 0 -- a wrong answer, framed as a message,
+    # where the reader would have said `invalid` and failed.
     parser.add_argument(
         "--channel-read",
-        default="",
+        default=None,
         metavar="ID",
         help="print one channel message, scrubbed",
     )
@@ -1248,7 +1256,7 @@ def main(argv=None):
         return cmd_survivors(args)
     if args.channel_list:
         return cmd_channel_list(args)
-    if args.channel_read:
+    if args.channel_read is not None:
         return cmd_channel_read(args)
     if args.list:
         return cmd_list(args)
