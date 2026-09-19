@@ -230,7 +230,7 @@ cmd_stop() {
             # signal and the sentence would not be true.
             printf 'run-ctl: WARNING: pgrep is not installed, so only the CLI itself will be signalled, not its children\n' >&2
         fi
-        for pid in $(descendants_deepest_first "$claude_pid"); do
+        for pid in $(abx_descendants_deepest_first "$claude_pid"); do
             kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
         done
         [ "$signalled" -gt 0 ] || printf 'run-ctl: WARNING: could not signal the CLI (pid %s)\n' "$claude_pid" >&2
@@ -429,16 +429,6 @@ newest_running() {
     printf '%s\n' "$newest"
 }
 
-# Depth-first pid list under a root pid, children before parents.
-descendants_deepest_first() {
-    local root="${1:?}" child
-    # shellcheck disable=SC2046  # one pid per line is exactly what is wanted.
-    for child in $(pgrep -P "$root" 2>/dev/null); do
-        descendants_deepest_first "$child"
-    done
-    printf '%s\n' "$root"
-}
-
 # ---------------------------------------------------------------------------
 # sessions
 # ---------------------------------------------------------------------------
@@ -518,6 +508,9 @@ last_event_json() {
 # The status file keeps the code the run exited with; a `stopped` marker beside
 # it says the run was interrupted. `exit:3` is never reinterpreted: it is the
 # leak check's, and `logs` keys its refusal off exactly that string.
+#
+# Every state emitted here must be accepted by bin/agentbox:valid_run_state, or
+# the host silently calls it unknown (agent-box#24).
 derived_state() {
     local dir="${1:?}" raw
     raw=$(abx_status_read "$dir")
@@ -780,7 +773,7 @@ base_commit_of() {
 }
 
 cmd_review() {
-    local of="" parent_state="" dir state reviewer base ahead child brief origin_line obrief slug
+    local of="" parent_state="" dir state reviewer base ahead child brief origin_line obrief
     while [ $# -gt 0 ]; do
         case "$1" in
             --of)           of="${2:?--of needs a run id}"; shift 2 ;;
@@ -809,7 +802,7 @@ cmd_review() {
 
     base=$(base_commit_of "$dir") || die "run ${of} recorded no base commit; cannot bound the diff"
     ahead=$(git -C "$ABX_WORK_DIR" rev-list --count "${base}..HEAD" 2>/dev/null) || ahead=""
-    case "$ahead" in ''|*[!0-9]*) die "cannot count commits past ${base} in ${ABX_WORK}" ;; esac
+    case "$ahead" in ''|*[!0-9]*) die "cannot count commits past ${base} in ${ABX_WORK_DIR}" ;; esac
     if [ "$ahead" -eq 0 ] && [ -z "$(git -C "$ABX_WORK_DIR" status --porcelain 2>/dev/null)" ]; then
         printf 'nothing to review: no commits past %s and a clean tree\n' "$(git -C "$ABX_WORK_DIR" rev-parse --short "$base")"
         return 2
@@ -847,7 +840,6 @@ cmd_review() {
     # that dies on the environment is healed like any other run.
     local heal_left; heal_left=$(meta_field "$dir" heal_left)
     case "$heal_left" in ''|*[!0-9]*) heal_left=0 ;; esac
-    slug=$(meta_field "$dir" slug); [ -n "$slug" ] || slug="task"
     start_followup "$dir" "$of" "$brief" "$child" "$heal_left" review "$reviewer" \
         || die "could not start the review run for ${of}"
 }

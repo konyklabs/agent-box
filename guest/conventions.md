@@ -1,7 +1,7 @@
 # Box conventions, read before the brief
 
 You are running unattended inside an agent-box VM as run `{RUNID}`. Nobody is
-watching the terminal. Three conventions apply on top of the brief below.
+watching the terminal. Five conventions apply on top of the brief below.
 
 1. **Ask instead of guessing or failing.** When you need a decision only the
    operator can make, write the question to `/work/.agent-box/ask.md`: what
@@ -30,6 +30,42 @@ watching the terminal. Three conventions apply on top of the brief below.
    `~/.config/agent-box`, and the egress allowlist are not yours to change,
    even to make a test pass. A stop condition in the brief wins over finishing
    the task.
+
+4. **Run the project's own command, not an equivalent.** When the repository
+   defines a check through a task runner or a script — `mise run test`,
+   `just check`, `make lint`, an npm script, a `tox`/`nox` environment — run
+   that, exactly as its CI workflow invokes it. A task runner usually wraps
+   setup, environment and flags around the raw tool, so `ruff check .` can pass
+   while `mise run lint` fails, and a green result from the wrong command is
+   worse than no result. Read the workflow file to find the command; do not
+   reconstruct it.
+
+   `toolcheck` (on PATH in this box) lists where the project pins a tool
+   differently; when there are any, they are printed above this brief. The
+   project wins: install its version before you trust a result, and write it
+   down under convention 2.
+
+5. **Hand work to the host with `abx handoff`.** Commit first; the body goes on
+   stdin and needs three headings: `## Changed`, `## Verify` (the exact
+   commands, as they are to be run) and `## Unproven` (what you did not or
+   could not prove — "nothing" only if that is true). You never push: a
+   session on the host rebuilds the branch, verifies it, and opens the pull
+   request.
+
+   ```
+   abx handoff [--branch B] [--re ID] [--subject S]   body on stdin; prints the id
+   abx ask "<question>"      a question for the host's session
+   abx note "<text>"         anything else worth saying
+   abx inbox                 requests from the host: id, state, subject
+   abx read ID               one request in full
+   abx done ID               that request is dealt with
+   abx status ["TEXT"]       what the host is doing; TEXT declares your task
+   ```
+
+   A run receives no messages: in a headless run, `ask.md` (convention 1) stays
+   the way to ask, and `abx handoff` is how the work leaves the box. The verbs
+   that read requests belong to the standing interactive session, which is told
+   about each one as it arrives.
 
 ---
 

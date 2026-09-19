@@ -44,9 +44,32 @@ RUNS_DIR = os.environ.get("ABX_RUNS_DIR", os.path.join(STATE_DIR, "runs"))
 TOKEN_FILE = os.environ.get(
     "ABX_TOKEN_FILE", os.path.join(HOME, ".config", "agent-box", "token")
 )
+# The one mounted repository, as guest/lib.sh's ABX_WORK_DIR sees it. What is
+# read from under here is the host's disk -- and, for the channel, the host's own
+# words; what is written to it crosses with no second chance to redact.
+WORK_DIR = os.environ.get("AGENT_BOX_WORK", "/work")
 
 TEXT_LIMIT = 160
 DETAIL_LIMIT = 120
+# A path an agent chose: a worktree a run left behind, a ledger entry. Long
+# enough to recognise, short enough that a hostile one cannot flood a terminal.
+PATH_LIMIT = 200
+# One triage reason, of at most six.
+REASON_LIMIT = 120
+# The channel's two sizes: the body the sanctioned writer will produce, and the
+# file size above which a reader refuses a message outright rather than reading
+# it. The second is not a truncation -- a file that large was not written by the
+# tool, so the honest answer about it is `invalid`.
+CHANNEL_BODY_LIMIT = 16384
+CHANNEL_FILE_LIMIT = 65536
+
+# A mode whose block this checkout does not carry fails loudly from its own
+# stub, which prints its message and returns 1: a dispatched mode with an empty
+# body that printed nothing and exited 0 would read to every caller as "there is
+# nothing to report". The shell side's `die` in its stubs says the same for the
+# same reason. Each message is written out inside its stub rather than shared
+# from here, so the last stub to be replaced takes the last of that wording with
+# it -- the finish slice greps this file for the phrase and expects none left.
 
 # System events the CLI emits for its own bookkeeping, several per turn, that
 # tell an operator nothing: token-count estimates while the model thinks,
@@ -922,8 +945,7 @@ def cmd_last_text(args):
 
 def cmd_learnings(args):
     """/work/.agent-box/learnings.md, scrubbed. Written by the runs, read by people."""
-    work = os.environ.get("AGENT_BOX_WORK", "/work")
-    path = os.path.join(work, ".agent-box", "learnings.md")
+    path = os.path.join(WORK_DIR, ".agent-box", "learnings.md")
     text = read_text(path)
     if not text.strip():
         print("no learnings recorded yet (%s)" % path, file=sys.stderr)
@@ -995,6 +1017,20 @@ def cmd_sessions(args):
     return 0
 
 
+# --- leftovers -------------------------------------------------------------
+#
+# What earlier runs left running, read from the resource ledger a run keeps in
+# the guest home. `_leftovers_or_none`, `_clean_leftovers`, `_fold_leftovers` and
+# the body of `cmd_survivors` belong to the slice that builds the ledger; the
+# skeleton owns the name, the dispatch and the `--leftovers` argument, so the
+# status object and this mode cannot disagree about either.
+
+
+def cmd_survivors(_args):
+    print("run-format: the leftovers reader is not built in this checkout", file=sys.stderr)
+    return 1
+
+
 LIST_COLUMNS = (
     ("runid", "RUNID", 15),
     ("state", "STATE", 8),
@@ -1034,6 +1070,27 @@ def cmd_list(args):
             cells.append("%-*s" % (width, scrub(shown)))
         print("  ".join(cells).rstrip())
     return 0
+
+
+# --- the channel -----------------------------------------------------------
+#
+# The two read paths for messages on the mount. Reading is done here, in Python,
+# rather than in the shell, for the reason every other read is: a message in
+# `to-host/` was written by the model, and one in `to-box/` arrives on a mount
+# whose contents the host controls -- both are untrusted bytes that must be
+# shape-checked and scrubbed before anything prints them. `read_message`,
+# `cmd_channel_list` and `cmd_channel_read` belong to the channel slice; the
+# skeleton owns the caps above, the names, and the dispatch.
+
+
+def cmd_channel_list(_args):
+    print("run-format: the channel listing is not built in this checkout", file=sys.stderr)
+    return 1
+
+
+def cmd_channel_read(_args):
+    print("run-format: the channel reader is not built in this checkout", file=sys.stderr)
+    return 1
 
 
 def cmd_box_json(args):
@@ -1096,6 +1153,20 @@ def cmd_box_text(args):
     return 0
 
 
+# --- triage ----------------------------------------------------------------
+#
+# One finished verdict about this box, built in the guest because the verdict
+# needs the run state and the host is not allowed to parse guest bytes. The
+# host's own facts come in as arguments (`--triage-facts`), which is why nothing
+# here has to reach back to the host for anything. `cmd_box_triage` belongs to
+# the triage slice; the skeleton owns the name, the caps and the dispatch.
+
+
+def cmd_box_triage(_args):
+    print("run-format: the box triage is not built in this checkout", file=sys.stderr)
+    return 1
+
+
 def cmd_scrub_stdin(_args):
     """Copy stdin to stdout, scrubbed.
 
@@ -1124,6 +1195,26 @@ def main(argv=None):
     parser.add_argument("--learnings", action="store_true", help="print /work/.agent-box/learnings.md, scrubbed")
     parser.add_argument("--sessions-in", action="store_true", help="format a session list from stdin")
     parser.add_argument(
+        "--survivors-in",
+        action="store_true",
+        help="format a leftovers list from stdin",
+    )
+    parser.add_argument(
+        "--channel-list", action="store_true", help="list this box's channel messages"
+    )
+    # The default is None, not "", because this flag both SELECTS the mode and
+    # carries its argument. An empty id is a caller bug, and the mode that was
+    # asked for is the one that must answer for it: dispatching on truthiness
+    # would send `--channel-read ""` to the log printer instead, which prints a
+    # run's console output and exits 0 -- a wrong answer, framed as a message,
+    # where the reader would have said `invalid` and failed.
+    parser.add_argument(
+        "--channel-read",
+        default=None,
+        metavar="ID",
+        help="print one channel message, scrubbed",
+    )
+    parser.add_argument(
         "--force-unsafe",
         action="store_true",
         help="print a leak-flagged run's output anyway",
@@ -1135,10 +1226,20 @@ def main(argv=None):
     )
     parser.add_argument("--box-json", action="store_true", help="one JSON line per box")
     parser.add_argument("--box-text", action="store_true", help="one text line per box")
+    parser.add_argument(
+        "--box-triage", action="store_true", help="one JSON line: this box's triage verdict"
+    )
     parser.add_argument("--claude-version", default="")
     parser.add_argument("--firewall", default="unknown")
     parser.add_argument("--firewall-detail", default="")
     parser.add_argument("--sessions", default="[]")
+    # The gathered halves the status and triage scripts pass in. Each default is
+    # the value that means "nobody answered", so a box whose gatherer is missing
+    # reports null rather than an empty reading: "[]" parses to an empty list and
+    # "" to nothing at all, which is the distinction _sessions_or_none draws.
+    parser.add_argument("--leftovers", default="[]")
+    parser.add_argument("--toolchain", default="")
+    parser.add_argument("--triage-facts", default="")
     args = parser.parse_args(argv)
 
     if args.scrub_stdin:
@@ -1147,8 +1248,16 @@ def main(argv=None):
         return cmd_box_text(args)
     if args.box_json:
         return cmd_box_json(args)
+    if args.box_triage:
+        return cmd_box_triage(args)
     if args.sessions_in:
         return cmd_sessions(args)
+    if args.survivors_in:
+        return cmd_survivors(args)
+    if args.channel_list:
+        return cmd_channel_list(args)
+    if args.channel_read is not None:
+        return cmd_channel_read(args)
     if args.list:
         return cmd_list(args)
     if args.summary:

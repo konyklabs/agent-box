@@ -79,7 +79,9 @@ else
     while IFS= read -r r; do
         [ -n "$r" ] || continue
         case "$r" in *"-j ACCEPT") ;; *) continue ;; esac
-        expected_accept "$r" || unexpected="$r"
+        # Accumulated, not assigned: with two unexpected accepts in the chain,
+        # naming only the last one sends the operator to fix half of it.
+        expected_accept "$r" || unexpected="${unexpected}${unexpected:+, }${r}"
     done < <(printf '%s\n' "$body")
 
     if [ -n "$unexpected" ]; then
