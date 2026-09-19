@@ -10,6 +10,12 @@
 #
 # Usage: test/smoke.sh
 #
+# Two development aids, neither of which may appear in a pull request's evidence:
+# SMOKE_STOP_AFTER=<step label> stops the run at the next step boundary and
+# prints STOPPED AFTER <label> above the RESULT line, and SMOKE_KEEP=1 leaves the
+# boxes and the temporary repositories in place for the next iteration. The
+# output pasted for a change has to come from a run with neither set.
+#
 # Run it from a terminal, or detach it with a launcher that resets signal
 # dispositions (python's subprocess with preexec_fn, say). A background job of
 # a non-interactive shell (`nohup test/smoke.sh &`) inherits SIGINT as IGNORED,
@@ -57,13 +63,22 @@ DOCKER_INSTANCE="agent-box-dk-${SMOKE_ID}"
 # to see a box go missing from it, and one box can never show that.
 SECOND_REPO="${TMP_ROOT}/second-${SMOKE_ID}"
 SECOND_INSTANCE="agent-box-second-${SMOKE_ID}"
-FORWARD_PORT=3999
 # A SECOND forwarded port, carrying a container published the ordinary way
 # (`-p N:80`, which binds 0.0.0.0), and one port deliberately left out of
 # --forward. Together they pin down both halves of the claim the whole design
 # rests on: what --forward reaches, and what nothing reaches.
-FORWARD_PORT2=3998
-UNFORWARDED_PORT=3997
+#
+# Derived from this run's pid, not hardcoded, and probed free in the preamble
+# below. Three fixed ports were an undeclared precondition: an unrelated process
+# holding one of them made step 12 report a FIREWALL BREACH ("nothing answers on
+# host 127.0.0.1:${UNFORWARDED_PORT}") for what was really a port collision.
+# 20000-27999 is above the privileged ports and below both 32768 and macOS's
+# ephemeral range (49152-65535, `sysctl net.inet.ip.portrange.first`), so the
+# kernel never hands one of these out as a source port for the many outbound
+# connections this suite makes. Do not re-hardcode them.
+FORWARD_PORT=$((20000 + ($$ % 8000)))
+FORWARD_PORT2=$((FORWARD_PORT + 1))
+UNFORWARDED_PORT=$((FORWARD_PORT + 2))
 
 # The host's python, for parsing JSON the guest produced. Named once so the
 # assertions below read as assertions rather than as plumbing.
@@ -77,18 +92,65 @@ FAIL=0
 WARN=0
 
 hr()   { printf '%s\n' '==============================================================='; }
-step() { hr; printf '## %s\n' "$*"; hr; }
 ok()   { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 bad()  { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
 adv()  { WARN=$((WARN + 1)); printf 'WARN  %s\n' "$*"; }
+
+# The verdict for an early exit, in one place. Three of them used to print their
+# own copy of the RESULT block, which is how a fourth early exit becomes a fourth
+# copy. (The suite's own ending is written out at the bottom of the file, for a
+# reason stated there.)
+#
+# With a label it prints STOPPED AFTER <label> first, so a transcript truncated
+# by SMOKE_STOP_AFTER can never be mistaken for a full run. CONTRIBUTING.md's
+# "paste the output" means an unfiltered run, and this line is what makes that
+# checkable by a reader rather than by trust.
+summarise_and_exit() {
+    [ -z "${1:-}" ] || printf 'STOPPED AFTER %s\n' "$1"
+    hr
+    printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"
+    hr
+    [ "$FAIL" -eq 0 ]
+    exit
+}
+
+# The step banner, and the only place SMOKE_STOP_AFTER is honoured. The label is
+# the banner's first word without its trailing dot, so `step "8h. status: …"` is
+# step 8h. The test is against the step that just FINISHED, which is the honest
+# thing this can implement: a run stops at a step boundary and what you get is a
+# prefix of the suite — stopping after 8h skips two VM creates.
+SMOKE_LAST_STEP=""
+# Set by cleanup() before it calls step(), because cleanup is the EXIT trap: a
+# stop firing from inside it would exit before the three destroys and leave three
+# real VMs and $TMP_ROOT behind.
+SMOKE_IN_CLEANUP=0
+step() {
+    hr; printf '## %s\n' "$*"; hr
+    local label="${1%% *}"
+    label="${label%.}"
+    if [ -n "${SMOKE_STOP_AFTER:-}" ] && [ "$SMOKE_IN_CLEANUP" -eq 0 ] \
+       && [ "$SMOKE_LAST_STEP" = "$SMOKE_STOP_AFTER" ]; then
+        summarise_and_exit "$SMOKE_LAST_STEP"
+    fi
+    SMOKE_LAST_STEP="$label"
+}
 
 # Set while the stand-in CLI is in place, so that an abort restores the real
 # one rather than leaving it parked at claude.real.
 STANDIN_INSTALLED=0
 
+# Background processes a step started and wants killed however the suite ends —
+# a listener holding a port, a waiter on a channel. Appended to by the step,
+# emptied by nobody: cleanup kills them all.
+SMOKE_BG_PIDS=()
+
 cleanup() {
-    local rc=$? inst
+    local rc=$? inst pid
+    SMOKE_IN_CLEANUP=1
     step "cleanup"
+    for pid in ${SMOKE_BG_PIDS[@]+"${SMOKE_BG_PIDS[@]}"}; do
+        kill "$pid" 2>/dev/null || true
+    done
     if [ "${STANDIN_INSTALLED:-0}" -eq 1 ]; then
         printf 'restoring the real Claude Code in %s\n' "$INSTANCE"
         # shellcheck disable=SC2016  # $HOME must expand in the guest.
@@ -96,6 +158,20 @@ cleanup() {
             bash -lc 'mv -f "$HOME/.local/bin/claude.real" "$HOME/.local/bin/claude"' \
             >/dev/null 2>&1 || true
         STANDIN_INSTALLED=0
+    fi
+    # SMOKE_KEEP is a development aid: it leaves the boxes and the temporary
+    # repositories in place so the next iteration reuses them. It keeps $TMP_ROOT
+    # too, because $CLEAN_REPO is mounted into the box that is being kept.
+    if [ "${SMOKE_KEEP:-0}" = "1" ]; then
+        printf 'SMOKE_KEEP=1: leaving these in place\n'
+        for inst in "$INSTANCE" "$DOCKER_INSTANCE" "$SECOND_INSTANCE"; do
+            if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$inst"; then
+                printf '  instance %s\n' "$inst"
+            fi
+        done
+        printf '  %s\n' "$TMP_ROOT"
+        printf 'Destroy them yourself when you are done: agentbox destroy <name>; rm -rf %s\n' "$TMP_ROOT"
+        exit "$rc"
     fi
     for inst in "$INSTANCE" "$DOCKER_INSTANCE" "$SECOND_INSTANCE"; do
         if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$inst"; then
@@ -108,6 +184,54 @@ cleanup() {
     exit "$rc"
 }
 trap cleanup EXIT
+
+# Every host prerequisite this suite assumes, checked in one second instead of an
+# hour. A missing `jq` turns two dozen `jq -e … >/dev/null 2>&1` contract
+# assertions into their else branch, so the suite fails loudly and about the
+# wrong thing. `mktemp`, `dirname` and `cd` are already load-bearing above this
+# line and cannot be protected from here; they are listed for the operator's
+# benefit, not as a guard.
+#
+# Below the EXIT trap on purpose: this check and the port probe under it both
+# exit, and $TMP_ROOT exists from the top of the file — above the trap they would
+# leave a temporary directory behind every time they fired.
+PREREQ_MISSING=0
+for _cmd in jq python3 git limactl curl script mktemp sed; do
+    command -v "$_cmd" >/dev/null 2>&1 || { printf 'PREREQ MISSING %s\n' "$_cmd"; PREREQ_MISSING=1; }
+done
+unset _cmd
+if [ "$PREREQ_MISSING" -eq 1 ]; then
+    bad "a host prerequisite is missing; nothing below would mean anything"
+    summarise_and_exit
+fi
+
+# The three host ports, probed free before a single VM is built. This is a
+# check-then-use with the whole suite as its window — step 11 binds them tens of
+# minutes from now — and it is not trying to close that: `create` refuses a held
+# forward and names the holder, which is the recoverable end of the same problem.
+# What the probe buys is the collision that is already there being named here
+# rather than read as a firewall breach four VMs later.
+host_port_free() { ! (exec 3<>"/dev/tcp/127.0.0.1/${1:?}") 2>/dev/null; }
+_tries=0
+while [ "$_tries" -lt 40 ]; do
+    if host_port_free "$FORWARD_PORT" && host_port_free "$FORWARD_PORT2" && host_port_free "$UNFORWARDED_PORT"; then
+        break
+    fi
+    printf 'ports %s/%s/%s: one is busy, moving up\n' "$FORWARD_PORT" "$FORWARD_PORT2" "$UNFORWARDED_PORT"
+    FORWARD_PORT=$((FORWARD_PORT + 3))
+    [ "$FORWARD_PORT" -le 27997 ] || FORWARD_PORT=20000
+    FORWARD_PORT2=$((FORWARD_PORT + 1))
+    UNFORWARDED_PORT=$((FORWARD_PORT + 2))
+    _tries=$((_tries + 1))
+done
+unset _tries
+if host_port_free "$FORWARD_PORT" && host_port_free "$FORWARD_PORT2" && host_port_free "$UNFORWARDED_PORT"; then
+    printf 'host ports: %s and %s forwarded, %s deliberately not\n' \
+        "$FORWARD_PORT" "$FORWARD_PORT2" "$UNFORWARDED_PORT"
+else
+    bad "no three consecutive free host ports in 20000-27999; free some and run this again"
+    summarise_and_exit
+fi
 
 # An explicit --workdir stops limactl from trying to cd into the host's
 # working directory inside the guest, which warns on stderr every time.
@@ -154,6 +278,24 @@ wait_for_guest() {
     done
     return 1
 }
+
+# ---------------------------------------------------------------------------
+# Feature slots
+# ---------------------------------------------------------------------------
+#
+# The slices of roadmap#146 each add their assertions inside one marked slot,
+# planted below in advance and separated by a blank line, so that no two slices
+# edit the same lines and no two hunks touch. A slot is a start line and an end
+# line, both beginning `# ---- `, naming the label and the owning slice.
+#
+# Every slot in this file is listed here with its owner, and nothing may be
+# planted that is not listed: the list and the markers are checked against each
+# other, which is what tells a missing slot from a filled one. When every slice
+# has landed, FIN deletes the markers and this block with them.
+#
+# SLOTS 3f=H1 3g=H2 3h=C2 5c=TA 5d=TB 5e=TB 5f=TB 8d2=M1 8d3=TB 8f-lost=M1
+# SLOTS 8g-kind=W 8k=C2 8l=C3 8m=C2 8j2=S1 8j3=S2 9-ch=C2 9-tc=TA
+# SLOTS 9f-triage=H3 9i=H3 11-pre=H1 11b=H1
 
 # ===========================================================================
 step "1. preflight on a clean repository (expect exit 0)"
@@ -408,6 +550,11 @@ for word in deny observe open; do
         bad "the refusal does not explain '${word}'"
     fi
 done
+# The load-bearing half is the instance-absence check on the same line. Nothing
+# creates ${CLEAN_REPO}/.agent-box until a GUEST run writes into it, so at this
+# position the directory test is vacuous; it is kept because it is correct and
+# becomes meaningful if this step ever moves. A new step must not copy the vacuous
+# half and take it for proof that a command left nothing behind.
 if [ ! -d "${CLEAN_REPO}/.agent-box" ] && ! "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$INSTANCE"; then
     ok "and it created nothing before refusing"
 else
@@ -447,6 +594,15 @@ else
 fi
 rm -f "${AGENT_BOX_CONFIG_DIR}/config"
 
+# ---- slot:3f (owner H1) ----
+# ---- end slot:3f ----
+
+# ---- slot:3g (owner H2) ----
+# ---- end slot:3g ----
+
+# ---- slot:3h (owner C2) ----
+# ---- end slot:3h ----
+
 # ===========================================================================
 step "4. create a real instance from the clean repository"
 # ===========================================================================
@@ -462,8 +618,7 @@ if "$LIMACTL" list --quiet | grep -qxF "$INSTANCE"; then
     ok "instance ${INSTANCE} exists"
 else
     bad "instance ${INSTANCE} does not exist; the remaining guest checks cannot run"
-    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
-    exit 1
+    summarise_and_exit
 fi
 
 "$LIMACTL" list
@@ -574,6 +729,18 @@ if printf '%s' "$GIT_ID" | grep -q 'agent-box'; then
 else
     bad "no git identity is configured in the guest"
 fi
+
+# ---- slot:5c (owner TA) ----
+# ---- end slot:5c ----
+
+# ---- slot:5d (owner TB) ----
+# ---- end slot:5d ----
+
+# ---- slot:5e (owner TB) ----
+# ---- end slot:5e ----
+
+# ---- slot:5f (owner TB) ----
+# ---- end slot:5f ----
 
 # ===========================================================================
 step "6. the egress firewall"
@@ -1215,8 +1382,7 @@ else
     # non-zero, which would make every assertion below report a pass for a run
     # that never happened.
     bad "the fake-token run printed no id; skipping the checks that depend on it"
-    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
-    exit 1
+    summarise_and_exit
 fi
 
 # `logs -f` must come back on its own when the run ends. Started here, while
@@ -1323,6 +1489,12 @@ if grep -qF "$FAKE_HEAD" "$LOGSJ" || grep -qF "$FAKE_TAIL" "$LOGSJ"; then
 else
     ok "logs --json printed neither the token's head nor its tail"
 fi
+
+# ---- slot:8d2 (owner M1) ----
+# ---- end slot:8d2 ----
+
+# ---- slot:8d3 (owner TB) ----
+# ---- end slot:8d3 ----
 
 # ===========================================================================
 step "8a2. heal: a failed run with budget starts its own follow-up, and the chain ends"
@@ -1708,6 +1880,9 @@ else
     bad "runs does not show the lost state"
 fi
 
+# ---- slot:8f-lost (owner M1) ----
+# ---- end slot:8f-lost ----
+
 printf -- '\n--- procps is installed, which is what makes the signal find claude ---\n'
 if guest sh -c 'command -v pgrep >/dev/null 2>&1'; then
     ok "pgrep is present in the guest"
@@ -1768,6 +1943,9 @@ else
     bad "attach exited ${attach_rc} after ${ATTACH_ELAPSED}s; expected 0 after at least 8s"
 fi
 guest tmux kill-session -t '=shell' 2>/dev/null || true
+
+# ---- slot:8g-kind (owner W) ----
+# ---- end slot:8g-kind ----
 
 # ===========================================================================
 step "8h. status: the JSON contract, and --watch leaving on Ctrl-C"
@@ -2229,6 +2407,15 @@ guest sh -c 'rm -rf /work/.claude /tmp/repo-hook-ran'
 # Clean up everything this step planted in the guest.
 guest sh -c "rm -rf \$HOME/.agent-box/runs/${HOSTILE_RUNID} \$HOME/.agent-box/runs/${LEAKY_RUNID}" || true
 
+# ---- slot:8k (owner C2) ----
+# ---- end slot:8k ----
+
+# ---- slot:8l (owner C3) ----
+# ---- end slot:8l ----
+
+# ---- slot:8m (owner C2) ----
+# ---- end slot:8m ----
+
 # ===========================================================================
 step "8j. an interrupted run is recorded as stopped, not as done (issue #14)"
 # ===========================================================================
@@ -2680,6 +2867,12 @@ else
     bad "agent-run did not explain the override"
 fi
 
+# ---- slot:8j2 (owner S1) ----
+# ---- end slot:8j2 ----
+
+# ---- slot:8j3 (owner S2) ----
+# ---- end slot:8j3 ----
+
 printf -- '\n--- no token fragment left this step ---\n'
 if grep -qF "$FAKE_HEAD" "$STOPPED_OUT" "$S14_STOP" "$WAIT_OUT" "$FAIL_OUT" 2>/dev/null \
    || grep -qF "$FAKE_TAIL" "$STOPPED_OUT" "$S14_STOP" "$WAIT_OUT" "$FAIL_OUT" 2>/dev/null; then
@@ -2844,6 +3037,9 @@ else
     bad "agentbox stop did not exit 0"
 fi
 
+# ---- slot:9-ch (owner C2) ----
+# ---- end slot:9-ch ----
+
 printf -- '\n--- limactl start (re-runs provisioning under the firewall) ---\n'
 RESTART_TS=$(date +%s)
 "$AGENTBOX" start "$CLEAN_REPO"
@@ -2878,6 +3074,9 @@ FW_OUT2="${TMP_ROOT}/firewall2.out"
 rc=$?
 cat "$FW_OUT2"
 if [ "$rc" -eq 0 ]; then ok "firewall-check still passes after the rebuild"; else bad "firewall-check failed after the rebuild"; fi
+
+# ---- slot:9-tc (owner TA) ----
+# ---- end slot:9-tc ----
 
 # ===========================================================================
 step "9b. resize changes the VM's shape and the box comes back"
@@ -3492,6 +3691,9 @@ for b in d["boxes"]:
     fi
 fi
 
+# ---- slot:9f-triage (owner H3) ----
+# ---- end slot:9f-triage ----
+
 # ===========================================================================
 step "9g. the resolver keeps feeding: cache expiry, mode survival, bad input"
 # ===========================================================================
@@ -3692,6 +3894,9 @@ else
 fi
 guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
 
+# ---- slot:9i (owner H3) ----
+# ---- end slot:9i ----
+
 # ===========================================================================
 step "10. destroy the instance, by bare name"
 # ===========================================================================
@@ -3723,6 +3928,9 @@ step "11. a second instance with the Docker and browser-testing profile"
 # time — that is the whole design — so the only way to test both shapes is to
 # build both.
 
+# ---- slot:11-pre (owner H1) ----
+# ---- end slot:11-pre ----
+
 mkdir -p "$DOCKER_REPO"
 git init -q "$DOCKER_REPO"
 cat > "${DOCKER_REPO}/hello.txt" <<'EOF'
@@ -3735,7 +3943,8 @@ DK_CREATE_OUT="${TMP_ROOT}/dk-create.out"
 DK_TS=$(date +%s)
 # FORWARD_PORT twice, deliberately: the flag accumulates across repeats and
 # across a comma list, so a duplicate must be collapsed rather than prepending
-# two identical portForwards entries and printing `forwarded 3999 3999 3998`.
+# two identical portForwards entries and printing the first port twice in the
+# summary. The ports are the $$-derived ones from the preamble, never literals.
 # The summary assertion below is what proves it.
 run_bounded 2400 "$DK_CREATE_OUT" "$AGENTBOX" create "$DOCKER_REPO" \
     --egress deny --docker --playwright --rosetta \
@@ -3765,12 +3974,14 @@ if "$LIMACTL" list --quiet | grep -qxF "$DOCKER_INSTANCE"; then
     ok "instance ${DOCKER_INSTANCE} exists"
 else
     bad "instance ${DOCKER_INSTANCE} does not exist; the remaining Docker checks cannot run"
-    hr; printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"; hr
-    exit 1
+    summarise_and_exit
 fi
 
 printf -- '\n--- the sizing Lima actually gave it ---\n'
 "$LIMACTL" list "$DOCKER_INSTANCE"
+
+# ---- slot:11b (owner H1) ----
+# ---- end slot:11b ----
 
 # ===========================================================================
 step "12. Docker inside the guest, under the same allowlist"
@@ -4821,6 +5032,13 @@ else
 fi
 
 # ===========================================================================
+# The suite's own ending, written out rather than calling summarise_and_exit.
+# Measured with shellcheck 0.11.0: with this replaced by the call, shellcheck
+# loses track of the two functions this file invokes indirectly — `cleanup`
+# through the EXIT trap and `guest_summary` through run_bounded — and reports
+# SC2329 "never invoked" for both. The helper is what the three EARLY exits use,
+# which is what stops a fourth copy of this block appearing in the middle of the
+# file; the last three lines of a test suite are not that risk.
 hr
 printf 'RESULT: %s passed, %s failed, %s advisory\n' "$PASS" "$FAIL" "$WARN"
 hr

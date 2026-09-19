@@ -30,6 +30,15 @@ LIMACTL="${LIMACTL:-limactl}"
 HOST_CONFIG_FILE="${HOST_CONFIG_DIR}/config"
 # One pid file per watched run, so `--notify` twice does not watch twice.
 WATCHER_DIR="${HOST_CONFIG_DIR}/watchers"
+# The host-side clone `bench` builds, and the host's own record of what it has
+# read from and sent to each box's mailbox. Both live under the host config
+# directory, which is never mounted into a guest: a box must not be able to read
+# what the host knows about it, let alone rewrite it. AGENT_BOX_BENCH_DIR moves
+# the bench root, so a test can put it somewhere disposable.
+# shellcheck disable=SC2034  # read by cmd_bench and by destroy's bench hook.
+BENCH_DIR="${AGENT_BOX_BENCH_DIR:-${HOST_CONFIG_DIR}/bench}"
+# shellcheck disable=SC2034  # read by the channel section's helpers.
+CHANNEL_STATE_DIR="${HOST_CONFIG_DIR}/channel"
 
 # This script's own absolute path. `--notify` re-invokes it detached, and $0 is
 # whatever the caller typed, which may be relative to a directory the
@@ -66,6 +75,12 @@ usage: ${PROG} <command> [args]
                                     answer a waiting run's question and continue it
   ask <repo> [runid]                print the question a waiting run left
   learnings <repo>                  print what the runs wrote down to improve
+  channel <repo> [--json] [--task TEXT|--clear-task] [--wait SECS]
+                                    both sides now: messages from the box, requests to it
+  handoff <repo> [id] [--json] [--peek] [--done] [--force-unsafe]
+                                    read one message from the box, scrubbed in the guest
+  request <repo> [--re ID] [--verdict accepted|changes] [--subject S] --text T | --file F|-
+                                    queue a request for the standing in-box session
   keepalive <repo> on|off|status    let the watchdog restart this box and heal lost runs
   watchdog --install|--uninstall|--run
                                     the launchd job that keeps kept-alive boxes running
@@ -73,17 +88,25 @@ usage: ${PROG} <command> [args]
   logs <repo> [runid] [-f] [--json] [--force-unsafe]
                                     read a run back, scrubbed, in the guest
   stop-run <repo> [runid]           interrupt a running task
+  leftovers <repo> [--json]         what earlier runs left running, and which run left it
   plugins <repo> [--update]         apply plugins.txt inside the VM
   update <repo>                     update Claude Code inside the VM
   stop <repo|name>                  stop the VM
   destroy <repo|name>               stop and delete the VM
+  bench <repo|name> [--branch B] [--json] | --list [--json] | <repo|name> --remove [--force]
+                                    a host-side clone for rebuilding and checking the box's branch
   status [repo] [--json] [--watch [SECS]]
                                     one line per box: run, sessions, firewall
                                     (--watch needs a named box)
+  triage [repo|name] [--json]       pause or remove, and what is only inside each box
   egress <repo|name> [MODE]         show, or change, the egress mode (deny|observe|open)
   egress-log <repo|name> [--since DUR] [--json] [--as-allowlist]
                                     what an observe-mode box tried to reach
   firewall-check <repo|name>        rebuild the allowlist and re-verify, in the VM
+  ports <repo|name> [--json]        which forwarded ports actually reach the guest
+  toolcheck <repo|name> [--json] [--project-only]
+                                    every baseline tool at its pin; project pin mismatches
+  version                           the checkout this CLI and every box's guest scripts come from
   help                              this message
 
 run options:
@@ -112,16 +135,26 @@ except the sizing, which 'resize' can change:
 
   --docker            Docker Engine and compose inside the guest, with
                       containers held to the same egress allowlist
-  --playwright        Node 22 and Playwright's system libraries
+  --playwright        (deprecated: the toolchain is baseline; ignored)
   --rosetta           run linux/amd64 images on Apple silicon
   --forward PORT[,PORT...]
                       forward guest 127.0.0.1:PORT to host 127.0.0.1:PORT.
-                      This is a widening: host processes can then reach it
+                      This is a widening: host processes can then reach it.
+                      create refuses a host port that is already bound;
+                      'ports' says which side of a forward is quiet
   --cpus N            default 4
   --memory SIZE       default 6GiB, or 8GiB with --docker
-  --disk SIZE         default 30GiB, or 60GiB with --docker
+  --disk SIZE         default 40GiB, or 60GiB with --docker
 
 resize options: --cpus N, --memory SIZE, --disk SIZE. The disk can only grow.
+
+toolcheck says whether a box is at the baseline: exit 0 when every tool is
+present at its pin, 10 when one is missing or off its pin, 11 when the box is
+clean but this repository pins a tool differently, and 1 for a usage error like
+everywhere else. create ends with the same check and exits with its status, so a
+new box that is not at baseline says which tool by name rather than reporting
+itself ready; start of an existing box prints the same lines as a warning and
+exits 0.
 
 Every subcommand stops reading options at a literal --, so a caller building a
 command line can always say where its operands begin:
@@ -146,7 +179,7 @@ Mounted read-only into the VM at /opt/agent-box-config:
   ${HOST_GUEST_CONFIG_DIR}/ca.pem            corporate TLS-intercept root, if any
   ${HOST_GUEST_CONFIG_DIR}/plugins.txt       marketplaces and plugins to install
   ${HOST_GUEST_CONFIG_DIR}/plugin-dir/<name> plugin roots loaded per session
-  ${HOST_GUEST_CONFIG_DIR}/claude/           CLAUDE.md, settings.json, governor.json, rules/
+  ${HOST_GUEST_CONFIG_DIR}/claude/           CLAUDE.md, settings.json, supervisor.json, rules/
 
 Read on this host only, never mounted, never visible to the agent:
   ${HOST_CONFIG_DIR}/blocklist.txt     literal terms preflight looks for
@@ -184,6 +217,18 @@ abs_file() {
     printf '%s/%s' "$dir" "$base"
 }
 
+# A brief, resolved the way abs_file resolves anything: against the caller's cwd.
+# One search path, deliberately (agent-box#5, docs/decisions.md) — but the
+# mistake the issue was filed for is naming a brief that sits in the repository
+# while standing somewhere else, so say that when it is what happened.
+require_brief() {
+    local repo="${1:?}" p="${2:?}"
+    if [ ! -f "$p" ] && [ "${p#/}" = "$p" ] && [ -f "${repo}/${p}" ]; then
+        die "not a file: ${p} (there is a ${p} in ${repo}; name it as ${repo}/${p}, or cd there first)"
+    fi
+    abs_file "$p"
+}
+
 # A run id and a tmux session name in one: %Y%m%d-%H%M%S, UTC, to the second.
 # Seconds because two runs inside one minute must not collide.
 new_runid() { date -u +%Y%m%d-%H%M%S; }
@@ -196,6 +241,15 @@ json_str() {
     v=${v//\\/\\\\}
     v=${v//\"/\\\"}
     printf '"%s"' "$v"
+}
+
+# Foreign text, made safe to print: control characters removed and the rest cut
+# to N characters. It sits beside json_str because both exist for the same
+# reason — a string this host did not write is about to appear in a message, and
+# a process name on the Mac, a branch name chosen by an agent and a reason line
+# out of a guest are all somebody else's bytes.
+host_clip() {
+    printf '%s' "${1-}" | tr -d '[:cntrl:]' | cut -c1-"${2:?}"
 }
 
 # Split a command line into options and operands, stopping option processing at
@@ -267,10 +321,33 @@ check_operands() {
 # can write. Bytes from in there are input, not data: they are matched against
 # a shape before they reach a shell, an arithmetic context, or a program text.
 
-# `running`, `exit:stopped`, or `exit:` and digits. Nothing else.
+# `running`, `exit:stopped`, `exit:waiting`, `exit:lost`, or `exit:` and digits.
+# Nothing else.
+#
+# Three files hold a run-state vocabulary and they are NOT the same vocabulary,
+# which is how `exit:lost` came to be missing here (agent-box#24) — and how
+# `exit:waiting` was missing from the comment this one replaces, which is the
+# same drift one step earlier:
+#   guest/lib.sh:370  abx_status_read  reads the status FILE: running,
+#                     exit:stopped, exit:lost, exit:<digits>. No exit:waiting —
+#                     waiting is not a file state, it is derived from a marker.
+#   guest/run-ctl.sh:521 derived_state  DERIVES state from the file plus the
+#                     marker files, and is the only thing that emits
+#                     exit:waiting and exit:lost together.
+#   this function     validates what `run-ctl.sh state` returned, i.e. derived
+#                     state — so it must accept the UNION that derived_state can
+#                     emit, which is every shape above.
+# Adding a state to derived_state means adding it here. There is no test that
+# fails if you forget, so this comment is the mechanism.
+#
+# What a rejection costs is the other half of why the union matters:
+# read_run_state turns anything this refuses into `unknown` AND warns that the
+# box reported something that is not a run state — for an ordinary state. The
+# warning is guarded by `[ -z "$state" ] ||`, so an empty answer is deliberately
+# silent; that guard is not the bug and must not be "fixed".
 valid_run_state() {
     case "${1:-}" in
-        running|exit:stopped|exit:waiting) return 0 ;;
+        running|exit:stopped|exit:waiting|exit:lost) return 0 ;;
         exit:*)
             case "${1#exit:}" in
                 ''|*[!0-9]*) return 1 ;;
@@ -297,6 +374,14 @@ valid_plain_name() {
         *) return 0 ;;
     esac
 }
+
+# ---------------------------------------------------------------------------
+# channel validators (C2)
+# ---------------------------------------------------------------------------
+#
+# Message ids, branch names, commit ids, verdict words and the standing
+# session's state word: everything the mailbox says about itself, shaped before
+# it is used. `case` patterns only, for the reason the section above gives.
 
 # Read a run's state out of the guest and return something the host may act on.
 # An unrecognised answer becomes `unknown` and is reported — never echoed, since
@@ -378,6 +463,78 @@ read_instance_meta() {
 }
 write_instance_egress() { write_instance_meta "${1:?}" egress "${2:?}"; }
 read_instance_egress()  { read_instance_meta  "${1:?}" egress; }
+
+# The same key, read raw. A repository path, a branch name, a timestamp and a
+# byte count all fail the `[a-z]*` reader above, and `watchdog_run` already does
+# exactly this inline for `repo=`. The record file is host-written and never
+# mounted, but a value out of it is still json_str'ed before it lands in JSON and
+# still `case`-checked for digits before it reaches arithmetic: that is the house
+# rule, and it costs one line.
+read_instance_meta_raw() {
+    local f
+    f=$(instance_meta_file "${1:?}")
+    [ -r "$f" ] || return 1
+    sed -n "s/^${2:?}=\(.*\)\$/\1/p" "$f" | tail -1
+}
+
+# Several keys, ONE read-modify-write. Three separate write_instance_meta calls
+# are three full rewrites of the file, and a concurrent `keepalive on` or
+# `egress` between two of them has its own write overwritten — silently, with
+# `keepalive=on` the value most likely to disappear. A command that writes a
+# group of keys while it reads (triage's watermark) does it here.
+write_instance_meta_multi() {
+    local inst="${1:?}" f tmp kv
+    shift
+    [ $# -gt 0 ] || return 0
+    mkdir -p "$INSTANCE_META_DIR" 2>/dev/null || return 0
+    f=$(instance_meta_file "$inst")
+    tmp="${f}.tmp.$$"
+    # One pass over the old file, dropping every key being written, then one
+    # append per key. `if A && B` rather than `A && B || C`, so a failed write
+    # and a failed rename both land in the same place.
+    local -a filter=()
+    for kv in "$@"; do filter+=(-e "^${kv%%=*}="); done
+    if {
+           { [ -r "$f" ] && grep -v "${filter[@]}" "$f"; } || true
+           for kv in "$@"; do printf '%s\n' "$kv"; done
+       } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
+    then
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    return 0
+}
+
+# An instance name used as a PATH COMPONENT — the bench directory, the channel
+# record directory — rather than only handed to limactl. `instance_name` returns
+# a bare `agent-box-*` argument unvalidated, so without this `agentbox bench
+# agent-box-../../x` would compute a path outside the directory it is supposed
+# to be in. Every other consumer of a bare name hands it to limactl, which
+# refuses it; nothing that builds a path may depend on that.
+valid_instance_name() {
+    case "${1:-}" in
+        *..*|*/*) return 1 ;;
+        agent-box-*)
+            case "${1#agent-box-}" in
+                ""|*[!A-Za-z0-9._-]*) return 1 ;;
+                *) return 0 ;;
+            esac ;;
+        *) return 1 ;;
+    esac
+}
+
+# Every git command the host runs INSIDE A MOUNTED REPOSITORY goes through this,
+# and only with `rev-parse`, `rev-list`, `for-each-ref`, `symbolic-ref`, or as
+# the source of a `clone`/`fetch`. Never `status`, `diff` or `log -p`: the box
+# can write `.git/config`, `.git/hooks` and `.gitattributes`, and those three
+# verbs run `core.fsmonitor` and clean filters — guest-chosen programs, on this
+# host, as this user. The two `-c` flags close the two that travel in the
+# repository itself. See docs/decisions.md.
+repo_git() {
+    local repo="${1:?}"
+    shift
+    git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" "$@"
+}
 
 # A plain `key: value` from the host config file, or nothing. The value is one
 # word: a model name, a number, a mode. Last one wins, like the egress reader.
@@ -474,13 +631,19 @@ ensure_host_config_dir() {
     fi
 }
 
+# A directory nobody wants in a backup: VM disk images, or a bench full of
+# node_modules and virtualenvs. The LABEL is what the operator sees, so both
+# messages name the directory that was actually excluded — a parameterised guard
+# with a hardcoded message would tell somebody excluding a bench that ~/.lima had
+# been dealt with.
 exclude_from_backup() {
+    local dir="${1:?}" label="${2:?}"
     command -v tmutil >/dev/null 2>&1 || return 0
-    [ -d "${HOME}/.lima" ] || return 0
-    if tmutil addexclusion "${HOME}/.lima" >/dev/null 2>&1; then
-        info "excluded ~/.lima from Time Machine"
+    [ -d "$dir" ] || return 0
+    if tmutil addexclusion "$dir" >/dev/null 2>&1; then
+        info "excluded ${label} from Time Machine"
     else
-        info "NOTE: could not exclude ~/.lima from Time Machine. VM disk images will be backed up unless you exclude the directory yourself in System Settings > General > Time Machine > Options."
+        info "NOTE: could not exclude ${label} from Time Machine. What it holds will be backed up unless you exclude the directory yourself in System Settings > General > Time Machine > Options."
     fi
 }
 
@@ -550,6 +713,19 @@ valid_port() {
     [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# ---------------------------------------------------------------------------
+# host port probes (H1)
+# ---------------------------------------------------------------------------
+#
+# Lima cannot bind a host port something else already holds, and the forward then
+# simply does not answer — which reads as a guest problem and is not one. These
+# answer "is the host side of this forward free, and if not, who has it" for
+# `create`, `start` and `ports`.
+#
+# The placeholder keeps `cmd_create` honest until H1 lands: a call with nothing
+# behind it is better than a call site added later to a command nobody re-read.
+check_forward_ports() { :; }
+
 cmd_create() {
     local repo inst
     split_args "--forward --cpus --memory --disk --egress" "$@"
@@ -572,6 +748,11 @@ cmd_create() {
     while [ $# -gt 0 ]; do
         case "$1" in
             --docker)     docker=true; shift ;;
+            # Still parsed, and still passed to the template: create-time params
+            # are frozen for the life of an instance, so a box made with it goes
+            # on passing it at every start for ever. It provisions nothing extra
+            # now that Node, Playwright and the browsers are part of every box's
+            # baseline toolchain.
             --playwright) playwright=true; shift ;;
             --rosetta)    rosetta=true; shift ;;
             --forward)
@@ -617,7 +798,11 @@ cmd_create() {
     # Docker needs more of both than a bare agent does: images, layers and a
     # build cache all land on the guest disk, and a compose stack plus a browser
     # is a different memory profile from a shell and an editor.
-    local def_cpus=4 def_memory="6GiB" def_disk="30GiB"
+    # 40GiB, not 30: the baseline toolchain, Playwright's browsers and a
+    # project's own dependency trees share the guest disk, and the installer
+    # skips itself under 4 GiB free rather than filling it. Existing boxes keep
+    # the size they were made with — 'agentbox resize <repo> --disk 40GiB'.
+    local def_cpus=4 def_memory="6GiB" def_disk="40GiB"
     if [ "$docker" = true ]; then
         def_memory="8GiB"; def_disk="60GiB"
     fi
@@ -652,6 +837,11 @@ cmd_create() {
             forward_ports+=("$p")
         done
     fi
+
+    # Before anything is built, and before preflight spends a minute on the
+    # repository: a forward whose host side is already held is a box that comes
+    # up with a port that silently does not answer.
+    [ "${#forward_ports[@]}" -eq 0 ] || check_forward_ports "${forward_ports[@]}"
 
     instance_exists "$inst" && die "instance '${inst}' already exists. Use '${PROG} start' or '${PROG} destroy'."
 
@@ -697,6 +887,12 @@ cmd_create() {
         || info "WARNING: egress mode 'open' means no egress filtering. Anything the agent does can reach any host."
     [ "$egress" != "observe" ] \
         || info "NOTE: egress mode 'observe' ALLOWS non-allowlisted traffic and logs it. Read it back with '${PROG} egress-log'."
+    # At the same nesting as the two egress notes, not inside the --forward block
+    # below: `create <repo> --rosetta` is the invocation the warning exists for,
+    # and a warning that only fires when --forward was also passed never reaches
+    # it. Rosetta runs linux/amd64 images, and nothing but Docker runs images.
+    [ "$rosetta" != true ] || [ "$docker" = true ] \
+        || info "WARNING: --rosetta without --docker provisions nothing that uses it. Rosetta is for running linux/amd64 container images; add --docker, or leave it out."
     if [ "${#forward_ports[@]}" -gt 0 ]; then
         info "WARNING: --forward ${forward_ports[*]} opens a hole in the other direction. Every one of those guest ports becomes reachable from any process on this Mac at 127.0.0.1, for as long as the VM runs. The default is that nothing the guest listens on is reachable from the host at all."
         # Measured, because the answer is not the obvious one and the failure is
@@ -708,10 +904,15 @@ cmd_create() {
     "$LIMACTL" create --tty=false "${create_args[@]}" "$LIMA_TEMPLATE"
     write_instance_egress "$inst" "$egress"
     write_instance_meta "$inst" repo "$repo"
+    # The forwards, recorded: they are create-time params, so this is the only
+    # moment they are known without asking Lima, and `start` and `ports` both
+    # need them for a box that is not running.
+    [ "${#forward_ports[@]}" -eq 0 ] \
+        || write_instance_meta "$inst" forward "$(IFS=,; printf '%s' "${forward_ports[*]}")"
 
     # After create, not before: on a machine that has never run Lima, ~/.lima
     # does not exist yet and the exclusion would fail for no reason.
-    exclude_from_backup
+    exclude_from_backup "${HOME}/.lima" "the Lima directory (~/.lima)"
 
     info "starting ${inst} (first boot downloads the image and provisions; this takes a while)"
     "$LIMACTL" start --tty=false "$inst"
@@ -806,6 +1007,11 @@ cmd_start() {
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
+    # Backfilled: `repo=` was written only by `create` and `keepalive on`, so
+    # every box made before that key existed has a record without it — and the
+    # commands that work from a bare instance name (bench, triage, the channel)
+    # have nowhere else to learn which repository a box is pointed at.
+    write_instance_meta "$inst" repo "$repo"
 
     run_preflight "$repo" || die "preflight failed; refusing to start ${inst}"
     ensure_host_config_dir
@@ -947,6 +1153,7 @@ cmd_claude() {
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
+    write_instance_meta "$inst" repo "$repo"
     sync_guest_config "$inst"
     exec "$LIMACTL" shell --workdir /work "$inst" -- \
         /opt/agent-box/guest/claude-session.sh "$@"
@@ -1055,7 +1262,7 @@ cmd_run() {
 
     # Resolved against the caller's working directory, before anything else
     # changes what that means.
-    brief=$(abs_file "$brief")
+    brief=$(require_brief "$repo" "$brief")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
@@ -1244,6 +1451,30 @@ cmd_learnings() {
     guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" learnings
 }
 
+# ---------------------------------------------------------------------------
+# The channel (C2)
+# ---------------------------------------------------------------------------
+#
+# Both directions, in one place: messages the box publishes for the host
+# (`channel`, `handoff`) and requests the host queues for the standing in-box
+# session (`request`). The mailbox is four directories on the mount; what the
+# host knows about it — what it has read, what it has answered, what it sent —
+# is its own, under ${CHANNEL_STATE_DIR}, and is never mounted.
+#
+# `channel-hook` is the hidden arm, like `watch-run`: a host Claude session's
+# hook calls it, nobody types it.
+
+# The `channel` object of `status --json`, or `null`. ST calls this for every
+# box, including a stopped one, so it answers before the rest of the block does.
+channel_counts_json() { printf 'null'; }
+
+cmd_channel()      { die "channel: not built in this checkout"; }
+cmd_handoff()      { die "handoff: not built in this checkout"; }
+cmd_request()      { die "request: not built in this checkout"; }
+cmd_channel_hook() { die "channel-hook: not built in this checkout"; }
+
+# ---------------------------------------------------------------------------
+
 cmd_runs() {
     local repo inst args=()
     split_args "" "$@"
@@ -1312,6 +1543,15 @@ cmd_stop_run() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# What earlier runs left behind (S2)
+# ---------------------------------------------------------------------------
+#
+# Processes, listening ports, worktrees and tmux sessions that outlived the run
+# that started them, each attributed to the run that left it.
+cmd_leftovers() { die "leftovers: not built in this checkout"; }
+# ---------------------------------------------------------------------------
+
 cmd_sessions() {
     local repo inst args=()
     split_args "" "$@"
@@ -1348,11 +1588,12 @@ cmd_session() {
     done
     [ -z "$model" ] || valid_plain_name "$model" || die "not a model name: ${model}"
     repo=$(abs_repo "${ABX_POSV[0]}")
-    [ "${#ABX_POSV[@]}" -lt 2 ] || brief=$(abs_file "${ABX_POSV[1]}")
+    [ "${#ABX_POSV[@]}" -lt 2 ] || brief=$(require_brief "$repo" "${ABX_POSV[1]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
     require_running "$inst"
+    write_instance_meta "$inst" repo "$repo"
     sync_guest_config "$inst"
 
     local session_args=(--tmux "$name")
@@ -1447,6 +1688,17 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
+# The bench (H2)
+# ---------------------------------------------------------------------------
+#
+# A clone of the repository, on the host, under ${BENCH_DIR}: where a host
+# session rebuilds and checks the branch a box produced, without letting the
+# guest's node_modules and virtualenvs into the repository it is about to commit
+# from. Disposable by design, and it never calls limactl.
+cmd_bench() { die "bench: not built in this checkout"; }
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # Status
 # ---------------------------------------------------------------------------
 #
@@ -1471,9 +1723,6 @@ list_boxes() {
         --format '{{.Name}}|{{.Status}}|{{(index .Config.Mounts 0).Location}}' 2>/dev/null
 }
 
-# The one bespoke parser: `--watch` takes an OPTIONAL count, so its value
-# cannot be declared to split_args without swallowing the box name in
-# `status --watch <repo>`.
 # ---------------------------------------------------------------------------
 # keepalive and the watchdog
 # ---------------------------------------------------------------------------
@@ -1492,6 +1741,10 @@ cmd_keepalive() {
     repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     mode="${ABX_POSV[1]}"
+    # Before require_instance, which reaches for `limactl list`: without it a
+    # host that has no Lima at all is told "no instance named …", which sends the
+    # operator looking for a box instead of for the thing that is missing.
+    require_limactl
     require_instance "$inst"
     case "$mode" in
         on)
@@ -1604,6 +1857,11 @@ EOF
     esac
 }
 
+# The one bespoke parser, and the only command whose operand does not go through
+# split_args/check_operands: `--watch` takes an OPTIONAL count, so declaring its
+# value to split_args would swallow the box name in `status --watch <repo>`.
+# NEW COMMANDS USE split_args. This one is the exception the option's shape
+# forces, not a style anything else may copy.
 cmd_status() {
     local as_json=0 watch_secs="" only="" literal=0
     while [ $# -gt 0 ]; do
@@ -1736,6 +1994,16 @@ EOF
         printf ']}\n'
     fi
 }
+
+# ---------------------------------------------------------------------------
+# Triage across the fleet (H3)
+# ---------------------------------------------------------------------------
+#
+# Which box can be paused or removed, and what exists only inside each one. The
+# second half is the one that matters: a box holding work that is nowhere else is
+# a box nothing may stop, whatever the memory pressure says.
+cmd_triage() { die "triage: not built in this checkout"; }
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # The notification watcher
@@ -1963,6 +2231,15 @@ cmd_egress_log() {
     guest_shell "$inst" sudo /opt/agent-box/guest/egress-log.sh --since "$since" --format "$fmt"
 }
 
+# ---------------------------------------------------------------------------
+# Forwarded ports, both sides (H1)
+# ---------------------------------------------------------------------------
+#
+# A forward has two halves and either can be quiet: nothing listening in the
+# guest, or something else on the Mac holding the host side. `ports` says which.
+cmd_ports() { die "ports: not built in this checkout"; }
+# ---------------------------------------------------------------------------
+
 cmd_firewall_check() {
     local inst
     split_args "" "$@"
@@ -2017,6 +2294,24 @@ cmd_firewall_check() {
 }
 
 # ---------------------------------------------------------------------------
+# The toolchain (TB)
+# ---------------------------------------------------------------------------
+#
+# Every baseline tool at its pin, and where this repository pins one
+# differently. The exit status is the answer a script reads: 10 for a box that is
+# not at baseline, 11 for a box that is clean where the project disagrees.
+cmd_toolcheck() { die "toolcheck: not built in this checkout"; }
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Which checkout this is (FIN)
+# ---------------------------------------------------------------------------
+#
+# /opt/agent-box in every guest is this checkout, mounted read-only, and
+# provisioning re-runs at every start — so "which version is this box running"
+# is a question about the host's working tree, and nothing else says it.
+cmd_version() { die "version: not built in this checkout"; }
+# ---------------------------------------------------------------------------
 
 case "${1:-}" in
     preflight)      shift; cmd_preflight "$@" ;;
@@ -2034,20 +2329,31 @@ case "${1:-}" in
     resume)         shift; cmd_resume "$@" ;;
     ask)            shift; cmd_ask "$@" ;;
     learnings)      shift; cmd_learnings "$@" ;;
+    channel)        shift; cmd_channel "$@" ;;
+    handoff)        shift; cmd_handoff "$@" ;;
+    request)        shift; cmd_request "$@" ;;
     keepalive)      shift; cmd_keepalive "$@" ;;
     watchdog)       shift; cmd_watchdog "$@" ;;
     runs)           shift; cmd_runs "$@" ;;
     logs)           shift; cmd_logs "$@" ;;
     stop-run)       shift; cmd_stop_run "$@" ;;
+    leftovers)      shift; cmd_leftovers "$@" ;;
+    # Not in the usage text, like watch-run: a hook calls it, nobody types it.
     watch-run)      shift; cmd_watch_run "$@" ;;
+    channel-hook)   shift; cmd_channel_hook "$@" ;;
     plugins)        shift; cmd_plugins "$@" ;;
     update)         shift; cmd_update "$@" ;;
     stop)           shift; cmd_stop "$@" ;;
     destroy)        shift; cmd_destroy "$@" ;;
+    bench)          shift; cmd_bench "$@" ;;
     status)         shift; cmd_status "$@" ;;
+    triage)         shift; cmd_triage "$@" ;;
     egress)         shift; cmd_egress "$@" ;;
     egress-log)     shift; cmd_egress_log "$@" ;;
     firewall-check) shift; cmd_firewall_check "$@" ;;
+    ports)          shift; cmd_ports "$@" ;;
+    toolcheck)      shift; cmd_toolcheck "$@" ;;
+    version)        shift; cmd_version "$@" ;;
     help|-h|--help) usage ;;
     *)              usage >&2; exit 2 ;;
 esac
