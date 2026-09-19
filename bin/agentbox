@@ -35,7 +35,6 @@ WATCHER_DIR="${HOST_CONFIG_DIR}/watchers"
 # directory, which is never mounted into a guest: a box must not be able to read
 # what the host knows about it, let alone rewrite it. AGENT_BOX_BENCH_DIR moves
 # the bench root, so a test can put it somewhere disposable.
-# shellcheck disable=SC2034  # read by cmd_bench and by destroy's bench hook.
 BENCH_DIR="${AGENT_BOX_BENCH_DIR:-${HOST_CONFIG_DIR}/bench}"
 # shellcheck disable=SC2034  # read by the channel section's helpers.
 CHANNEL_STATE_DIR="${HOST_CONFIG_DIR}/channel"
@@ -1818,6 +1817,10 @@ cmd_destroy() {
     require_instance "$inst"
     "$LIMACTL" stop --force "$inst" >/dev/null 2>&1 || true
     "$LIMACTL" delete --force "$inst"
+    # The bench is read and dealt with while the record still says where it is:
+    # after the line below there is no `bench=` left to resolve it from. Never
+    # fatal, and it keeps whatever it cannot prove disposable.
+    destroy_bench_hook "$inst" || true
     # The host's per-instance record goes with the instance. Left behind, it
     # outlives the box and is then read by the NEXT box of the same name — a
     # repository recreated with a different mode would be described by the old
@@ -1841,7 +1844,505 @@ EOF
 # session rebuilds and checks the branch a box produced, without letting the
 # guest's node_modules and virtualenvs into the repository it is about to commit
 # from. Disposable by design, and it never calls limactl.
-cmd_bench() { die "bench: not built in this checkout"; }
+#
+# A CLONE, not a `git worktree add`. /work IS the host repository, so the branch
+# the box is on is already checked out here and `worktree add` refuses it
+# outright (measured: `fatal: 'agent/example' is already used by worktree at
+# …/src`). The clone also writes nothing into the repository's own .git — no
+# `worktrees/<name>/gitdir` for the agent to read a host path out of, and nothing
+# it does to /work/.git can prune or corrupt the bench. Measured on git 2.55.0:
+# the source's `.git` listing is byte-for-byte the same before and after, and no
+# `worktrees/` directory appears.
+#
+# `--no-local` is the other half of that property, and it is what it costs.
+# Without it the clone's objects are HARDLINKS: the same inodes as files the guest
+# can rewrite, which contradicts the one thing the bench is for. Measured,
+# four-commit fixture: with `--no-local` the clone holds one pack file with link
+# count 1; without it, loose objects with link count 2. What the bench then costs
+# is a second copy of the object store — received as a pack, so on a repository
+# whose objects are still loose it is SMALLER than the source (measured, 60
+# commits of random content: 1.5M repository with 960 KiB of loose objects ->
+# 864K bench with a 263 KiB pack) and on an already-packed one it is that pack
+# again (this repository: 1.0M -> 1.5M). A large history pays it once per bench.
+#
+# `--no-local` does mean the source runs `git upload-pack`, so the question is
+# whether a guest-written `.git/config` can name a program that way. Measured
+# with `uploadpack.packObjectsHook`, `core.fsmonitor` and `pager.clone` planted
+# in the source: none of the three ran during the clone, and the same planted
+# `core.fsmonitor` DID run on a plain `git status` in that repository — so the
+# clone is quiet and the measurement is not vacuous. git refuses
+# `packObjectsHook` outside protected configuration by design (git-config(1),
+# SCOPES), which is exactly this case.
+
+# Narrative lines, silenced by `--json` so that the object is the only thing on
+# stdout for a caller to parse. git's own progress goes to stderr in every mode,
+# for the same reason.
+BENCH_QUIET=0
+bench_say() { [ "$BENCH_QUIET" -eq 1 ] || info "$*"; }
+
+# A branch name this host is willing to hand to git and to print. The default
+# comes from the MOUNTED repository's HEAD, which the guest writes, and git's own
+# rules allow a great deal in a ref name: `$`, `;`, `&`, quotes and a leading `-`
+# are all legal, and a leading `-` is an OPTION to every git command that takes a
+# branch. Same shape as `abx_valid_branch` in guest/lib.sh — a shape test, never
+# an existence test. It lives here rather than beside the other validators
+# because C2 owns that region in this cycle; the two belong together afterwards.
+bench_valid_branch() {
+    local b="${1:-}"
+    [ -n "$b" ] || return 1
+    [ "${#b}" -le 200 ] || return 1
+    case "$b" in
+        [!A-Za-z0-9]*)      return 1 ;;
+        *[!A-Za-z0-9._/-]*) return 1 ;;
+        *..*|*//*|*/)       return 1 ;;
+        *.lock)             return 1 ;;
+    esac
+    return 0
+}
+
+# Modified TRACKED files in the bench. `git status` is safe here and nowhere else
+# in this file: the bench's config was written by `clone` on this host and carries
+# none of the source's keys (measured — a `core.fsmonitor` planted in the source
+# ran on a `git status` there and never ran from the bench), and a
+# `.gitattributes` out of the branch cannot name a filter program without a
+# `filter.<name>.clean` entry in that host-written config.
+#
+# `--untracked-files=no` is load-bearing: a bench exists to be BUILT IN, and the
+# node_modules or .venv that the build leaves is the point of it, not a change to
+# protect. Returns 1 when git could not answer at all, so that a guard standing
+# between somebody and their work refuses rather than reading a failure as
+# "clean". macOS pads `wc -l`, hence the `tr`.
+bench_dirty_count() {
+    local bench="${1:?}" out n=0
+    out=$(git -C "$bench" status --porcelain --untracked-files=no 2>/dev/null) || return 1
+    [ -z "$out" ] || n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+    printf '%s' "$n"
+}
+
+# Commits in the bench that the repository does not have. Prints the count, or
+# prints nothing and returns 1 when `origin/<branch>` is not in the bench any
+# more — which is a routine state, not an exotic one: the branch was deleted or
+# renamed in the repository and a refresh's `fetch --prune` took the remote ref
+# with it. Measured, git 2.55.0: the bare `rev-list --count origin/B..HEAD` then
+# exits 128 with `unknown revision`, and under `set -e` that takes the whole
+# command down with git's raw error and no agentbox message — while `--remove`
+# never gets to remove a bench that is in fact perfectly disposable.
+# Unverifiable is not zero: every caller treats it as "this may be the only home
+# of a commit".
+bench_ahead_count() {
+    local bench="${1:?}" branch="${2:?}" n
+    git -C "$bench" rev-parse --verify --quiet "refs/remotes/origin/${branch}" >/dev/null 2>&1 \
+        || return 1
+    n=$(git -C "$bench" rev-list --count "refs/remotes/origin/${branch}..HEAD" 2>/dev/null | tr -d ' ') \
+        || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$n"
+}
+
+# The branch the bench is on, and its HEAD. Both come out of a repository this
+# host made, and both are shape-checked anyway: the branch was a guest-chosen
+# name when the clone was made, and it is about to be printed.
+bench_branch_of() {
+    local bench="${1:?}" b
+    b=$(git -C "$bench" symbolic-ref --quiet --short HEAD 2>/dev/null) || return 1
+    bench_valid_branch "$b" || return 1
+    printf '%s' "$b"
+}
+
+bench_head_of() {
+    local bench="${1:?}" h
+    h=$(git -C "$bench" rev-parse --verify --quiet HEAD 2>/dev/null) || return 1
+    case "$h" in ''|*[!0-9a-f]*) return 1 ;; esac
+    printf '%s' "$h"
+}
+
+# `rm -rf` is the one destructive act in this section, so the path it is given is
+# checked rather than trusted: a directory named exactly after the instance,
+# directly under BENCH_DIR. `bench=` in the record is host-written and never
+# mounted, but a record left by a run with AGENT_BOX_BENCH_DIR pointing somewhere
+# else — or a corrupted one — must not be able to aim it at anything else.
+bench_path_is_ours() {
+    local inst="${1:?}" bench="${2:?}"
+    valid_instance_name "$inst" || return 1
+    [ "$bench" = "${BENCH_DIR}/${inst}" ]
+}
+
+# Where this box's bench IS: what the record says, else where this run would put
+# one. `--remove` and destroy resolve it this way, because they are about what
+# exists. Creating and refreshing always use ${BENCH_DIR}/<inst>, which is where
+# THIS invocation was told to keep benches.
+bench_path_for() {
+    local inst="${1:?}" p
+    p=$(read_instance_meta_raw "$inst" bench 2>/dev/null || true)
+    [ -n "$p" ] || p="${BENCH_DIR}/${inst}"
+    printf '%s' "$p"
+}
+
+# The one route back from the bench to the repository, printed by the refusals
+# that exist because of it: a host session that fixed something IN the bench
+# holds the only copy of that commit, `git push` into a checked-out branch is
+# refused, and `--remove` refuses too — correctly — so a refusal without a
+# command leaves the operator re-typing the fix or doing surgery.
+#
+# The cherry-pick half runs INSIDE THE MOUNTED REPOSITORY, so the printed line
+# carries the same three flags `repo_git` uses: the box writes `.git/config`,
+# `cherry-pick` writes refs and would run whatever `core.hooksPath` names, and a
+# pager named there runs when stdout is a terminal — which is exactly what it is
+# when somebody pastes this. The `rev-list` half runs in the bench, which this
+# host owns, so it needs none of them.
+bench_recovery_command() {
+    local repo="${1:?}" bench="${2:?}" branch="${3:?}"
+    printf "git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C '%s' cherry-pick \$(git -C '%s' rev-list --reverse 'origin/%s..HEAD')" \
+        "$repo" "$bench" "$branch"
+}
+
+# The bench is on a branch with no `origin/<branch>` in it, so nothing can prove
+# the bench is disposable. Refused in the same words as a bench that is ahead, and
+# it names the branch: that is the fact the operator needs and the only one this
+# knows. Three routes get here and the message covers all three, because from in
+# here they are indistinguishable — the branch was deleted in the repository and a
+# `fetch --prune` took the remote ref with it, it was renamed, or the branch was
+# made in the bench and never existed in the repository.
+# The `log` it offers runs in the bench, not in a mount, so it needs none of
+# repo_git's protections.
+bench_gone_message() {
+    local inst="${1:?}" bench="${2:?}" branch="${3:?}"
+    printf "the bench at %s is on '%s' and has no origin/%s: the branch was deleted or renamed in the repository, or it was made in the bench, so nothing here can tell whether the bench still holds the only copy of a commit. Look with 'git -C %s log --oneline -20', then remove it with '%s bench %s --remove --force'." \
+        "$bench" "$branch" "$branch" "$bench" "$PROG" "${inst#agent-box-}"
+}
+
+# The branches the repository does have, when the named one is not there. A box
+# makes its own branches, so every name printed here is the guest's bytes:
+# clipped, and the list capped.
+bench_print_branches() {
+    local repo="${1:?}" ref n=0
+    {
+        printf 'branches in %s:\n' "$repo"
+        while IFS= read -r ref; do
+            [ -n "$ref" ] || continue
+            printf '  %s\n' "$(host_clip "$ref" 200)"
+            n=$((n + 1))
+        done <<EOF
+$(repo_git "$repo" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null | head -20)
+EOF
+        [ "$n" -ne 0 ] || printf '  (none)\n'
+    } >&2
+}
+
+# One bench as JSON FIELDS, without the enclosing braces: the two callers wrap
+# them differently — the single form adds created/refreshed/advanced_by, the
+# listing puts them in an array.
+#
+# An empty argument becomes `null` and means nobody could answer. Never 0, never
+# "": a bench whose ahead-count could not be computed is exactly the case a
+# consumer must not read as "0 commits to lose".
+bench_json_fields() {
+    local inst="${1:?}" repo="${2-}" bench="${3:?}" branch="${4-}" head="${5-}" \
+          dirty="${6-}" ahead="${7-}" j_repo=null j_branch=null j_head=null \
+          j_dirty=null j_ahead=null
+    [ -z "$repo" ]   || j_repo=$(json_str "$repo")
+    [ -z "$branch" ] || j_branch=$(json_str "$(host_clip "$branch" 200)")
+    [ -z "$head" ]   || j_head=$(json_str "$head")
+    [ -z "$dirty" ]  || j_dirty="$dirty"
+    [ -z "$ahead" ]  || j_ahead="$ahead"
+    printf '"box":%s,"instance":%s,"repo":%s,"bench":%s,"branch":%s,"head":%s,"dirty_files":%s,"ahead_of_repo":%s' \
+        "$(json_str "${inst#agent-box-}")" "$(json_str "$inst")" "$j_repo" \
+        "$(json_str "$bench")" "$j_branch" "$j_head" "$j_dirty" "$j_ahead"
+}
+
+# Every bench this host has, read from the directory rather than from the
+# records: a bench whose instance record was deleted is still a directory full of
+# somebody's build, and a listing that hid it would be the reason it was lost.
+# One bad bench never stops the listing — a fleet command answers for the others.
+bench_list() {
+    local as_json="${1:-0}" d inst bench repo branch head dirty ahead state any=0 first=1
+    for d in "${BENCH_DIR}"/*; do
+        if [ -d "$d" ]; then any=1; break; fi
+    done
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"generated_at":%s,"benches":[' "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
+    elif [ "$any" -eq 0 ]; then
+        info "no benches under ${BENCH_DIR} yet: ${PROG} bench <repo|name> makes one"
+        return 0
+    else
+        printf '%-46s %-16s %-24s %-9s %s\n' 'BENCH' 'BOX' 'BRANCH' 'HEAD' 'STATE'
+    fi
+    if [ "$any" -eq 1 ]; then
+        for d in "${BENCH_DIR}"/*; do
+            [ -d "$d" ] || continue
+            inst=$(basename "$d")
+            valid_instance_name "$inst" || continue
+            bench="$d"
+            repo=$(read_instance_meta_raw "$inst" repo 2>/dev/null || true)
+            branch=$(bench_branch_of "$bench") || branch=""
+            head=$(bench_head_of "$bench") || head=""
+            dirty=$(bench_dirty_count "$bench") || dirty=""
+            ahead=""
+            [ -z "$branch" ] || ahead=$(bench_ahead_count "$bench" "$branch") || ahead=""
+            if [ "$as_json" -eq 1 ]; then
+                [ "$first" -eq 1 ] || printf ','
+                first=0
+                printf '{%s}' "$(bench_json_fields "$inst" "$repo" "$bench" "$branch" "$head" "$dirty" "$ahead")"
+            else
+                state=""
+                [ "${dirty:-0}" = "0" ] || state="${dirty} modified"
+                if [ -z "$ahead" ]; then
+                    state="${state}${state:+, }no upstream"
+                elif [ "$ahead" != "0" ]; then
+                    state="${state}${state:+, }${ahead} ahead"
+                fi
+                [ -n "$state" ] || state="clean"
+                printf '%-46s %-16s %-24s %-9s %s\n' \
+                    "$bench" "${inst#agent-box-}" "$(host_clip "${branch:-?}" 60)" \
+                    "$(printf '%.7s' "${head:-?}")" "$state"
+            fi
+        done
+    fi
+    [ "$as_json" -eq 0 ] || printf ']}\n'
+}
+
+# Make the bench, or bring it up to the repository's branch head. Refuses rather
+# than resetting anything the operator has not put back in the repository.
+bench_ensure() {
+    local inst="${1:?}" repo="${2:?}" bench="${3:?}" branch="${4-}" as_json="${5:-0}" \
+          created=false refreshed=false advanced=0 old="" head dirty ahead on=""
+    [ -d "$repo" ] \
+        || die "the repository ${repo} is gone; bench works on the repository, not the VM"
+    repo_git "$repo" rev-parse --verify --quiet HEAD >/dev/null 2>&1 \
+        || die "${repo} has no commits yet; there is nothing to check out"
+    if [ -z "$branch" ]; then
+        # The branch the box is on right now, read on this host, with no guest
+        # contact at all — so it works on a stopped box. A detached HEAD makes
+        # symbolic-ref fail, and then the operator names one.
+        branch=$(repo_git "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+        [ -n "$branch" ] \
+            || die "${repo} is not on a branch (detached HEAD). Name one: ${PROG} bench ${inst#agent-box-} --branch agent/fix-login"
+    fi
+    bench_valid_branch "$branch" \
+        || die "'$(host_clip "$branch" 60)' is not a branch name this tool will use"
+    if ! repo_git "$repo" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null 2>&1; then
+        bench_print_branches "$repo"
+        die "no branch '${branch}' in ${repo}"
+    fi
+
+    if [ ! -d "$BENCH_DIR" ]; then
+        mkdir -p "$BENCH_DIR" || die "cannot create ${BENCH_DIR}"
+        # A bench fills up with node_modules and virtualenvs the way ~/.lima
+        # fills up with disk images. ~/.lima is already excluded and
+        # ${HOST_CONFIG_DIR} is not, so without this line a bench doubles the
+        # backup of every dependency tree. To stderr, so --json's stdout stays
+        # parseable whatever tmutil says.
+        exclude_from_backup "$BENCH_DIR" "the bench directory (${BENCH_DIR})" >&2
+    fi
+
+    bench_say "bench for ${inst} at ${bench}"
+    if [ ! -e "$bench" ]; then
+        repo_git "$repo" clone --no-local --branch "$branch" -- "$repo" "$bench" >&2 \
+            || die "cloning ${repo} failed; the box may have been writing to it. Try again."
+        created=true
+        head=$(bench_head_of "$bench") \
+            || die "the clone left no usable checkout at ${bench}; remove it and run bench again"
+        bench_say "cloned ${repo} at ${branch} ($(printf '%.7s' "$head"))"
+    else
+        [ -d "${bench}/.git" ] \
+            || die "${bench} exists and is not a git repository. Remove it yourself, then run bench again."
+        old=$(bench_head_of "$bench") \
+            || die "${bench} is a git repository with no usable HEAD; remove it and run bench again"
+        # Both guards BEFORE the fetch, so a bench nobody may touch is not
+        # touched: the dirty one refuses without going near the repository, and
+        # the ahead one refuses before a checkout moves the branch off its
+        # commits.
+        dirty=$(bench_dirty_count "$bench") \
+            || die "git could not read the bench at ${bench}; remove it and run bench again"
+        [ "$dirty" = "0" ] \
+            || die "the bench for ${inst} has ${dirty} modified files; a refresh would discard them. Commit them in the repository, or '${PROG} bench ${inst#agent-box-} --remove --force'."
+        # Measured against the branch the BENCH is on, not the one being asked
+        # for: the question is whether the bench holds a commit nothing else has,
+        # and against a different target branch the count would be that target's
+        # divergence — commits that ARE in the repository, reported as commits
+        # that are not. The requested branch is what the fetch and the checkout
+        # below use.
+        on=$(bench_branch_of "$bench") \
+            || die "the bench at ${bench} is not on a branch, so nothing here can tell whether it holds the only copy of a commit. Look at it, then '${PROG} bench ${inst#agent-box-} --remove --force'."
+        git -C "$bench" fetch --prune -- origin >&2 \
+            || die "fetching ${repo} into the bench failed; the box may have been writing to it. Try again."
+        ahead=$(bench_ahead_count "$bench" "$on") \
+            || die "$(bench_gone_message "$inst" "$bench" "$on")"
+        [ "$ahead" = "0" ] \
+            || die "the bench for ${inst} has ${ahead} commits that are not in ${repo}. The bench is disposable by design — move them into the repository first: $(bench_recovery_command "$repo" "$bench" "$on")"
+        git -C "$bench" checkout -B "$branch" "refs/remotes/origin/${branch}" >&2 \
+            || die "the bench at ${bench} could not be moved to ${branch}; look at it before running bench again"
+        head=$(bench_head_of "$bench") \
+            || die "${bench} has no usable HEAD after the refresh; look at it before running bench again"
+        if [ "$head" = "$old" ]; then
+            bench_say "already at $(printf '%.7s' "$head") on ${branch}"
+        else
+            refreshed=true
+            advanced=$(git -C "$bench" rev-list --count "${old}..HEAD" 2>/dev/null | tr -d ' ') \
+                || advanced=0
+            case "$advanced" in ''|*[!0-9]*) advanced=0 ;; esac
+            bench_say "refreshed ${branch} $(printf '%.7s' "$old") -> $(printf '%.7s' "$head") (${advanced} commits)"
+        fi
+    fi
+    # The host's own record of where this box's bench is and what it holds. One
+    # read-modify-write for both keys, so a concurrent `keepalive on` or `egress`
+    # loses neither of them.
+    write_instance_meta_multi "$inst" "bench=${bench}" "bench_branch=${branch}"
+
+    # Said every time, and deliberately not a count: the host must not run
+    # `git status` in a mounted repository (the box writes .git/config and
+    # .gitattributes), so how much is uncommitted in there is a fact only the
+    # box can state — `agentbox status` carries it. What the host CAN say is
+    # which half of the work the bench is showing.
+    bench_say "the bench sees commits only; anything the box has not committed is not in it"
+
+    if [ "$as_json" -eq 1 ]; then
+        dirty=$(bench_dirty_count "$bench") || dirty=""
+        ahead=$(bench_ahead_count "$bench" "$branch") || ahead=""
+        printf '{"generated_at":%s,%s,"created":%s,"refreshed":%s,"advanced_by":%s}\n' \
+            "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+            "$(bench_json_fields "$inst" "$repo" "$bench" "$branch" "$head" "$dirty" "$ahead")" \
+            "$created" "$refreshed" "$advanced"
+    fi
+}
+
+# Take the bench away, unless it is the only place something lives. Both guards
+# are the item-9 failure mode — work in exactly one place — applied to this
+# tool's own directory.
+bench_remove() {
+    local inst="${1:?}" bench="${2:?}" force="${3:-0}" repo="${4-}" dirty ahead branch tail
+    [ -d "$bench" ] || die "no bench for ${inst} at ${bench}"
+    bench_path_is_ours "$inst" "$bench" \
+        || die "the bench recorded for ${inst} is ${bench}, which is not ${BENCH_DIR}/${inst}; remove it yourself with 'rm -rf' if that is what you want"
+    if [ "$force" -eq 0 ]; then
+        [ -d "${bench}/.git" ] \
+            || die "${bench} is not a git repository. Remove it yourself, or run this again with --force."
+        dirty=$(bench_dirty_count "$bench") \
+            || die "git could not read the bench at ${bench}; look at it, then remove it with --force"
+        [ "$dirty" = "0" ] \
+            || die "the bench for ${inst} has ${dirty} modified files; --remove would discard them. Commit them in the repository, or '${PROG} bench ${inst#agent-box-} --remove --force'."
+        branch=$(bench_branch_of "$bench") || branch=""
+        [ -n "$branch" ] \
+            || die "the bench at ${bench} is not on a branch, so nothing here can tell whether it holds the only copy of a commit. Remove it with '${PROG} bench ${inst#agent-box-} --remove --force'."
+        ahead=$(bench_ahead_count "$bench" "$branch") \
+            || die "$(bench_gone_message "$inst" "$bench" "$branch")"
+        if [ "$ahead" != "0" ]; then
+            tail="move them into the repository first"
+            [ -z "$repo" ] \
+                || tail="move them into the repository first: $(bench_recovery_command "$repo" "$bench" "$branch")"
+            die "the bench for ${inst} has ${ahead} commits that are not in the repository. The bench is disposable by design — ${tail}"
+        fi
+    fi
+    rm -rf "$bench" || die "could not remove ${bench}"
+    info "removed the bench at ${bench}"
+    # The record itself belongs to the instance, not to the bench, so the two
+    # bench keys are emptied rather than the file removed: nothing later reads a
+    # path that is gone.
+    if [ -f "$(instance_meta_file "$inst")" ]; then
+        write_instance_meta_multi "$inst" "bench=" "bench_branch="
+    fi
+}
+
+# Called by `destroy`, BEFORE the record file is deleted: afterwards there is no
+# `bench=` line left for `bench --remove` to resolve, which is why the message
+# below says `rm -rf` and not a subcommand. Never fatal — a bench problem is not
+# a reason for destroy to stop half way — and it keeps anything it cannot prove
+# disposable, which after the box is gone is the last chance anybody gets.
+destroy_bench_hook() {
+    local inst="${1:?}" bench dirty ahead branch why=""
+    bench=$(bench_path_for "$inst")
+    [ -n "$bench" ] && [ -d "$bench" ] || return 0
+    if ! bench_path_is_ours "$inst" "$bench"; then
+        info "kept the bench at ${bench}: it is not ${BENCH_DIR}/${inst}. Remove it with 'rm -rf' when you are done with it."
+        return 0
+    fi
+    if [ ! -d "${bench}/.git" ]; then
+        why="it is not a git repository"
+    else
+        dirty=$(bench_dirty_count "$bench") || dirty=""
+        branch=$(bench_branch_of "$bench") || branch=""
+        ahead=""
+        [ -z "$branch" ] || ahead=$(bench_ahead_count "$bench" "$branch") || ahead=""
+        if [ -z "$dirty" ]; then
+            why="git could not read it"
+        elif [ "$dirty" != "0" ]; then
+            why="${dirty} modified files"
+        elif [ -z "$branch" ]; then
+            why="it is not on a branch"
+        elif [ -z "$ahead" ]; then
+            why="it is on '${branch}' and has no origin/${branch}, so nothing here can tell what it holds"
+        elif [ "$ahead" != "0" ]; then
+            why="${ahead} commits that are not in the repository"
+        fi
+    fi
+    if [ -n "$why" ]; then
+        info "kept the bench at ${bench}: ${why}. Remove it with 'rm -rf' when you are done with it."
+        return 0
+    fi
+    if rm -rf "$bench"; then
+        info "removed the bench at ${bench}"
+    else
+        info "NOTE: could not remove the bench at ${bench}. Remove it with 'rm -rf'."
+    fi
+}
+
+cmd_bench() {
+    local as_json=0 do_list=0 do_remove=0 force=0 branch="" arg inst repo bench
+    split_args "--branch" "$@"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --branch)
+                [ -n "${2:-}" ] || die "--branch needs a branch name"
+                branch="$2"; shift 2 ;;
+            --json)   as_json=1; shift ;;
+            --list)   do_list=1; shift ;;
+            --remove) do_remove=1; shift ;;
+            --force)  force=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    [ "$do_list" -eq 0 ] || [ "$do_remove" -eq 0 ] \
+        || die "--list and --remove are different commands; run one of them"
+
+    if [ "$do_list" -eq 1 ]; then
+        [ -z "$branch" ] || die "--branch has no meaning with --list"
+        [ "$force" -eq 0 ] || die "--force only applies to --remove"
+        check_operands 0 0 "bench --list [--json]"
+        bench_list "$as_json"
+        return 0
+    fi
+
+    check_operands 1 1 "bench <repo|name> [--branch B] [--json] | bench <repo|name> --remove [--force]"
+    arg="${ABX_POSV[0]}"
+    inst=$(instance_name "$arg")
+    valid_instance_name "$inst" \
+        || die "'${inst}' cannot name a bench directory; pass the repository path instead"
+    # A path operand is its own answer. A bare box name is not: bench never calls
+    # limactl, so the only place the repository can come from is the host's own
+    # record — and `repo=` was written by `create` and `keepalive on` only until
+    # this version backfilled it at `start`, so a box made by an older checkout
+    # that has not been started since may not have it.
+    if [ -d "$arg" ]; then
+        repo=$(abs_repo "$arg")
+    else
+        repo=$(read_instance_meta_raw "$inst" repo 2>/dev/null || true)
+    fi
+
+    if [ "$do_remove" -eq 1 ]; then
+        [ "$as_json" -eq 0 ] || die "--json does not apply to --remove"
+        [ -z "$branch" ] || die "--branch has no meaning with --remove"
+        bench_remove "$inst" "$(bench_path_for "$inst")" "$force" "$repo"
+        return 0
+    fi
+
+    [ "$force" -eq 0 ] || die "--force only applies to --remove"
+    [ -n "$repo" ] \
+        || die "no repository recorded for ${inst}; pass the repository path: ${PROG} bench ~/dev/app"
+    bench="${BENCH_DIR}/${inst}"
+    BENCH_QUIET="$as_json"
+    bench_ensure "$inst" "$repo" "$bench" "$branch" "$as_json"
+}
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
