@@ -115,6 +115,17 @@ for _i in "$@"; do
     case "$_i" in
         --verify-only) ABX_VERIFY_ONLY=1 ;;
         --docker-hook) ABX_DOCKER_HOOK=1 ;;
+        # Only the separated form is read above, so `--mode=deny` would fall
+        # through to the mode FILE and rebuild the firewall in a mode nobody
+        # asked for. A silent wrong-mode rebuild is the worst failure this
+        # script has, so the joined form is refused instead of ignored. The
+        # value is not echoed back: it came from a caller's argv.
+        #
+        # printf and not log(), which is defined further down this file and is
+        # therefore not a command yet at this point in it.
+        --mode=*)
+            printf 'ERROR: --mode takes its value as a separate argument: --mode <deny|observe|open>\n' >&2
+            exit 2 ;;
     esac
     _prev="$_i"
 done
