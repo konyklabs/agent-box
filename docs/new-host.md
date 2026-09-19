@@ -88,10 +88,10 @@ What the answers mean:
 ```
 brew install lima gitleaks uv
 mkdir -p ~/dev ~/.local/bin
-git clone https://github.com/OlegKonyk/agent-box ~/dev/agent-box
-git clone https://github.com/OlegKonyk/porthole  ~/dev/porthole
+git clone https://github.com/konyklabs/agent-box ~/dev/agent-box
+git clone https://github.com/konyklabs/porthole  ~/dev/porthole
 ln -sf ~/dev/agent-box/bin/agentbox ~/.local/bin/agentbox
-uv tool install git+https://github.com/OlegKonyk/porthole
+uv tool install git+https://github.com/konyklabs/porthole
 ```
 
 `~/.local/bin` must be on `PATH` (it usually is with `uv`). porthole finds
@@ -431,7 +431,7 @@ equivalent, never in a commit: which phases needed a human, what the
 preconditions returned, the box name, which profile flags were used, whether
 a `ca.pem` was needed, and the exact output of verify-auth and firewall-check.
 Anything worth changing in this repository — a check that lied, a step that
-was missing — becomes an issue on `OlegKonyk/agent-box` with the internal
+was missing — becomes an issue on `konyklabs/agent-box` with the internal
 names removed.
 
 ## 11. Stop, rotate, decommission

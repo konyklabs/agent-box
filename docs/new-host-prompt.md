@@ -15,7 +15,7 @@ Start:
 
 ```
 brew install lima gitleaks uv
-git clone https://github.com/OlegKonyk/agent-box ~/dev/agent-box
+git clone https://github.com/konyklabs/agent-box ~/dev/agent-box
 ln -sf ~/dev/agent-box/bin/agentbox ~/.local/bin/agentbox
 ```
 
@@ -55,7 +55,7 @@ Rules that override everything else:
 Install the window onto the boxes as well, in phase 3, and use it:
 
 ```
-uv tool install git+https://github.com/OlegKonyk/porthole
+uv tool install git+https://github.com/konyklabs/porthole
 porthole
 ```
 

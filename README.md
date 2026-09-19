@@ -282,7 +282,7 @@ pre-2.0 name `governor.json` is still carried and still read, with a nag.
   capable agent could disable its own firewall. The firewall is a guard rail
   against carelessness, not a sandbox against a hostile tool — the VM boundary
   is what protects the host. Tracked as
-  [issue #1](https://github.com/OlegKonyk/agent-box/issues/1).
+  [issue #1](https://github.com/konyklabs/agent-box/issues/1).
 - **Three commands hand you a terminal and cannot scrub it.** `agentbox claude`
   and `agentbox session` give the CLI your screen. `agentbox attach` draws a
   pane's raw bytes, including a run's pane. Everything `agentbox logs`,
