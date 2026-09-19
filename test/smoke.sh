@@ -13,7 +13,10 @@
 # Two development aids, neither of which may appear in a pull request's evidence:
 # SMOKE_STOP_AFTER=<step label> stops the run at the next step boundary and
 # prints STOPPED AFTER <label> above the RESULT line, and SMOKE_KEEP=1 leaves the
-# boxes and the temporary repositories in place for the next iteration. The
+# boxes and the temporary repositories in place TO BE INSPECTED. It is not reuse:
+# the instance names and the temporary root are derived from this process's pid,
+# so the next run builds its own boxes beside the kept ones and each kept box
+# holds its memory until it is destroyed. Destroy them before the next run. The
 # output pasted for a change has to come from a run with neither set.
 #
 # Run it from a terminal, or detach it with a launcher that resets signal
@@ -160,17 +163,27 @@ cleanup() {
         STANDIN_INSTALLED=0
     fi
     # SMOKE_KEEP is a development aid: it leaves the boxes and the temporary
-    # repositories in place so the next iteration reuses them. It keeps $TMP_ROOT
-    # too, because $CLEAN_REPO is mounted into the box that is being kept.
+    # repositories in place TO BE INSPECTED. It keeps $TMP_ROOT too, because
+    # $CLEAN_REPO is mounted into the box that is being kept.
+    #
+    # It is not reuse, and it must not be read as reuse: $SMOKE_ID is `smoke$$`
+    # and $TMP_ROOT a fresh mktemp, so the next run builds its own boxes and
+    # cannot see these. That is why the count below is of every smoke box on the
+    # host and not only this run's: each one holds several GiB until it is
+    # destroyed, and two or three forgotten sets will starve the next create.
     if [ "${SMOKE_KEEP:-0}" = "1" ]; then
-        printf 'SMOKE_KEEP=1: leaving these in place\n'
+        printf 'SMOKE_KEEP=1: leaving these in place for inspection (NOT reuse: the next run builds its own)\n'
         for inst in "$INSTANCE" "$DOCKER_INSTANCE" "$SECOND_INSTANCE"; do
             if "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$inst"; then
                 printf '  instance %s\n' "$inst"
             fi
         done
         printf '  %s\n' "$TMP_ROOT"
-        printf 'Destroy them yourself when you are done: agentbox destroy <name>; rm -rf %s\n' "$TMP_ROOT"
+        # All three shapes: agent-box-smoke<pid>, and the dk- and second- ones.
+        local kept
+        kept=$("$LIMACTL" list --quiet 2>/dev/null | grep -cE '^agent-box-(dk-|second-)?smoke[0-9]+$' || true)
+        printf 'smoke boxes on this host now: %s. Destroy them before the next run: agentbox destroy <name>; rm -rf %s\n' \
+            "${kept:-0}" "$TMP_ROOT"
         exit "$rc"
     fi
     for inst in "$INSTANCE" "$DOCKER_INSTANCE" "$SECOND_INSTANCE"; do

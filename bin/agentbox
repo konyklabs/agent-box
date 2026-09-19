@@ -61,7 +61,8 @@ usage: ${PROG} <command> [args]
   preflight <repo>                  scan a repo for secrets and configured terms
   create <repo> [options]           preflight, then create and start its VM
   resize <repo|name> [options]      change cpus/memory/disk of an existing VM
-  start <repo>                      preflight, then start an existing VM
+  start <repo> [--ignore-port-conflict]
+                                    preflight, then start an existing VM
   token <repo>                      read an OAuth token from the terminal into the VM
   verify-auth <repo>                prove the token authenticates, with a real model call
   claude [--] <repo> [claude args]  interactive Claude Code in the VM, in /work
@@ -147,6 +148,12 @@ except the sizing, which 'resize' can change:
   --disk SIZE         default 40GiB, or 60GiB with --docker
 
 resize options: --cpus N, --memory SIZE, --disk SIZE. The disk can only grow.
+
+A forward is a frozen create-time parameter, so start cannot move one: if a host
+port a box forwards was taken by something else while the box was stopped, start
+refuses and names the port and the process holding it. --ignore-port-conflict
+starts it anyway and prints a WARNING naming the port; that forward will not
+answer.
 
 toolcheck says whether a box is at the baseline: exit 0 when every tool is
 present at its pin, 10 when one is missing or off its pin, 11 when the box is
@@ -248,8 +255,30 @@ json_str() {
 # reason — a string this host did not write is about to appear in a message, and
 # a process name on the Mac, a branch name chosen by an agent and a reason line
 # out of a guest are all somebody else's bytes.
+#
+# Pure bash, not `tr | cut`, and that is the whole point: in a UTF-8 locale
+# macOS `tr` ABORTS on a byte that is not valid UTF-8 (`tr: Illegal byte
+# sequence`), `set -o pipefail` turns that into a non-zero return, and `set -e`
+# then kills the caller with no agentbox message at all. Git permits a high byte
+# in a ref name and `.git/HEAD` is guest-writable on the mount, so the helper
+# whose job is making hostile bytes safe would have been the thing that died on
+# them — and for `triage`, a fleet command, one box would take down the report
+# for every box. Measured: `host_clip $'py\xffthon' 80` returned 1 and printed
+# `py`; this version returns 0 and passes the byte through, where it prints as
+# one replacement character and never as an escape sequence.
+#
+# Two substitutions, because `[[:cntrl:]]` is the locale's class, not a byte
+# range: under UTF-8 it covers C0, DEL and the C1 block, under LC_ALL=C only C0
+# and DEL. The second line removes the C1 block the way UTF-8 spells it (U+0080
+# to U+009F are exactly the two-byte sequences C2 80 to C2 9F, and C2 never
+# appears as a continuation byte, so nothing legitimate is touched), which makes
+# U+009B — a CSI to a terminal in 8-bit mode — go in BOTH locales. Measured
+# under LC_ALL=C and LC_ALL=en_US.UTF-8, bash 3.2.
 host_clip() {
-    printf '%s' "${1-}" | tr -d '[:cntrl:]' | cut -c1-"${2:?}"
+    local v="${1-}"
+    v=${v//[[:cntrl:]]/}
+    v=${v//$'\302'[$'\200'-$'\237']/}
+    printf '%s' "${v:0:${2:?}}"
 }
 
 # Split a command line into options and operands, stopping option processing at
@@ -442,6 +471,41 @@ EOF
 # what lets `status` answer for a box that is not running.
 INSTANCE_META_DIR="${HOST_CONFIG_DIR}/instances"
 instance_meta_file() { printf '%s/%s' "$INSTANCE_META_DIR" "${1:?}"; }
+
+# Every write below is a read-modify-write of one small file, and two commands
+# can be inside it at once: `triage` writes its watermark while a `keepalive
+# <repo> on` loop or `egress` writes its own key, both read the same old file,
+# and whichever renames second erases the other's keys. Measured before this
+# lock existed: 200 rounds of `keepalive on` + `repo` against one
+# `write_instance_meta_multi`, and `keepalive=on` was gone from the record 200
+# times out of 200 — after which the watchdog stops restarting that box and
+# nothing says why. `mkdir` is the only atomic test-and-set a shell has on macOS
+# (no `flock`), and a DIRECTORY is the right shape for a second reason:
+# `watchdog_run` iterates this directory and skips anything that is not a
+# regular file, so the lock is invisible to it.
+#
+# Per file, not per directory, so two boxes never wait on each other. Bounded
+# wait then break: a holder killed between `mkdir` and `rm` would otherwise
+# block every later write for good, and losing one key is bad where never
+# writing again is worse. Best-effort throughout, like the writers it guards —
+# it returns 0 even when it cannot lock, because failing to record a mode must
+# never fail the command that set it.
+META_LOCK_TRIES=50   # x 0.1s = 5s
+meta_lock() {
+    local d="${1:?}.lock" i=0
+    while ! mkdir "$d" 2>/dev/null; do
+        i=$((i + 1))
+        if [ "$i" -ge "$META_LOCK_TRIES" ]; then
+            rm -rf "$d" 2>/dev/null || true
+            mkdir "$d" 2>/dev/null || true
+            break
+        fi
+        sleep 0.1
+    done
+    return 0
+}
+meta_unlock() { rm -rf "${1:?}.lock" 2>/dev/null || true; }
+
 # One `key=value` per line. Writing a key replaces that key's line and leaves
 # the others alone, so `agentbox egress` changing the mode does not forget
 # what `keepalive` or `create` recorded.
@@ -450,8 +514,10 @@ write_instance_meta() {
     mkdir -p "$INSTANCE_META_DIR" 2>/dev/null || return 0
     f=$(instance_meta_file "$inst")
     tmp="${f}.tmp.$$"
+    meta_lock "$f"
     { { [ -r "$f" ] && grep -v "^${key}=" "$f"; } || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; true; }
+    meta_unlock "$f"
 }
 # A word value: letters only, the way the egress mode and keepalive read. A
 # path (the repo) is read raw where it is needed, not through this.
@@ -477,13 +543,28 @@ read_instance_meta_raw() {
     sed -n "s/^${2:?}=\(.*\)\$/\1/p" "$f" | tail -1
 }
 
-# Several keys, ONE read-modify-write. Three separate write_instance_meta calls
-# are three full rewrites of the file, and a concurrent `keepalive on` or
-# `egress` between two of them has its own write overwritten — silently, with
-# `keepalive=on` the value most likely to disappear. A command that writes a
-# group of keys while it reads (triage's watermark) does it here.
+# `repo=` was written only by `create` and `keepalive on`, so every box made
+# before that key existed has a record without it — and the commands that work
+# from a bare instance name (bench, triage, the channel) have nowhere else to
+# learn which repository a box is pointed at. `start`, `claude` and `session`
+# each backfill it, which is three more writers on a file with a lock around it:
+# read first and the write happens once per box instead of on every invocation,
+# and the common case stops contending at all.
+backfill_instance_repo() {
+    local inst="${1:?}" repo="${2:?}"
+    [ "$(read_instance_meta_raw "$inst" repo 2>/dev/null || true)" = "$repo" ] \
+        || write_instance_meta "$inst" repo "$repo"
+}
+
+# Several keys, ONE read-modify-write, under the lock. Three separate
+# write_instance_meta calls are three full rewrites of the file, and a concurrent
+# `keepalive on` or `egress` between two of them has its own write overwritten —
+# silently, with `keepalive=on` the value most likely to disappear. Doing the
+# group in one pass narrows that window; only `meta_lock` closes it, so a command
+# that writes a group of keys while it reads (triage's watermark) does it here
+# and gets both.
 write_instance_meta_multi() {
-    local inst="${1:?}" f tmp kv
+    local inst="${1:?}" f tmp kv rc=0
     shift
     [ $# -gt 0 ] || return 0
     mkdir -p "$INSTANCE_META_DIR" 2>/dev/null || return 0
@@ -494,14 +575,18 @@ write_instance_meta_multi() {
     # and a failed rename both land in the same place.
     local -a filter=()
     for kv in "$@"; do filter+=(-e "^${kv%%=*}="); done
+    meta_lock "$f"
     if {
            { [ -r "$f" ] && grep -v "${filter[@]}" "$f"; } || true
            for kv in "$@"; do printf '%s\n' "$kv"; done
        } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null
     then
-        return 0
+        rc=0
+    else
+        rc=1
     fi
-    rm -f "$tmp" 2>/dev/null || true
+    meta_unlock "$f"
+    [ "$rc" -eq 0 ] || rm -f "$tmp" 2>/dev/null || true
     return 0
 }
 
@@ -528,12 +613,27 @@ valid_instance_name() {
 # the source of a `clone`/`fetch`. Never `status`, `diff` or `log -p`: the box
 # can write `.git/config`, `.git/hooks` and `.gitattributes`, and those three
 # verbs run `core.fsmonitor` and clean filters — guest-chosen programs, on this
-# host, as this user. The two `-c` flags close the two that travel in the
-# repository itself. See docs/decisions.md.
+# host, as this user.
+#
+# THREE ways the repository itself names a program, and all three are closed
+# here, because the third fires for the verbs ALLOWED above and not only for
+# the forbidden ones:
+#   core.fsmonitor   a query-daemon command, run by `status`, `diff` and kin
+#   core.hooksPath   the hook directory, run by anything that writes a ref
+#   pager.<verb>     that verb's pager — `for-each-ref`, `rev-list` and
+#                    `symbolic-ref` all honour it
+# The pager is the trap, because git only starts one when stdout is a TERMINAL:
+# a helper checked by capturing its output in `$(…)` looks clean and is not, and
+# the first consumer that prints through it straight to the operator's terminal
+# runs whatever the box wrote. Measured on git 2.55.0 with `pager.for-each-ref`,
+# `pager.rev-list` and `pager.symbolic-ref` planted in a repository's
+# `.git/config`: captured, no marker; under a pty, all three ran. `--no-pager`
+# is as load-bearing as the two `-c` flags. Any git command a message tells the
+# operator to run by hand needs it too. See docs/decisions.md.
 repo_git() {
     local repo="${1:?}"
     shift
-    git -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" "$@"
+    git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C "$repo" "$@"
 }
 
 # A plain `key: value` from the host config file, or nothing. The value is one
@@ -722,9 +822,34 @@ valid_port() {
 # answer "is the host side of this forward free, and if not, who has it" for
 # `create`, `start` and `ports`.
 #
-# The placeholder keeps `cmd_create` honest until H1 lands: a call with nothing
-# behind it is better than a call site added later to a command nobody re-read.
+# The placeholders keep `cmd_create` and `cmd_start` honest until H1 lands: a
+# call with nothing behind it is better than a call site added later to a command
+# nobody re-read. They are also why H1 does not have to touch either command's
+# own lines — the call sites, the `--ignore-port-conflict` parsing and its usage
+# text are already here, so H1 adds only the two bodies.
 check_forward_ports() { :; }
+
+# `start`'s half, per amendment A2. A host port can be taken between `stop` and
+# `start`, and the forwards are frozen create-time params, so the only honest
+# answers are refuse-and-name-the-holder or proceed-with-a-WARNING. $2 is 1 when
+# `--ignore-port-conflict` was given; the box's own Lima hostagent holding the
+# port is not a conflict.
+start_port_check() { :; }
+
+# ---------------------------------------------------------------------------
+# toolchain readiness (TB)
+# ---------------------------------------------------------------------------
+#
+# Amendment A3: a NEW box must not be reported ready with a baseline tool
+# missing. $2 is `create` or `start` and decides only how loud it is — the same
+# by-name lines either way:
+#   create  prints `NOT READY: <tool> …` and RETURNS the toolcheck's status,
+#           which becomes create's exit status (the box exists and is usable;
+#           the status and the last lines say it is not at baseline)
+#   start   prints them as a WARNING, and the caller drops the status so an
+#           existing box still starts and exits 0
+# Returning 0 until TB lands, so neither command's behaviour changes yet.
+report_toolchain_readiness() { return 0; }
 
 cmd_create() {
     local repo inst
@@ -931,6 +1056,12 @@ ${inst} is up.
 Next: ${PROG} token ${repo}         # paste the OAuth token, once
 Then: ${PROG} verify-auth ${repo}   # a real model call, which is the only proof
 EOF
+
+    # LAST, and its status is create's status (amendment A3): the summary above
+    # says the box is up, and only the toolcheck can say whether it is at
+    # baseline. A non-zero status here means "created, not at baseline", which is
+    # why it is not a `die` — the box is real and usable.
+    report_toolchain_readiness "$inst" create
 }
 
 # Sizing is the one part of an instance's shape that is not fixed at create
@@ -1000,18 +1131,28 @@ cmd_resize() {
 }
 
 cmd_start() {
-    local repo inst
+    local repo inst ignore_conflict=0
     split_args "" "$@"
-    check_operands 1 1 "start <repo>"
+    check_operands 1 1 "start <repo> [--ignore-port-conflict]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --ignore-port-conflict) ignore_conflict=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
     repo=$(abs_repo "${ABX_POSV[0]}")
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
-    # Backfilled: `repo=` was written only by `create` and `keepalive on`, so
-    # every box made before that key existed has a record without it — and the
-    # commands that work from a bare instance name (bench, triage, the channel)
-    # have nowhere else to learn which repository a box is pointed at.
-    write_instance_meta "$inst" repo "$repo"
+    backfill_instance_repo "$inst" "$repo"
+
+    # The forwards are frozen create-time params, so `start` cannot move them:
+    # all it can do is refuse to start a box whose host port something else took
+    # between `stop` and `start`, which is better than a forward that silently
+    # does not answer. H1 fills this in; the flag is parsed above either way, so
+    # the escape hatch works the moment the body lands.
+    start_port_check "$inst" "$ignore_conflict"
 
     run_preflight "$repo" || die "preflight failed; refusing to start ${inst}"
     ensure_host_config_dir
@@ -1020,6 +1161,11 @@ cmd_start() {
     # A run that was going when the VM stopped never ran its EXIT trap, so its
     # status still says `running`. This is the first moment anything can tell.
     guest_shell "$inst" "${GUEST_BIN}/run-ctl.sh" reconcile 2>/dev/null || true
+
+    # A WARNING, and the status is dropped on purpose (amendment A3): an existing
+    # box that has drifted off baseline must still start, and `start` must still
+    # exit 0. Only `create` refuses to call a new box ready.
+    report_toolchain_readiness "$inst" start || true
 }
 
 cmd_token() {
@@ -1153,7 +1299,7 @@ cmd_claude() {
     inst=$(instance_name "$repo")
     require_limactl
     require_instance "$inst"
-    write_instance_meta "$inst" repo "$repo"
+    backfill_instance_repo "$inst" "$repo"
     sync_guest_config "$inst"
     exec "$LIMACTL" shell --workdir /work "$inst" -- \
         /opt/agent-box/guest/claude-session.sh "$@"
@@ -1593,7 +1739,7 @@ cmd_session() {
     require_limactl
     require_instance "$inst"
     require_running "$inst"
-    write_instance_meta "$inst" repo "$repo"
+    backfill_instance_repo "$inst" "$repo"
     sync_guest_config "$inst"
 
     local session_args=(--tmux "$name")
