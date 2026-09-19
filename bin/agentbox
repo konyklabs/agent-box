@@ -1695,7 +1695,32 @@ cmd_stop_run() {
 #
 # Processes, listening ports, worktrees and tmux sessions that outlived the run
 # that started them, each attributed to the run that left it.
-cmd_leftovers() { die "leftovers: not built in this checkout"; }
+#
+# It REPORTS and it does not clean. Killing a survivor from here would mean
+# reaching into the box to signal a process the host cannot identify, on the
+# strength of a ledger an agent could have written; a run's own sweep is a
+# different act, from inside, over what it is proven to own. A host-side cleaner,
+# if there is ever one, is a separate confirming command.
+cmd_leftovers() {
+    local repo inst args=()
+    split_args "" "$@"
+    check_operands 1 1 "leftovers <repo> [--json]"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) args+=(--json); shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    repo=$(abs_repo "${ABX_POSV[0]}")
+    inst=$(instance_name "$repo")
+    require_limactl
+    require_instance "$inst"
+    # A stopped box is not asked, like every other read command: its survivors
+    # are genuinely unknown, which is what `status --json` reports for it.
+    require_running "$inst"
+    guest_shell "$inst" "${GUEST_BIN}/run-ledger.sh" survivors ${args[@]+"${args[@]}"}
+}
 # ---------------------------------------------------------------------------
 
 cmd_sessions() {

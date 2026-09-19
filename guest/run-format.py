@@ -24,6 +24,7 @@ Modes:
   run-format.py --summary [RUNID]            that run's scrubbed summary
   run-format.py --list [--json]              every run, newest first
   run-format.py --sessions-in [--json]       format a session list from stdin
+  run-format.py --survivors-in [--json]      format a leftovers list from stdin
   run-format.py --box-json ...               one JSON line describing this box
   run-format.py --box-text ...               the same, as one line of text
 """
@@ -695,6 +696,11 @@ class Run:
             "turns": result.get("num_turns"),
             "cost_usd": result.get("total_cost_usd"),
             "files_changed": self.files_changed,
+            # int when this run swept, null when it never did: see
+            # `_run_survivors`. No column in the text table -- a count of what a
+            # finished run left behind belongs where a person is asking about
+            # leftovers, and `agentbox leftovers` is that place.
+            "survivors": _run_survivors(self.dir),
             "heal_attempt": meta.get("heal_attempt"),
             "heal_parent": meta.get("heal_parent"),
             "resume_of": meta.get("resume_of"),
@@ -1020,15 +1026,212 @@ def cmd_sessions(args):
 # --- leftovers -------------------------------------------------------------
 #
 # What earlier runs left running, read from the resource ledger a run keeps in
-# the guest home. `_leftovers_or_none`, `_clean_leftovers`, `_fold_leftovers` and
-# the body of `cmd_survivors` belong to the slice that builds the ledger; the
-# skeleton owns the name, the dispatch and the `--leftovers` argument, so the
-# status object and this mode cannot disagree about either.
+# the guest home. Two shapes come out of the same rows, so that `agentbox
+# leftovers` and the `leftovers` object of `status --json` can never disagree
+# about what is still up: the rows themselves (`cmd_survivors`) and the folded
+# summary a monitor renders a column from (`_fold_leftovers`).
+#
+# Every row is untrusted text. `value` is a path or a name the agent chose and
+# `detail` is a command line it chose, so the ledger is exactly the file an
+# agent would write a credential into on purpose. Nothing here is executed,
+# nothing is compared arithmetically, and every field is scrubbed and capped
+# before it is printed.
+
+# The scan in the guest stops at this many rows and says so on its own stderr.
+# No field in a row carries that fact, so the reader infers it from the count:
+# a list that came back at the cap is treated as possibly incomplete, which is
+# what `truncated` says. The cap lives in two places -- here and in the guest's
+# ledger reader -- and changing one means changing both.
+LEFTOVERS_SCAN_LIMIT = 200
+
+# What one row's identity may be, per class. A port is `tcp:65535`, a pid is
+# digits, a tmux name is capped where a session name is capped, and a worktree
+# is a path the agent chose. An unrecognised class is capped like a path rather
+# than dropped: the ledger's `kind` domain is deliberately open, so a later
+# version adding one must not make this reader silently lose its rows.
+LEFTOVER_VALUE_LIMITS = {"proc": 12, "port": 12, "tmux": 80, "worktree": PATH_LIMIT}
+
+# The folded summary's per-class caps: (key, kind, how many). A person acting on
+# this needs to know there are leftovers and of what kind; the full list is one
+# `agentbox leftovers` away and is where completeness belongs.
+LEFTOVERS_FOLD_CAPS = (("ports", "port", 20), ("worktrees", "worktree", 10), ("tmux", "tmux", 10))
+LEFTOVERS_RUNS_CAP = 10
+
+# How many ledger lines one run's survivor count reads. The sampler appends only
+# pairs it has not recorded yet, so a real ledger is tens of lines; this is the
+# bound that keeps `runs --json` cheap when one is not real.
+LEDGER_LINE_LIMIT = 4000
 
 
-def cmd_survivors(_args):
-    print("run-format: the leftovers reader is not built in this checkout", file=sys.stderr)
-    return 1
+def _leftovers_or_none(raw, where):
+    """The leftovers rows, or None when nobody could answer.
+
+    Unlike `_sessions_or_none`, an EMPTY string is None and not an empty list.
+    box-status.sh passes the empty string through on purpose when the ledger
+    reader is missing or failed, and "this box has nothing left running" and
+    "nobody could tell" are different answers: the second one must not render
+    as a clean box.
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        parsed = None
+    if not isinstance(parsed, list):
+        print(
+            "run-format: %s did not produce a parsable JSON array; reporting "
+            "the leftovers as unknown" % where,
+            file=sys.stderr,
+        )
+        return None
+    return parsed
+
+
+def _clean_leftovers(rows):
+    """One row per (kind, value), scrubbed, capped, and shape-checked.
+
+    Five keys, always present, `runid`/`detail`/`since` nullable. `runid: null`
+    means present but recorded by no run.
+
+    The rows carry no phase to order duplicates by, so the first of a pair wins
+    and the guest's own order is kept. The runid survives only if it is a runid:
+    a row the box cannot attribute reads as unattributed rather than carrying
+    invented bytes on towards `agentbox logs`. `since` is re-rendered from a
+    parsed timestamp rather than passed through, which is the same discipline
+    `abx_status_read` applies to a status file -- an unrecognised value is not
+    echoed back, it is absent.
+    """
+    out = []
+    seen = set()
+    for item in rows or []:
+        if not isinstance(item, dict):
+            continue
+        kind = scrub(str(item.get("kind") or ""))[:16]
+        value = scrub(str(item.get("value") or ""))[: LEFTOVER_VALUE_LIMITS.get(kind, PATH_LIMIT)]
+        # A row without a class or an identity names nothing that could be
+        # looked at, and it is the identity that is the deduplication key.
+        if not kind or not value:
+            continue
+        if (kind, value) in seen:
+            continue
+        seen.add((kind, value))
+        runid = item.get("runid")
+        detail = item.get("detail")
+        out.append(
+            {
+                "runid": runid if isinstance(runid, str) and RUNID_RE.match(runid) else None,
+                "kind": kind,
+                "value": value,
+                "detail": first_line(scrub(detail), DETAIL_LIMIT) if isinstance(detail, str) else None,
+                "since": iso(parse_ts(item.get("since"))),
+            }
+        )
+        if len(out) >= LEFTOVERS_SCAN_LIMIT:
+            break
+    return out
+
+
+def _fold_leftovers(rows):
+    """The `leftovers` object of `status --json`, or None.
+
+    Built here and nowhere else, so the status object and `agentbox leftovers`
+    read the same rows the same way. The status slice's one call site is
+    `_fold_leftovers(_leftovers_or_none(args.leftovers, "the leftovers scan"))`:
+    both halves are null-safe, so there is nothing to branch on there.
+
+    Every key is ALWAYS present, because a
+    consumer renders a column from this and must not have to branch on a missing
+    one; a clean box is zeros and empty lists. The whole object is `null` -- not
+    zeros -- when the scan could not run, which is the `sessions` rule: unknown
+    beats a guess.
+    """
+    if rows is None:
+        return None
+    folded = {
+        "procs": 0,
+        "ports": [],
+        "worktrees": [],
+        "tmux": [],
+        "runs": [],
+        # Of the rows as they arrived, before the pairs were folded: the cap was
+        # reached in the guest, and a fold cannot un-reach it.
+        "truncated": len(rows) >= LEFTOVERS_SCAN_LIMIT,
+    }
+    for row in _clean_leftovers(rows):
+        kind = row["kind"]
+        if kind == "proc":
+            # An integer, uncapped: it is a count and not a list, so a big one
+            # costs a reader nothing and is the honest number.
+            folded["procs"] += 1
+        for key, want, cap in LEFTOVERS_FOLD_CAPS:
+            if kind == want and len(folded[key]) < cap:
+                folded[key].append(row["value"])
+        runid = row["runid"]
+        if runid and runid not in folded["runs"] and len(folded["runs"]) < LEFTOVERS_RUNS_CAP:
+            folded["runs"].append(runid)
+    return folded
+
+
+def _run_survivors(run_dir):
+    """How many resources this run left behind, or None if it never swept.
+
+    Distinct (kind, value) pairs whose last recorded phase is `survived`,
+    counted only when the ledger carries the sweep's closing `swept` line. A run
+    with no such line was hard-killed or predates the ledger, and 0 there would
+    be a claim -- "it left nothing running" -- that nothing checked.
+
+    `baseline` lines are read and ignored, like every reader ignores them: the
+    writer has already subtracted the baseline from what it records as observed,
+    and a reader that subtracted it again is a second copy of that rule to drift
+    away from the first.
+    """
+    swept = False
+    phases = {}
+    for count, (_index, obj) in enumerate(read_json_lines(os.path.join(run_dir, "owned.jsonl"))):
+        if count >= LEDGER_LINE_LIMIT:
+            break
+        if not isinstance(obj, dict):
+            continue
+        phase = obj.get("phase")
+        if phase == "swept":
+            swept = True
+            continue
+        kind, value = obj.get("kind"), obj.get("value")
+        if not isinstance(phase, str) or not isinstance(kind, str) or not isinstance(value, str):
+            continue
+        phases[(kind, value)] = phase
+    if not swept:
+        return None
+    return sum(1 for phase in phases.values() if phase == "survived")
+
+
+def cmd_survivors(args):
+    """The rows of what earlier runs left running. Reports; never cleans."""
+    raw = sys.stdin.read()
+    rows = _leftovers_or_none(raw, "run-ledger.sh survivors")
+    if rows is None:
+        return 1
+    rows = _clean_leftovers(rows)
+    if args.json:
+        print(json.dumps(rows, separators=(",", ":")))
+        return 0
+    if not rows:
+        print("no leftovers")
+        return 0
+    print("%-15s  %-8s  %-22s  %-20s  %s" % ("RUN", "KIND", "VALUE", "SINCE", "DETAIL"))
+    for row in rows:
+        print(
+            "%-15s  %-8s  %-22s  %-20s  %s"
+            % (
+                row["runid"] or "-",
+                row["kind"],
+                row["value"],
+                row["since"] or "-",
+                row["detail"] or "-",
+            )
+        )
+    return 0
 
 
 LIST_COLUMNS = (
