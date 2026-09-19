@@ -261,11 +261,18 @@ trap close_network_on_exit EXIT
 # address set follow what the guest actually resolves, which is the fix for a
 # rotating CDN as much as it is the mechanism for a domain suffix.
 REQUIRED_PKGS=(iptables ipset dnsutils jq curl git ca-certificates tmux procps dnsmasq)
-# gnupg is only needed to check the Docker repository key's fingerprint, and
-# xz-utils only to unpack the Node tarball, so neither is asked for on an
-# instance that wants neither.
-[ "$WANT_DOCKER" = true ]     && REQUIRED_PKGS+=(gnupg)
-[ "$WANT_PLAYWRIGHT" = true ] && REQUIRED_PKGS+=(xz-utils python3-venv python3-pip)
+# gnupg is only needed to check the Docker repository key's fingerprint, so it
+# is not asked for on an instance that does not want Docker.
+#
+# Nothing else is added to this list, and that is deliberate. The baseline
+# toolchain needs five archive packages — xz-utils, unzip, zip, python3-venv,
+# python3-pip — and guest/install-toolchain.sh installs them itself, under the
+# standing deny. Listed here instead they would be `missing_required` on every
+# box created before this version, and a missing required package is exactly
+# what reopens the network: every existing box would spend one apt run with
+# ACCEPT policies and the AGENTBOX chains flushed, the first time it started
+# under the new checkout. No box reopens its firewall window for a formatter.
+[ "$WANT_DOCKER" = true ] && REQUIRED_PKGS+=(gnupg)
 # `aggregate` merges the GitHub CIDR list; the firewall works without it.
 OPTIONAL_PKGS=(aggregate)
 # Attempted once, then never again, and this marker is what makes "once" true.
@@ -442,113 +449,30 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 1c. Node 22 and Playwright's system libraries
+# 1c. The baseline toolchain is NOT installed here
 # ---------------------------------------------------------------------------
 #
-# Node comes from nodejs.org's own tarball rather than a distribution package,
-# because Ubuntu 24.04 ships Node 18 and Playwright needs 22 or newer. The
-# tarball's checksum is taken from the SHASUMS256.txt beside it and verified
-# before anything is unpacked.
+# Node, Playwright's system libraries and the browser used to be installed in
+# this section: inside the open network window, and only when --playwright was
+# passed at create time. Both halves of that were wrong.
 #
-# Only the system libraries are installed here. Browsers are not: each
-# repository's own Playwright version downloads the builds it was pinned
-# against, on first use, from cdn.playwright.dev — which is on the allowlist.
-# Baking one set of browsers into the image would be the wrong set for most
-# repositories and would double the disk footprint of every instance.
-
-NODE_PREFIX=/opt/node22
-
-install_node22() {
-    local arch node_arch base sums file want_sha tmp
-    if [ -x "${NODE_PREFIX}/bin/node" ] && "${NODE_PREFIX}/bin/node" --version | grep -q '^v22\.'; then
-        log "Node $("${NODE_PREFIX}/bin/node" --version) already installed at ${NODE_PREFIX}"
-        return 0
-    fi
-
-    arch=$(dpkg --print-architecture)
-    case "$arch" in
-        arm64) node_arch="arm64" ;;
-        amd64) node_arch="x64" ;;
-        *) log "ERROR: no Node build known for dpkg architecture '${arch}'" >&2; return 1 ;;
-    esac
-
-    log "Installing Node 22 for linux-${node_arch}"
-    open_network_for_provisioning
-    base="https://nodejs.org/dist/latest-v22.x"
-    tmp=$(mktemp -d)
-    curl -fsSL --retry 3 "${base}/SHASUMS256.txt" -o "${tmp}/SHASUMS256.txt"
-    sums="${tmp}/SHASUMS256.txt"
-    file=$(awk -v a="linux-${node_arch}.tar.xz" '$2 ~ ("^node-v22\\..*-" a "$") {print $2; exit}' "$sums")
-    if [ -z "$file" ]; then
-        rm -rf "$tmp"
-        log "ERROR: no node-v22.*-linux-${node_arch}.tar.xz in ${base}/SHASUMS256.txt" >&2
-        return 1
-    fi
-    want_sha=$(awk -v f="$file" '$2 == f {print $1; exit}' "$sums")
-    log "Downloading ${file}"
-    curl -fsSL --retry 3 "${base}/${file}" -o "${tmp}/${file}"
-    # Checked before the archive is opened, not after.
-    if ! printf '%s  %s\n' "$want_sha" "$file" | (cd "$tmp" && sha256sum -c -); then
-        rm -rf "$tmp"
-        log "ERROR: ${file} does not match its SHASUMS256 entry" >&2
-        return 1
-    fi
-    rm -rf "$NODE_PREFIX"
-    install -d -m 0755 "$NODE_PREFIX"
-    tar -xJf "${tmp}/${file}" --strip-components=1 -C "$NODE_PREFIX"
-    rm -rf "$tmp"
-    local b
-    for b in node npm npx; do
-        ln -sfn "${NODE_PREFIX}/bin/${b}" "/usr/local/bin/${b}"
-    done
-    log "Node $(node --version) installed"
-}
-
-# Pinned, for the same reason the Node tarball is checksummed and the Docker
-# repository key's fingerprint is verified: this runs `npx` as ROOT, at a moment
-# when open_network_for_provisioning() has set all three policies to ACCEPT and
-# flushed the AGENTBOX chains, in a guest that has read-write virtiofs access to
-# the host's real repository directory at /work. `playwright@latest` resolves at
-# provision time and executes whatever was published; a version cannot be
-# tampered with retroactively.
+# A create-time flag can never reach an existing box — create params are frozen
+# for a box's life — so a toolchain that is meant to be on every box has to be
+# unconditional provisioner code instead of a profile.
 #
-# 1.63.0 was the `latest` dist-tag of the `playwright` package on
-# registry.npmjs.org, read on 2026-09-05. It governs only the apt system
-# libraries `install-deps` installs — the browser BUILDS come from each
-# repository's own Playwright version on first use, as docs/daily-use.md says,
-# and those libraries are compatible across nearby releases. Raise it
-# deliberately; do not float it.
-PLAYWRIGHT_VERSION="1.63.0"
-
-install_playwright_deps() {
-    # A marker rather than a package query: the dependency list is Playwright's
-    # and changes with its releases, so "did this already run" is the only
-    # question that can be answered cheaply.
-    local marker=/var/lib/agent-box/playwright-deps-installed
-    install -d -m 0755 /var/lib/agent-box
-    if [ -f "$marker" ]; then
-        log "Playwright system libraries already installed ($(cat "$marker"))"
-        return 0
-    fi
-    log "Installing Playwright's system libraries with 'npx playwright@${PLAYWRIGHT_VERSION} install-deps'"
-    open_network_for_provisioning
-    export DEBIAN_FRONTEND=noninteractive
-    # npm's cache and prefix under /root, not the guest user's home: this runs
-    # as root and must not leave root-owned files in a directory the agent uses.
-    if HOME=/root npm_config_cache=/root/.npm npx --yes "playwright@${PLAYWRIGHT_VERSION}" install-deps; then
-        printf 'playwright@%s install-deps, %s\n' "$PLAYWRIGHT_VERSION" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker"
-        log "Playwright system libraries installed"
-    else
-        log "ERROR: 'npx playwright install-deps' failed" >&2
-        return 1
-    fi
-}
+# And a download that happens in the open window succeeds even when its host is
+# off the allowlist, so nothing notices until an agent needs the same host later.
+# Installing under the standing deny makes a create a live test of every
+# allowlist entry, which is the argument §6 already makes about plugins.
+#
+# So the whole toolchain — Node included — is installed by
+# guest/install-toolchain.sh in §4b below, after the firewall is up, from the
+# versions and digests in guest/toolchain.pins. --playwright is still parsed,
+# because lima/agent-box.yaml always passes it and as_bool() exits 1 on an
+# unknown value, and it now changes nothing.
 
 if [ "$WANT_PLAYWRIGHT" = true ]; then
-    install_node22
-    install_playwright_deps
-else
-    log "Playwright not requested for this instance"
+    log "note: --playwright is ignored; the toolchain is baseline on every box"
 fi
 
 if [ "$WANT_ROSETTA" = true ]; then
@@ -729,16 +653,55 @@ fi
     # start nobody can account for. `agentbox update <repo>` does it on
     # purpose instead; `claude update` by hand still works.
     printf 'DISABLE_AUTOUPDATER=1\n'
+    # The toolchain's environment. In /etc/environment as well as profile.d
+    # because neither alone covers every caller: pam_env reads this file for
+    # every session including `limactl shell -- cmd`, and profile.d is the
+    # login-shell copy. This file takes no `export` and does no expansion, so
+    # PATH itself stays in profile.d only.
+    #
+    # Three of these are load-bearing rather than hygiene:
+    #   PLAYWRIGHT_BROWSERS_PATH  the shared, agent-owned browser directory the
+    #                             provisioner installs Chromium into
+    #   npm_config_prefix         without it `npm i -g` as the agent fails with
+    #                             EACCES on /opt/node/lib/node_modules
+    #   MISE_USE_VERSIONS_HOST    mise resolves version lists from
+    #                             mise-versions.jdx.dev, which is not on the
+    #                             allowlist and will not be; with it off, mise
+    #                             falls back to the GitHub API, which the
+    #                             meta-range rule already permits — so
+    #                             `mise install` works under the standing deny.
+    #                             The _TRACK sibling is the anonymous download
+    #                             statistics. Both names are docs-sourced and
+    #                             must be confirmed against `mise settings` in a
+    #                             guest before the pull request.
+    printf 'PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright\n'
+    printf 'npm_config_prefix=/opt/npm-global\n'
+    printf 'npm_config_update_notifier=false\n'
+    printf 'SEMGREP_SEND_METRICS=off\n'
+    printf 'SEMGREP_ENABLE_VERSION_CHECK=0\n'
+    printf 'MISE_USE_VERSIONS_HOST=false\n'
+    printf 'MISE_USE_VERSIONS_HOST_TRACK=false\n'
+    printf 'MISE_NOT_FOUND_AUTO_INSTALL=false\n'
+    printf 'UV_NO_MODIFY_PATH=1\n'
     [ -n "$NODE_CA_LINE" ] && printf '%s\n' "$NODE_CA_LINE"
 } >> /etc/environment
 
 cat > /etc/profile.d/agent-box.sh <<EOF
 # Managed by agent-box provisioning. Do not edit.
-export PATH="\$HOME/.local/bin:\$PATH"
+export PATH="\$HOME/.local/bin:/opt/npm-global/bin:\$PATH"
 export CLAUDE_CONFIG_DIR="${BOX_HOME}/.claude"
 export DISABLE_TELEMETRY=1
 export DISABLE_ERROR_REPORTING=1
 export DISABLE_AUTOUPDATER=1
+export PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+export npm_config_prefix=/opt/npm-global
+export npm_config_update_notifier=false
+export SEMGREP_SEND_METRICS=off
+export SEMGREP_ENABLE_VERSION_CHECK=0
+export MISE_USE_VERSIONS_HOST=false
+export MISE_USE_VERSIONS_HOST_TRACK=false
+export MISE_NOT_FOUND_AUTO_INSTALL=false
+export UV_NO_MODIFY_PATH=1
 EOF
 [ -n "$NODE_CA_LINE" ] && printf 'export %s\n' "$NODE_CA_LINE" >> /etc/profile.d/agent-box.sh
 chmod 0644 /etc/profile.d/agent-box.sh
@@ -919,6 +882,24 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# 4b. The baseline toolchain, under the standing deny
+# ---------------------------------------------------------------------------
+#
+# After §5, not before it, for the reason §6 below already gives about plugins: a
+# download inside the open window succeeds even when its host is off the
+# allowlist, and nothing notices until an agent needs the same host later.
+# Installing here makes every create a live test of every allowlist entry.
+#
+# Never allowed to fail the boot, for the same reason as the plugin install and
+# with more at stake: this code runs on every EXISTING box the first time it
+# starts under a new checkout, and those boxes hold real work. A toolchain
+# problem is a warning and a retry on the next start, never a failed boot.
+
+log "Installing the baseline toolchain from ${BOX_DIR}/guest/toolchain.pins"
+"${BOX_DIR}/guest/install-toolchain.sh" --user "$BOX_USER" \
+    || log "WARN: parts of the toolchain are missing; 'agentbox toolcheck <repo>' names them"
+
+# ---------------------------------------------------------------------------
 # 6. Personal configuration and plugins, as the guest user, under the firewall
 # ---------------------------------------------------------------------------
 #
@@ -948,5 +929,28 @@ run_as_box_user "${BOX_DIR}/guest/sync-claude-config.sh" \
 log "Installing plugins listed in ${CONFIG_DIR}/plugins.txt, if any"
 run_as_box_user "${BOX_DIR}/guest/install-plugins.sh" \
     || log "WARN: install-plugins.sh exited non-zero; run 'agentbox plugins <repo>' after 'agentbox token <repo>'"
+
+# ---------------------------------------------------------------------------
+# 6b. The toolchain snapshot the host reads
+# ---------------------------------------------------------------------------
+#
+# Written last, as the box user (it must not be able to write anywhere root can),
+# then moved into place by root. `status` and `toolcheck --project-only` read
+# this file rather than sweeping every tool's --version on demand; when it is
+# absent they say the box half is unknown, which is what an old box looks like.
+#
+# Guarded on the script existing: an older checkout has no toolcheck.sh, and a
+# box must still start.
+if [ -x "${BOX_DIR}/guest/toolcheck.sh" ]; then
+    log "Recording the toolchain snapshot"
+    if run_as_box_user "${BOX_DIR}/guest/toolcheck.sh" --json --box-only \
+            > /var/lib/agent-box/toolcheck.json.tmp 2>/dev/null; then
+        mv /var/lib/agent-box/toolcheck.json.tmp /var/lib/agent-box/toolcheck.json
+        chmod 0644 /var/lib/agent-box/toolcheck.json
+    else
+        rm -f /var/lib/agent-box/toolcheck.json.tmp
+        log "WARN: could not write the toolchain snapshot; 'agentbox toolcheck <repo>' still sweeps live"
+    fi
+fi
 
 log "Provisioning complete"
