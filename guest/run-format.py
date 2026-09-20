@@ -1050,6 +1050,7 @@ LEFTOVERS_SCAN_LIMIT = 200
 # than dropped: the ledger's `kind` domain is deliberately open, so a later
 # version adding one must not make this reader silently lose its rows.
 LEFTOVER_VALUE_LIMITS = {"proc": 12, "port": 12, "tmux": 80, "worktree": PATH_LIMIT}
+LEFTOVER_KIND_LIMIT = 16
 
 # The folded summary's per-class caps: (key, kind, how many). A person acting on
 # this needs to know there are leftovers and of what kind; the full list is one
@@ -1101,14 +1102,27 @@ def _clean_leftovers(rows):
     parsed timestamp rather than passed through, which is the same discipline
     `abx_status_read` applies to a status file -- an unrecognised value is not
     echoed back, it is absent.
+
+    Every displayed field goes through `first_line`, `kind` and `value`
+    included. `scrub` strips control characters but keeps `\\n` on purpose (a
+    newline is not a terminal escape), and a path or a session name the agent
+    chose may legally contain one -- so without this a single row could print a
+    second line of its own at column 0 in the five-column table, reading as
+    `no leftovers`, as another row, or as a line from `agentbox` itself.
+    Two values that differ only past their first line therefore fold into one
+    row, which is the right side to err on: the row still names the leftover,
+    and the sweep acts on the guest's own ledger, never on this display.
     """
     out = []
     seen = set()
     for item in rows or []:
         if not isinstance(item, dict):
             continue
-        kind = scrub(str(item.get("kind") or ""))[:16]
-        value = scrub(str(item.get("value") or ""))[: LEFTOVER_VALUE_LIMITS.get(kind, PATH_LIMIT)]
+        kind = first_line(scrub(str(item.get("kind") or "")), LEFTOVER_KIND_LIMIT)
+        value = first_line(
+            scrub(str(item.get("value") or "")),
+            LEFTOVER_VALUE_LIMITS.get(kind, PATH_LIMIT),
+        )
         # A row without a class or an identity names nothing that could be
         # looked at, and it is the identity that is the deduplication key.
         if not kind or not value:

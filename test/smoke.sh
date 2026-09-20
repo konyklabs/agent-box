@@ -3030,6 +3030,7 @@ long="/work/\$(printf 'A%.0s' \$(seq 400))"
 jq -nc --arg d '${HOSTILE_STATE}' --arg t '${FAKE_TOKEN}' --arg e "\$esc" --arg l "\$long" \
   '[{runid:"../../.ssh",kind:"port",value:\$t,detail:\$d,since:"not a time"},
     {runid:"${LEFT_RUNID}",kind:"worktree",value:\$l,detail:\$e,since:"2026-01-04T00:00:00Z"},
+    {runid:"${LEFT_RUNID}",kind:"proc",value:"4127\nno leftovers",detail:null,since:null},
     {runid:"${LEFT_RUNID}",kind:"tmux",value:"srv",detail:null,since:"2026-01-04T00:00:00Z"},
     {runid:"${LEFT_RUNID}",kind:"tmux",value:"srv",detail:"a second row for the same pair",since:null}]' \
   | python3 /opt/agent-box/guest/run-format.py --survivors-in --json
@@ -3078,6 +3079,32 @@ if jq -e 'map(select(.since == null)) | length >= 1' "$LEFT_HOSTILE" >/dev/null 
     ok "a timestamp that is not a timestamp reads as absent"
 else
     bad "an unparsable timestamp was passed through"
+fi
+# `scrub` strips control characters but keeps \n on purpose (a newline is not a
+# terminal escape), and a path or a session name the agent chose may legally
+# contain one. Every displayed field is therefore collapsed to its first line.
+if jq -e '[.[] | .kind, .value, (.detail // "-"), (.runid // "-"), (.since // "-")]
+          | map(contains("\n")) | any | not' "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "no field of any row carries a newline the guest chose"
+else
+    bad "SECURITY: a newline from a ledger row reached a field the host prints"
+fi
+# The consequence of that newline, in the form an operator actually reads: the
+# five-column table. One row must never print a second line of its own — a
+# forged row, or a line that reads like `agentbox`'s own output.
+LEFT_FORGE="${TMP_ROOT}/leftovers-forged.txt"
+guest bash -l > "$LEFT_FORGE" 2>&1 <<SH
+set -u
+jq -nc '[{runid:"${LEFT_RUNID}",kind:"worktree",value:"/work/.wt/a\nno leftovers",detail:"branch x",since:null},
+         {runid:null,kind:"tmux",value:"srv\nagentbox: the box is clean",detail:null,since:null}]' \
+  | python3 /opt/agent-box/guest/run-format.py --survivors-in
+SH
+cat "$LEFT_FORGE"
+if [ "$(grep -c . "$LEFT_FORGE")" -eq 3 ] && ! grep -q '^no leftovers' "$LEFT_FORGE" \
+   && ! grep -q '^agentbox:' "$LEFT_FORGE"; then
+    ok "a newline inside a row's value cannot forge a line in the table"
+else
+    bad "SECURITY: a row's value printed a line of its own in the leftovers table"
 fi
 
 printf -- '\n--- (8j3) the survivor display is live, not sticky ---\n'
