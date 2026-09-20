@@ -4042,6 +4042,35 @@ case "${1:-}" in
     --version) printf '2.1.261-standin (Claude Code)\n'; exit 0 ;;
     --help)    printf -- '--include-hook-events --max-budget-usd --settings --verbose\n'; exit 0 ;;
 esac
+# The spawn mode of slot 8j2, gated on a FILE and not on a variable: this script
+# is exec'd by agent-run.sh deep inside the guest, and `limactl shell` forwards
+# no host variable into it. Without the gate file it behaves exactly as 8j's own
+# assertions expect, so those are unchanged.
+#
+# It starts one of each class the way an agent would, and the two listeners
+# differ on purpose: the first is a plain `&` child and stays in the run's
+# process group; the second leaves the group with setsid, so the group cannot be
+# what closes it. The ports are chosen HERE, from this process's pid, and
+# written out, because the host has no way to know them otherwise.
+if [ -e /tmp/abx-standin-spawn ]; then
+    rm -f /tmp/abx-smoke-spawned
+    printf '{"type":"system","subtype":"init","model":"stand-in","claude_code_version":"stand-in"}\n'
+    _port=$((21000 + ($$ % 4000)))
+    _escapee=$((_port + 1))
+    python3 -m http.server "$_port" --bind 127.0.0.1 >/dev/null 2>&1 &
+    setsid python3 -m http.server "$_escapee" --bind 127.0.0.1 >/dev/null 2>&1 &
+    git -C /work worktree add --detach "$HOME/abx-smoke-wt" >/dev/null 2>&1
+    tmux new-session -d -s abx-smoke-srv -- sleep 600
+    sleep 3
+    if command -v setsid >/dev/null 2>&1; then _has_setsid=yes; else _has_setsid=no; fi
+    printf 'GROUP_PORT=%s\nESCAPEE_PORT=%s\nSETSID=%s\n' \
+        "$_port" "$_escapee" "$_has_setsid" > /tmp/abx-smoke-spawned
+    # Long enough for the host to read the marker back and check all four
+    # resources while the run is still going.
+    sleep 25
+    printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"duration_ms":1000,"total_cost_usd":0}\n'
+    exit 0
+fi
 on_int() {
     printf '{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"duration_ms":900,"total_cost_usd":0}\n'
     exit 0
@@ -4469,6 +4498,262 @@ else
 fi
 
 # ---- slot:8j2 (owner S1) ----
+printf -- '\n--- (c) a run records what it starts, stops it, and survivors are named ---\n'
+# The ledger, the sweep, and the two ownership proofs, on a REAL run — driven by
+# the stand-in, so no model is called and nothing is spent. Everything planted
+# here is removed at the end of the slot.
+#
+# The stand-in reinstalled here is (a), abx-claude-stop, the one with the spawn
+# mode: by this point in 8j `claude` is abx-claude-fail, which exits before it
+# could start anything. (b) is put back at the end of the slot.
+guest bash -l > /dev/null 2>&1 <<'SH'
+cp /tmp/abx-claude-stop "$HOME/.local/bin/claude"
+chmod +x "$HOME/.local/bin/claude"
+rm -f /tmp/abx-smoke-spawned
+: > /tmp/abx-standin-spawn
+SH
+
+# A standing interactive session of this slot's OWN: a tmux session WITH the
+# session directory that makes it the operator's, holding a listener of its own.
+# This is the process a run's sweep must never touch, and the session directory
+# is what takes it out of the candidate set.
+#
+# Not named `claude`: that name and `~/.agent-box/sessions/claude` are the real
+# standing session's, which slot 8l owns and which sits EARLIER in this file, so
+# creating it here would collide with a live one (`tmux new-session` would fail as
+# a duplicate) and the teardown below would delete it under 8l's feet. The
+# exemption this proves is name-agnostic by design — `collect_tmux` exempts a
+# session by the presence of its session DIRECTORY, not by its name — so a name
+# of our own tests the mechanism rather than a literal.
+STANDING_SESSION=abx-standing-8j2
+STANDING_PORT=$((FORWARD_PORT + 500))
+guest bash -l > /dev/null 2>&1 <<SH
+mkdir -p "\$HOME/.agent-box/sessions/${STANDING_SESSION}"
+chmod 700 "\$HOME/.agent-box/sessions/${STANDING_SESSION}"
+tmux new-session -d -s ${STANDING_SESSION} -- python3 -m http.server ${STANDING_PORT} --bind 127.0.0.1
+SH
+
+# An EARLIER run whose ledger holds the fake token inside a `detail`, and a tmux
+# session it recorded that is still there, so the new run's start note has
+# something to report. If that note echoed another run's text, this run's
+# console.log would carry the token and its own leak check would end it at
+# exit:3 — so the assertion below is on the state that causes the regression,
+# not on a string that describes it.
+EARLIER_RUN=20260103-000000
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${EARLIER_RUN}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:lost\n' > "\$d/status"
+printf '{"runid":"${EARLIER_RUN}","model":"sonnet","branch":null,"brief":"earlier","started_at":"2026-01-03T00:00:00Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+printf '{"ts":"2026-01-03T00:00:00Z","phase":"observed","kind":"tmux","value":"abx-earlier-srv","detail":"curl -H authorization: ${FAKE_TOKEN}"}\n' > "\$d/owned.jsonl"
+chmod 600 "\$d/owned.jsonl" "\$d/status" "\$d/meta.json"
+tmux new-session -d -s abx-earlier-srv -- sleep 600
+SH
+
+J2_OUT="${TMP_ROOT}/8j2-run.out"
+run_bounded 120 "$J2_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md"
+cat "$J2_OUT"
+J2_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$J2_OUT" | head -1)
+printf 'runid: %s\n' "${J2_RUNID:-<none>}"
+
+# The ports the stand-in chose, read back from the marker file it wrote.
+J2_SPAWNED=""
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    J2_SPAWNED=$(guest sh -c 'cat /tmp/abx-smoke-spawned 2>/dev/null' 2>/dev/null | tr -d '\r')
+    [ -z "$J2_SPAWNED" ] || break
+    sleep 2
+done
+printf '%s\n' "${J2_SPAWNED:-<the stand-in wrote no marker>}"
+GROUP_PORT=$(printf '%s\n' "$J2_SPAWNED" | sed -n 's/^GROUP_PORT=\([0-9]*\)$/\1/p')
+ESCAPEE_PORT=$(printf '%s\n' "$J2_SPAWNED" | sed -n 's/^ESCAPEE_PORT=\([0-9]*\)$/\1/p')
+
+# The vacuity guard, while the run is still going: unless all four resources are
+# really there, every assertion after the sweep passes for the wrong reason.
+J2_LIVE="${TMP_ROOT}/8j2-live.out"
+if [ -n "$GROUP_PORT" ] && [ -n "$ESCAPEE_PORT" ]; then
+    guest bash -l > "$J2_LIVE" 2>&1 <<SH
+for p in ${GROUP_PORT} ${ESCAPEE_PORT} ${STANDING_PORT}; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/\$p") 2>/dev/null; then
+        printf 'BOUND=%s\n' "\$p"
+    else
+        printf 'FREE=%s\n' "\$p"
+    fi
+done
+[ -d "\$HOME/abx-smoke-wt" ] && printf 'WT=yes\n'
+tmux has-session -t '=abx-smoke-srv' 2>/dev/null && printf 'TMUX=yes\n'
+exit 0
+SH
+    cat "$J2_LIVE"
+fi
+if grep -qx "BOUND=${GROUP_PORT:-none}" "$J2_LIVE" 2>/dev/null \
+   && grep -qx "BOUND=${ESCAPEE_PORT:-none}" "$J2_LIVE" 2>/dev/null \
+   && grep -qx 'WT=yes' "$J2_LIVE" 2>/dev/null \
+   && grep -qx 'TMUX=yes' "$J2_LIVE" 2>/dev/null; then
+    ok "the run really started a listener in its group, one outside it, a worktree and a tmux session"
+else
+    bad "the run did not start all four resources; nothing below this line would mean anything"
+fi
+if grep -qx "BOUND=${STANDING_PORT}" "$J2_LIVE" 2>/dev/null; then
+    ok "the standing session's own listener is up before the sweep"
+else
+    bad "the standing session's listener never started"
+fi
+
+# The sweep runs before finish() writes the status, so a state that is no longer
+# `running` means the sweep is over.
+J2_STATE=""
+for _attempt in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25; do
+    J2_STATE=$(guest /opt/agent-box/guest/run-ctl.sh state "$J2_RUNID" 2>/dev/null | tr -d '\r\n')
+    [ "$J2_STATE" = "running" ] || break
+    sleep 2
+done
+printf 'state after the run: %s\n' "${J2_STATE:-<none>}"
+
+J2_AFTER="${TMP_ROOT}/8j2-after.out"
+guest bash -l > "$J2_AFTER" 2>&1 <<SH
+d="\$HOME/.agent-box/runs/${J2_RUNID}"
+for k in proc port worktree tmux; do
+    if grep -q "\"phase\":\"observed\",\"kind\":\"\${k}\"" "\$d/owned.jsonl" 2>/dev/null; then
+        printf 'OBSERVED=%s\n' "\$k"
+    fi
+done
+printf 'CLOSED=%s\n' "\$(grep -c '"phase":"closed"' "\$d/owned.jsonl" 2>/dev/null)"
+printf 'SWEPT=%s\n' "\$(grep -c '"phase":"swept"' "\$d/owned.jsonl" 2>/dev/null)"
+printf 'LEDGER_MODE=%s\n' "\$(stat -c '%a' "\$d/owned.jsonl" 2>/dev/null)"
+for p in ${GROUP_PORT} ${ESCAPEE_PORT} ${STANDING_PORT}; do
+    if (exec 3<>"/dev/tcp/127.0.0.1/\$p") 2>/dev/null; then
+        printf 'BOUND=%s\n' "\$p"
+    else
+        printf 'FREE=%s\n' "\$p"
+    fi
+done
+[ -d "\$HOME/abx-smoke-wt" ] && printf 'WT=still-there\n'
+git -C /work worktree list --porcelain | grep -q 'abx-smoke-wt' && printf 'WT_REGISTERED=yes\n'
+tmux has-session -t '=abx-smoke-srv' 2>/dev/null && printf 'TMUX=still-there\n'
+tmux has-session -t '=${STANDING_SESSION}' 2>/dev/null && printf 'STANDING_TMUX=yes\n'
+# The sampler is a SUBSHELL of agent-run.sh — \`( ... ) &\` — so its own
+# /proc/PID/cmdline is agent-run.sh's, and it spends all but a fraction of each
+# 15-second pass inside \`sleep\`. Probing for 'run-ledger.sh observe' therefore
+# looks for a string that exists for a few milliseconds per pass and reports a
+# clean box for a sampler that will append to a finished run's ledger for four
+# hours. What is asked for instead is any live process still wearing this run's
+# own command line, which a leaked sampler does for as long as it lives.
+SAMPLER_LEFT=\$(pgrep -f "agent-run.sh --runid ${J2_RUNID}" 2>/dev/null | tr '\n' ' ')
+[ -z "\$SAMPLER_LEFT" ] || printf 'SAMPLER=still-there:%s\n' "\$SAMPLER_LEFT"
+exit 0
+SH
+cat "$J2_AFTER"
+
+J2_KINDS=$(grep -c '^OBSERVED=' "$J2_AFTER")
+if [ "$J2_KINDS" = "4" ]; then
+    ok "the run's ledger records each class it started: a process, a port, a worktree and a tmux session"
+else
+    bad "the ledger records ${J2_KINDS} of the four classes"
+fi
+if grep -qx 'LEDGER_MODE=600' "$J2_AFTER"; then
+    ok "the ledger is mode 600 in the guest home"
+else
+    bad "the ledger is not 600"
+fi
+if grep -qx "FREE=${GROUP_PORT:-none}" "$J2_AFTER"; then
+    ok "the listener the run started in its own process group is gone"
+else
+    bad "the run's own listener survived its sweep"
+fi
+if grep -qx "FREE=${ESCAPEE_PORT:-none}" "$J2_AFTER"; then
+    ok "the listener that left the process group with setsid is gone too: the second ownership proof closed it"
+else
+    bad "the setsid escapee survived the sweep; the process-group path cannot reach it and the marker proof did not"
+fi
+if grep -qx 'TMUX=still-there' "$J2_AFTER"; then
+    bad "the tmux session the run started survived the sweep"
+else
+    ok "the tmux session the run started is gone"
+fi
+if grep -qx 'WT=still-there' "$J2_AFTER" || grep -qx 'WT_REGISTERED=yes' "$J2_AFTER"; then
+    bad "the worktree the run created is still there or still registered"
+else
+    ok "the worktree the run created was removed, and git no longer lists it"
+fi
+J2_CLOSED=$(sed -n 's/^CLOSED=\([0-9]*\)$/\1/p' "$J2_AFTER" | head -1)
+case "${J2_CLOSED:-0}" in
+    ''|*[!0-9]*) bad "the ledger's closed count did not read as a number" ;;
+    *) if [ "$J2_CLOSED" -ge 3 ]; then
+           ok "the ledger records at least three resources as closed (${J2_CLOSED})"
+       else
+           bad "the ledger records only ${J2_CLOSED} closed resources"
+       fi ;;
+esac
+if grep -qx 'SWEPT=1' "$J2_AFTER"; then
+    ok "the sweep left exactly one swept line, which is what makes the survivor count a settled fact"
+else
+    bad "the ledger does not carry exactly one swept line"
+fi
+if grep -q '^SAMPLER=still-there' "$J2_AFTER"; then
+    bad "a process of the run's own script outlived it: the sampler was not stopped"
+else
+    ok "no sampler outlived the run: no process still carries the run's command line"
+fi
+if grep -qx "BOUND=${STANDING_PORT}" "$J2_AFTER" && grep -qx 'STANDING_TMUX=yes' "$J2_AFTER"; then
+    ok "a process the standing session started survived the run's sweep, and so did its session"
+else
+    bad "the sweep reached into the standing session"
+fi
+
+J2_SUM="${TMP_ROOT}/8j2-summary.out"
+run_bounded 60 "$J2_SUM" guest_summary "$J2_RUNID"
+cat "$J2_SUM"
+if grep -q '^hygiene' "$J2_SUM"; then
+    ok "the run's summary names what it cleaned up"
+else
+    bad "the summary carries no hygiene line"
+fi
+
+J2_LOGS="${TMP_ROOT}/8j2-logs.out"
+run_bounded 60 "$J2_LOGS" "$AGENTBOX" logs "$CLEAN_REPO" "$J2_RUNID"
+if grep -q 'from earlier work are still present' "$J2_LOGS"; then
+    ok "the run was told at its start that an earlier run's work was still present"
+else
+    bad "the run printed no collision note, so the check below is vacuous"
+fi
+if grep -q "$EARLIER_RUN" "$J2_LOGS"; then
+    ok "the note names the run that left it"
+else
+    bad "the note does not name the earlier run"
+fi
+if grep -qF "$FAKE_HEAD" "$J2_LOGS" || grep -qF "$FAKE_TAIL" "$J2_LOGS" \
+   || grep -q 'abx-earlier-srv' "$J2_LOGS"; then
+    bad "an earlier run's ledger text reached this run's console"
+else
+    ok "no text from the earlier run's ledger reached this run's console: counts and runids only"
+fi
+if [ "$J2_STATE" = "exit:0" ]; then
+    ok "and the run ended exit:0 rather than being failed by its own leak check"
+else
+    bad "the run ended '${J2_STATE}'; exit:3 would mean the collision note carried the token"
+fi
+
+printf -- '\n--- 8j2 cleans up after itself ---\n'
+guest bash -l > /dev/null 2>&1 <<SH
+rm -f /tmp/abx-standin-spawn /tmp/abx-smoke-spawned
+tmux kill-session -t '=${STANDING_SESSION}' 2>/dev/null || true
+tmux kill-session -t '=abx-earlier-srv' 2>/dev/null || true
+tmux kill-session -t '=abx-smoke-srv' 2>/dev/null || true
+pkill -f "http.server ${STANDING_PORT}" 2>/dev/null || true
+pkill -f "http.server ${GROUP_PORT:-0}" 2>/dev/null || true
+pkill -f "http.server ${ESCAPEE_PORT:-0}" 2>/dev/null || true
+git -C /work worktree remove --force "\$HOME/abx-smoke-wt" 2>/dev/null || true
+rm -rf "\$HOME/.agent-box/sessions/${STANDING_SESSION}" "\$HOME/.agent-box/runs/${EARLIER_RUN}" "\$HOME/abx-smoke-wt"
+cp /tmp/abx-claude-fail "\$HOME/.local/bin/claude"
+chmod +x "\$HOME/.local/bin/claude"
+exit 0
+SH
+if guest test -e /tmp/abx-standin-spawn; then
+    bad "8j2 left its spawn gate behind"
+else
+    ok "8j2 removed everything it planted"
+fi
 # ---- end slot:8j2 ----
 
 # ---- slot:8j3 (owner S2) ----
