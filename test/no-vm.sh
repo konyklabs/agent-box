@@ -2,14 +2,16 @@
 #
 # agent-box — no-VM regression checks.
 #
-# Eight checks the skeleton implementers wrote as throwaway scripts while
-# reviewing bin/agentbox and guest/lib.sh, promoted here so a regression in any
-# of them fails a test run instead of waiting for someone to remember a fixture
-# under /tmp. Every function under test is pulled out of the real file with
-# `sed`, never by sourcing bin/agentbox whole — it ends in a command dispatch
-# that would try to run one with no arguments — and every fixture (throwaway
-# git repositories, fabricated /proc files, a fabricated run directory) is
-# built by this script and thrown away with it.
+# Eleven checks the implementers wrote as throwaway scripts while reviewing
+# bin/agentbox, guest/lib.sh and the status document, promoted here so a
+# regression in any of them fails a test run instead of waiting for someone to
+# remember a fixture under /tmp. Every function under test is pulled out of the
+# real file with `sed`, never by sourcing bin/agentbox whole — it ends in a
+# command dispatch that would try to run one with no arguments — and every
+# fixture (throwaway git repositories, fabricated /proc files, a fabricated run
+# directory, a FIFO where a sensor expects a file) is built by this script and
+# thrown away with it. The one whole-command check drives `agentbox status`
+# itself over test/fake-limactl, which is a stand-in and not a VM.
 #
 # No VM, no limactl, no network. Seconds to run.
 #
@@ -687,6 +689,258 @@ check_chromium_found() {
     unset -f _cf
 }
 
+# ---------------------------------------------------------------------------
+# 9. render_status's TEXT column: one row per box, whatever the guest says
+# ---------------------------------------------------------------------------
+#
+# `channel_bar` states the premise this rests on: the guest scrubs its own
+# output and the guest user has sudo over the renderer that does the scrubbing,
+# so the host redoes what it can. The barred text keeps the newline because the
+# bar makes a second line harmless; the status TABLE cannot be barred, so it has
+# to lose more — a newline in one box's line prints a second row at column 0
+# that an operator cannot tell from a box.
+#
+# Through the real `render_status`, over test/fake-limactl, with a handler
+# standing in for the box's renderer. Nothing here builds a VM.
+check_status_text_clamp() {
+    section "render_status: a hostile guest text line is one row, and has no escape in it"
+    local sc="${WORK}/status-clamp" cfg fake repo handler out rows
+    cfg="${sc}/config"; fake="${sc}/fake"; repo="${sc}/app"; handler="${sc}/handler"
+    mkdir -p "${cfg}/instances" "$fake" "$repo"
+    printf 'repo=%s\n' "$repo" > "${cfg}/instances/agent-box-app"
+    printf 'agent-box-app|Running|%s|4|6GiB|40GiB|%s\n' "$repo" "${sc}/lima" > "${fake}/instances"
+
+    cat > "$handler" <<'HANDLER_EOF'
+#!/usr/bin/env bash
+shift
+case "$*" in
+    *box-status.sh*--text)
+        case "${ST_TEXT_MODE:-row}" in
+            # A whole extra row, at column 0, naming a box that does not exist.
+            row) printf 'fw=deny  runs=0\nagent-box-ghost                running   fw=deny  (forged row)\n' ;;
+            # U+009B in UTF-8: a CSI to a terminal in 8-bit mode, which can
+            # erase and repaint the rows already printed above this one.
+            csi) printf 'fw=deny  runs=0  \302\233\062K\302\233\061A(repainted)\n' ;;
+            # A tab, which moves the column the rest of the table is aligned on.
+            tab) printf 'fw=deny\truns=0\n' ;;
+            esc) printf 'fw=deny  runs=0  \033[2K\033[1A(repainted)\n' ;;
+        esac ;;
+    *) exit 1 ;;
+esac
+HANDLER_EOF
+    chmod +x "$handler"
+
+    local mode
+    for mode in row csi tab esc; do
+        out="${sc}/out.${mode}"
+        ST_TEXT_MODE="$mode" AGENT_BOX_CONFIG_DIR="$cfg" LIMACTL="${BOX_DIR}/test/fake-limactl" \
+        FAKE_LIMA_DIR="$fake" FAKE_LIMA_SHELL="$handler" "$AGENTBOX" status > "$out" 2>&1
+        # The header plus exactly one box row, for the one instance that exists.
+        rows=$(wc -l < "$out" | tr -d ' ')
+        if [ "$rows" = 2 ]; then
+            ok "${mode}: one box prints one row (header + 1)"
+        else
+            bad "${mode}: one box printed ${rows} lines: $(LC_ALL=C cat -v "$out" | tr '\n' '/')"
+        fi
+        # A box row is a line that STARTS with a box name; what the guest says
+        # inside its own cell is its own business. So the count of rows is the
+        # assertion, not the absence of the word: `agent-box-ghost` may appear
+        # in the third column of the one real row, and does.
+        local named
+        named=$(grep -c '^agent-box-' "$out" | tr -d ' ')
+        if [ "$named" = 1 ] && grep -q '^agent-box-app ' "$out"; then
+            ok "${mode}: exactly one line begins with a box name, and it is the real one"
+        else
+            bad "${mode}: ${named} lines begin with a box name: $(LC_ALL=C cat -v "$out" | tr '\n' '/')"
+        fi
+        # No control byte at all, and no C1 in either spelling. `cat -v` is what
+        # makes the assertion readable when it fails: an ESC is `^[`, and the
+        # UTF-8 C1 block is `M-BM-^[`-shaped.
+        if LC_ALL=C grep -q '[[:cntrl:]]' <(LC_ALL=C tr -d '\n' < "$out"); then
+            bad "${mode}: a control byte reached the listing: $(LC_ALL=C cat -v "$out" | tr '\n' '/')"
+        else
+            ok "${mode}: no control byte survives to the terminal"
+        fi
+        if LC_ALL=C grep -q $'\xc2[\x80-\x9f]' "$out"; then
+            bad "${mode}: the UTF-8 C1 block survives: $(LC_ALL=C cat -v "$out" | tr '\n' '/')"
+        else
+            ok "${mode}: no U+0080-U+009F survives either"
+        fi
+    done
+    # Vacuity guard: the box's own words DO reach the column, so the checks above
+    # are about what is stripped and not about an empty cell.
+    if grep -q 'fw=deny' "${sc}/out.row"; then
+        ok "vacuity guard: the guest's legitimate text still reaches the column"
+    else
+        bad "vacuity guard: nothing of the guest's answer reached the listing at all"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 10. The toolchain snapshot is kept when the check RAN, whatever it found
+# ---------------------------------------------------------------------------
+#
+# `toolcheck.sh --json` prints the document and THEN returns its status, so exit
+# 10 ("a baseline tool is missing or off its pin") arrives with a complete
+# reading on stdout. A provisioner that gates the `mv` on exit 0 discards
+# exactly the snapshot `status --json`'s `toolchain` key exists to carry, and the
+# only box that would ever report findings is a box that has none.
+check_toolchain_snapshot_keep() {
+    section "provision.sh: a findings snapshot is kept, a failed run's output is not"
+    local tk="${WORK}/toolchain-keep" f
+    mkdir -p "$tk"
+
+    sed -n '/^toolcheck_snapshot_worth_keeping() {/,/^}/p' "${BOX_DIR}/guest/provision.sh" \
+        > "${tk}/fn.sh"
+    if [ -s "${tk}/fn.sh" ]; then
+        ok "toolcheck_snapshot_worth_keeping extracted from guest/provision.sh"
+    else
+        bad "could not extract toolcheck_snapshot_worth_keeping from guest/provision.sh"; return
+    fi
+    # And the call site really uses it: a helper nothing calls proves nothing.
+    if grep -q 'toolcheck_snapshot_worth_keeping "' "${BOX_DIR}/guest/provision.sh" \
+       && ! grep -q 'if run_as_box_user ' "${BOX_DIR}/guest/provision.sh"; then
+        ok "and the snapshot's mv is gated on it, not on toolcheck's exit status alone"
+    else
+        bad "provision.sh still gates the snapshot on toolcheck's exit status"
+    fi
+    # shellcheck source=/dev/null
+    . "${tk}/fn.sh"
+
+    f="${tk}/snap.json"
+    printf '{"generated_at":"2026-09-19T13:58:02Z","state":"findings","counts":{"missing":1,"off_pin":0}}\n' > "$f"
+    if toolcheck_snapshot_worth_keeping 10 "$f"; then
+        ok "status 10 with a complete document: kept (the findings case)"
+    else
+        bad "status 10 with a complete document was discarded"
+    fi
+    if toolcheck_snapshot_worth_keeping 0 "$f"; then
+        ok "status 0 with a complete document: kept"
+    else
+        bad "status 0 with a complete document was discarded"
+    fi
+    if toolcheck_snapshot_worth_keeping 11 "$f"; then
+        ok "status 11 (project mismatch): kept"
+    else
+        bad "status 11 was discarded"
+    fi
+    if toolcheck_snapshot_worth_keeping 1 "$f"; then
+        bad "status 1 was kept; 1 is the status that means the script could not do its job"
+    else
+        ok "status 1: discarded, whatever is on stdout"
+    fi
+    if toolcheck_snapshot_worth_keeping 127 "$f"; then
+        bad "status 127 (no such command) was kept"
+    else
+        ok "status 127: discarded"
+    fi
+    : > "$f"
+    if toolcheck_snapshot_worth_keeping 10 "$f"; then
+        bad "an empty file was kept"
+    else
+        ok "an empty file: discarded even on an accepted status"
+    fi
+    printf '{"generated_at":"2026-09-19T13:58:02Z","state":"findi' > "$f"
+    if toolcheck_snapshot_worth_keeping 10 "$f"; then
+        bad "a half-written document was kept"
+    else
+        ok "a write cut off half-way: discarded (it does not close where an object closes)"
+    fi
+    if toolcheck_snapshot_worth_keeping 10 "${tk}/no-such-file"; then
+        bad "a missing file was kept"
+    else
+        ok "a file that is not there: discarded"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 11. --box-json against the agent's own files: no bare NaN, no hang on a FIFO
+# ---------------------------------------------------------------------------
+#
+# Every file the standing-session and run sensors read is in the agent's own
+# home, so both of these are one command away for the thing being observed. The
+# host has no timeout around its `limactl shell`, so a reader that blocks takes
+# out `agentbox status` for every box in the fleet, not just this one; and a
+# document carrying a bare `NaN` is refused whole by the host's shape check,
+# which reports the box as unreachable with its firewall unknown.
+check_box_json_hostile_values() {
+    section "--box-json: a non-finite number is null, and a FIFO does not hang the reader"
+    local hv="${WORK}/hostile-values" state runs sessions proc out rid f rc
+    hv="${WORK}/hostile-values"
+    state="${hv}/state"; runs="${state}/runs"; sessions="${state}/sessions"; proc="${hv}/proc"
+    mkdir -p "$runs" "$sessions" "$proc"
+
+    box_json_here() {
+        ABX_STATE_DIR="$state" ABX_RUNS_DIR="$runs" ABX_SESSIONS_DIR="$sessions" \
+        ABX_PROC_DIR="$proc" ABX_TOKEN_FILE="${hv}/no-token" \
+            "$PY" "$RUNFORMAT" --box-json --firewall deny --sessions '' --toolchain ''
+    }
+
+    # `json.loads` accepts NaN and Infinity, so the agent can put one in its own
+    # events.jsonl and `json.dumps` will hand it back as a bare word.
+    rid=20260919-120000
+    mkdir -p "${runs}/${rid}"
+    printf '{"runid":"%s","model":"sonnet","branch":null,"brief":"b","started_at":"2026-09-19T12:00:00Z"}\n' \
+        "$rid" > "${runs}/${rid}/meta.json"
+    printf 'exit:0\n' > "${runs}/${rid}/status"
+    printf '{"type":"result","num_turns":3,"total_cost_usd":NaN,"duration_ms":Infinity}\n' \
+        > "${runs}/${rid}/events.jsonl"
+    out=$(box_json_here 2>&1)
+    case "$out" in
+        *NaN*|*Infinity*) bad "--box-json emitted a bare NaN/Infinity: ${out}" ;;
+        *) ok "a non-finite number in the agent's events.jsonl does not reach the document as a bare word" ;;
+    esac
+    # And the document is one the HOST will splice: its own shape check, pulled
+    # out of bin/agentbox, is the consumer that would otherwise refuse the whole
+    # guest half and report the box as unreachable.
+    sed -n '/^channel_json_shape_ok() {/,/^}/p' "$AGENTBOX" > "${hv}/shape.sh"
+    if [ -s "${hv}/shape.sh" ]; then
+        # shellcheck source=/dev/null
+        . "${hv}/shape.sh"
+        if channel_json_shape_ok "$out"; then
+            ok "and the host's own shape check accepts the document"
+        else
+            bad "the host's shape check refuses the document: the whole guest half becomes the fallback"
+        fi
+        # Vacuity guard: the same check really does refuse a bare NaN.
+        if channel_json_shape_ok '{"cost_usd":NaN}'; then
+            bad "vacuity guard: the host's shape check accepts a bare NaN, so the check above proves nothing"
+        else
+            ok "vacuity guard: the host's shape check does refuse a bare NaN"
+        fi
+    else
+        bad "could not extract channel_json_shape_ok from bin/agentbox"
+    fi
+    if printf '%s' "$out" | grep -q '"cost_usd":null'; then
+        ok "the unreadable number is null, which is the contract's word for it"
+    else
+        bad "cost_usd is not null: $(printf '%s' "$out" | head -c 300)"
+    fi
+    rm -rf "${runs:?}/${rid}"
+
+    # A FIFO named like any file the standing-session sensor reads. A blocking
+    # open never returns, and `status` has no timeout around the guest call.
+    for f in pid task last-text runs-seen hooks.jsonl; do
+        rm -rf "${sessions:?}/claude"
+        mkdir -p "${sessions}/claude"
+        printf '77\n' > "${sessions}/claude/pid"
+        rm -f "${sessions}/claude/${f}"
+        mkfifo "${sessions}/claude/${f}"
+        out=$(box_json_here 2>&1 &
+              bg=$!
+              ( sleep 5; kill -9 "$bg" 2>/dev/null ) >/dev/null 2>&1 &
+              killer=$!
+              wait "$bg" 2>/dev/null
+              kill "$killer" 2>/dev/null)
+        rc=$?
+        case "$out" in
+            *'"standing"'*) ok "a FIFO at sessions/claude/${f}: --box-json still answers" ;;
+            *) bad "a FIFO at sessions/claude/${f}: no answer (rc=${rc}), out='$(printf '%s' "$out" | head -c 120)'" ;;
+        esac
+    done
+    rm -rf "${sessions:?}/claude"
+}
+
 check_repo_git
 check_host_clip
 check_meta_race
@@ -696,6 +950,9 @@ check_slot_list
 check_proc_starttime
 check_channel_read
 check_chromium_found
+check_status_text_clamp
+check_toolchain_snapshot_keep
+check_box_json_hostile_values
 
 printf -- '\nRESULT: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

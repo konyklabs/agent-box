@@ -4513,6 +4513,20 @@ cmd_bench() {
 # inside the box's own line is assembled by guest/box-status.sh, which is where
 # the scrub happens: the host formats what it is given and parses none of it.
 
+# What the guest half of a box object says when there is no guest answer: the
+# box is stopped, the renderer failed, or what it returned was not one object
+# this host will splice. EVERY key of the contract's guest half is here, with
+# `null` for each — a consumer that has to branch on a key being absent is a
+# consumer that will get it wrong, and a `sessions` of `[]` or a `runs_total` of
+# `0` here would claim a reading ("this box has no sessions, and has never run
+# anything") where the truth is that nobody could look.
+#
+# `firewall_detail` is present for the same reason it is present on a box whose
+# mode file and ruleset disagree: the contract carries it whenever `firewall` is
+# `unknown`, and this is the case where a reader most needs to know the unknown
+# means "nobody answered" rather than "this box is in a strange state".
+STATUS_GUEST_FALLBACK='{"claude_version":null,"firewall":"unknown","firewall_detail":"the guest status script did not answer","run":null,"runs_total":null,"sessions":null,"standing":null,"toolchain":null,"leftovers":null}'
+
 # The agent-box instances, one per line: name|status|repo. Mount 0 is /work by
 # construction — lima/agent-box.yaml declares it first — so the repository a
 # box is pointed at is read back from Lima rather than guessed from the name.
@@ -4727,7 +4741,7 @@ cmd_status() {
 }
 
 render_status() {
-    local as_json="$1" only="${2:-}" name state repo guest first=1
+    local as_json="$1" only="${2:-}" name state repo guest first=1 chan
 
     if [ "$as_json" -eq 1 ]; then
         printf '{"generated_at":%s,"boxes":[' "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
@@ -4740,7 +4754,13 @@ render_status() {
         guest=""
         if [ "$state" = "Running" ]; then
             if [ "$as_json" -eq 1 ]; then
-                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" 2>/dev/null) || guest=""
+                # Capped and reduced to printable ASCII on the way in. The guest
+                # scrubs its own output and json.dumps escapes everything above
+                # ASCII, so this takes nothing off a legitimate document; what it
+                # takes off a subverted one is the ability to spend this host's
+                # memory or to reach its terminal with a control byte.
+                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" 2>/dev/null \
+                        | head -c 262144 | LC_ALL=C tr -cd '\040-\176') || guest=""
                 # A box built from a checkout older than the egress work reports
                 # the OUTPUT policy in the old vocabulary. Normalise it here so
                 # the documented contract holds for every box in the listing
@@ -4749,7 +4769,22 @@ render_status() {
                 guest=${guest//\"firewall\":\"drop\"/\"firewall\":\"deny\"}
                 guest=${guest//\"firewall\": \"drop\"/\"firewall\": \"deny\"}
             else
-                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" --text 2>/dev/null) || guest=""
+                # `channel_bar`'s clamp, minus the bar. This column is a table
+                # cell, so it cannot carry the `  | ` prefix — which is why it
+                # has to lose MORE than the barred text does: the newline and
+                # the tab go as well, because a box's line is ONE line by
+                # construction and a newline inside it prints a second row at
+                # column 0, indistinguishable from a box that exists. The C1
+                # block goes in its UTF-8 spelling too (`\302\233` is U+009B, a
+                # CSI to a terminal in 8-bit mode): the guest's own scrub strips
+                # those code points, and the premise here is the one
+                # `channel_bar` states — the guest user has sudo over the
+                # renderer that does the scrubbing, so the host redoes what it
+                # can without parsing.
+                guest=$(guest_shell "$name" "${GUEST_BIN}/box-status.sh" --text 2>/dev/null \
+                        | head -c 8192 \
+                        | LC_ALL=C tr -d '\000-\037\177' \
+                        | LC_ALL=C sed $'s/\xc2[\x80-\x9f]//g') || guest=""
                 guest=${guest//fw=drop/fw=deny}
             fi
         fi
@@ -4757,24 +4792,42 @@ render_status() {
         if [ "$as_json" -eq 1 ]; then
             [ "$first" -eq 1 ] || printf ','
             first=0
+            # The guest object goes FIRST and the host's keys after it, so a
+            # renderer that emitted `"state":"pwned"` a second time loses to this
+            # host's own value: jq and Python are both last-key-wins. Printed the
+            # other way round — as this did until the contract was written down —
+            # the box's own answer would win, and `name`, `instance`, `repo` and
+            # `state` are exactly the four keys worth forging.
+            #
+            # Which is why the answer has to be ONE balanced object and not
+            # merely something that starts `{` and ends `}`: splicing
+            # `{"a":1},{"name":"other"}` would add a SECOND element to the
+            # `boxes` array — a box nobody owns, carrying whatever it liked —
+            # and one brace too many would end this document early. That is the
+            # same defect the channel's own embedding was fixed for, and this is
+            # the same check (`channel_json_shape_ok`, beside it).
             case "$guest" in
-                \{*) ;;
+                # `{}` is balanced and useless: stripping its closing brace
+                # leaves `{`, and the host's keys would then follow a comma that
+                # opens nothing. It takes the fallback like any other non-answer.
+                \{\}) guest="$STATUS_GUEST_FALLBACK" ;;
+                \{*\}) channel_json_shape_ok "$guest" || guest="$STATUS_GUEST_FALLBACK" ;;
                 # Not running, or the guest could not answer. Say so with the
                 # same keys rather than omitting them: a consumer that has to
                 # branch on missing keys is a consumer that will get it wrong.
-                # `firewall_detail` is present here for the same reason it is
-                # present on a disagreeing box: the contract carries it whenever
-                # `firewall` is "unknown", and this is the case where a reader
-                # most needs to know that the unknown means "nobody answered"
-                # rather than "the box is in a strange state".
-                *) guest='{"claude_version":null,"firewall":"unknown","firewall_detail":"the guest status script did not answer","run":null,"runs_total":0,"sessions":[]}' ;;
+                *) guest="$STATUS_GUEST_FALLBACK" ;;
             esac
-            printf '{"name":%s,"instance":%s,"repo":%s,"state":%s,%s' \
+            # Host-computed, for every box including a stopped one: it is read
+            # from file NAMES on the mount and from this host's own record, so a
+            # box that is not running can still be asked what is waiting in it.
+            chan=$(channel_counts_json "$repo" "$name")
+            printf '%s,"name":%s,"instance":%s,"repo":%s,"state":%s,"channel":%s}' \
+                "${guest%\}}" \
                 "$(json_str "${name#agent-box-}")" \
                 "$(json_str "$name")" \
                 "$(json_str "$repo")" \
                 "$(json_str "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')")" \
-                "${guest#\{}"
+                "$chan"
         else
             # A running box whose guest script could not answer is NOT "(not
             # running)" — that is a false statement about a box, and the two
@@ -4787,6 +4840,15 @@ render_status() {
                 else
                     guest='(not running)'
                 fi
+            fi
+            # The one part of the line the HOST contributes, for the same reason
+            # the `channel` key is host-computed: the counts come from file names
+            # on the mount and from this host's private record, so they are there
+            # for a stopped box too. Only when something is pending — a line that
+            # said `ch=0/0` about every quiet box would train the eye to skip it.
+            if channel_counts "$repo" "$name" \
+               && { [ "$CH_TO_HOST_UNREAD" -ne 0 ] || [ "$CH_TO_BOX_QUEUED" -ne 0 ]; }; then
+                guest="${guest}  ch=${CH_TO_HOST_UNREAD}/${CH_TO_BOX_QUEUED}"
             fi
             printf '%-30s %-9s %s\n' \
                 "$name" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$guest"

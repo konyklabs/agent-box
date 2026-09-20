@@ -948,15 +948,55 @@ run_as_box_user "${BOX_DIR}/guest/install-plugins.sh" \
 #
 # Guarded on the script existing: an older checkout has no toolcheck.sh, and a
 # box must still start.
+
+# Is this toolcheck run's output a snapshot worth keeping?
+#
+# The status is NOT the test on its own. `--json` prints the whole document and
+# THEN returns report_status (toolcheck.sh:501-505), so 10 — "a baseline tool is
+# missing or off its pin" — arrives with a complete reading on stdout, and that
+# reading is the one the snapshot exists for: `status --json`'s `toolchain` key
+# and the readiness lines at create and start all come from it. Throwing the
+# file away there would report `toolchain: null` — "nobody could answer" — about
+# the one box whose readiness is precisely known to be bad, and the only box
+# reporting findings would be a box that has none. 11 is the project-mismatch
+# status, unreachable under `--box-only` and accepted for the same reason. 1 is
+# the status that means the script could not do its job, and its output is not a
+# reading.
+#
+# Then the cheap completeness test the host applies to documents of this kind
+# (`channel_json_clamp` in bin/agentbox): something is there, and it opens and
+# closes where one balanced object does. That catches the write cut off
+# half-way, which is the failure a status cannot describe. It is deliberately
+# not a parse: root's PATH here is not the box user's, the reader validates the
+# shape properly in Python, and a snapshot that fails there is `null` — so a
+# provisioner guessing at JSON would only add a way to lose a good file.
+toolcheck_snapshot_worth_keeping() {
+    local status="${1:-1}" file="${2:?}" doc
+    case "$status" in
+        0|10|11) ;;
+        *) return 1 ;;
+    esac
+    [ -s "$file" ] || return 1
+    doc=$(LC_ALL=C tr -d '[:space:]' < "$file" 2>/dev/null) || return 1
+    case "$doc" in
+        \{*\}) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 if [ -x "${BOX_DIR}/guest/toolcheck.sh" ]; then
     log "Recording the toolchain snapshot"
-    if run_as_box_user "${BOX_DIR}/guest/toolcheck.sh" --json --box-only \
-            > /var/lib/agent-box/toolcheck.json.tmp 2>/dev/null; then
+    TOOLCHECK_STATUS=0
+    run_as_box_user "${BOX_DIR}/guest/toolcheck.sh" --json --box-only \
+        > /var/lib/agent-box/toolcheck.json.tmp 2>/dev/null || TOOLCHECK_STATUS=$?
+    if toolcheck_snapshot_worth_keeping "$TOOLCHECK_STATUS" /var/lib/agent-box/toolcheck.json.tmp; then
         mv /var/lib/agent-box/toolcheck.json.tmp /var/lib/agent-box/toolcheck.json
         chmod 0644 /var/lib/agent-box/toolcheck.json
+        [ "$TOOLCHECK_STATUS" -eq 0 ] \
+            || log "NOTE: the snapshot records findings (toolcheck status ${TOOLCHECK_STATUS}); 'agentbox toolcheck <repo>' names them"
     else
         rm -f /var/lib/agent-box/toolcheck.json.tmp
-        log "WARN: could not write the toolchain snapshot; 'agentbox toolcheck <repo>' still sweeps live"
+        log "WARN: could not write the toolchain snapshot (toolcheck status ${TOOLCHECK_STATUS}); 'agentbox toolcheck <repo>' still sweeps live"
     fi
 fi
 
