@@ -341,9 +341,25 @@ agentbox ports ~/dev/<repo>
 Every forwarded port should read `yes` under REACHES once something in the box is
 listening on it, and the table names which side is quiet when one does not.
 
+Then prove the channel, which is the one thing a run cannot tell you about
+itself. It needs no session and no token:
+
+```
+agentbox request ~/dev/<repo> --subject "setup check" --text "Ignore this; it is a setup check."
+agentbox shell ~/dev/<repo>      # inside: abx inbox   -> the request is listed
+                                 #         abx done <id>
+agentbox channel ~/dev/<repo>    # TO THE BOX: ... done
+```
+
+`abx` is the box's own side of the channel and is on the guest's PATH: `abx
+inbox`, `abx read <id>`, `abx done <id>`, `abx handoff`, `abx status`. The
+standing session is told all of this by itself, so this step is for you, not for
+it. `agentbox leftovers <repo>` lists anything an earlier run left running.
+
 **Check:** verify-auth `pass`, firewall-check all `PASS` or `SKIP`, toolcheck
 exit 0 (or 11 with the project's own pins named), one staging host reachable if
-the allowlist names one.
+the allowlist names one, and the request above coming back `done` in `agentbox
+channel`.
 
 ## 7b. The application's credentials, into the guest
 
