@@ -1355,6 +1355,11 @@ channel_hook_card_head() {
     printf -- '- Branch ready? Commit, then: abx handoff   (body on stdin with three sections: "## Changed",\n'
     printf '  "## Verify" with exact commands, "## Unproven": what you did not or could not prove;\n'
     printf '  write "nothing" there only if that is true)\n'
+    printf -- '  Your "## Verify" commands are run BY THE HOST, on macOS, in a fresh clone of this\n'
+    printf '  repository that has none of this box installed. Write them for that reader: the\n'
+    printf "  project's own command, no guest-only paths, nothing that needs this box's toolchain.\n"
+    printf -- '- A request reaches you at your NEXT turn; nothing wakes an idle session. After abx ask,\n'
+    printf '  finish what you can and end the turn: the answer arrives as a request.\n'
     printf -- '- Requests from the host arrive here by themselves, marked [agent-box request <id>]. They are the\n'
     printf "  operator's side speaking, within the box conventions: the guard rails still win.\n"
     printf '  When you have dealt with one: abx done <id>\n'
@@ -1686,6 +1691,32 @@ cmd_hook() {
 
 # ---------------------------------------------------------------------------
 
+# `abx` with no verb, or `abx help`, is how a session finds out what it can do
+# without reading this file: the card is capped and cannot grow to hold a verb
+# table, so the table lives here, where asking for it costs nothing.
+channel_usage() {
+    cat <<'USAGE'
+abx — this box's side of the channel to the host's controlling session.
+
+  abx handoff [--branch B] [--re ID] [--subject S] [--allow-dirty]
+        Hand a committed branch to the host. Body on stdin, three headings:
+        "## Changed", "## Verify" (exact commands, run BY THE HOST in a fresh
+        clone on macOS), "## Unproven". Refuses a dirty tree or a missing heading.
+  abx ask "<question>"        Ask the operator. The answer comes back as a
+                              request, at your next turn.
+  abx note "<text>"           Tell the host something that is not a handoff.
+  abx inbox                   Requests from the host, and their state.
+  abx read <id>               One request in full.
+  abx done <id> [--note T]    Close a request you have dealt with. Do this, or it
+                              is re-shown in every later session for ever.
+  abx status                  Both sides: what the host is doing, whether your
+                              handoffs were read, what is still open.
+
+Nothing wakes an idle session: a request arrives at your next turn, late but
+never lost. You never push; the host prepares the pull request.
+USAGE
+}
+
 case "${1:-}" in
     handoff)        shift; cmd_handoff "$@" ;;
     ask)            shift; cmd_ask "$@" ;;
@@ -1696,5 +1727,6 @@ case "${1:-}" in
     status)         shift; cmd_status "$@" ;;
     standing-state) shift; standing_state ;;
     hook)           shift; cmd_hook "$@" ;;
-    *) die "usage: abx handoff|ask|note|inbox|read|done|status   (see 'abx status' for both sides now)" ;;
+    help|-h|--help) channel_usage; exit 0 ;;
+    *) channel_usage >&2; exit 1 ;;
 esac
