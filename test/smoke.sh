@@ -752,6 +752,29 @@ else
 fi
 rm -f "${CH_CFG}/blocklist.txt"
 
+printf -- '\n--- nothing is published before this host can record it ---\n'
+# The private record is the only proof the host has that it sent a request. If it
+# cannot be written, a published request would be live in the box while `channel`
+# reported it as `foreign` with nothing queued — and with --verdict the message it
+# answered would stay open. A read-only state directory stands in for a full disk.
+CH_TOBOX_BEFORE=$(find "${CH_REPO}/.agent-box/channel/to-box" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+chmod 500 "${CH_CFG}/channel/${CH_INST}"
+CH_NOREC="${TMP_ROOT}/ch-norecord.out"
+run_bounded 30 "$CH_NOREC" ch_box request "$CH_REPO" \
+    --text "this must not reach the box unrecorded"
+CH_NOREC_RC=$BOUNDED_RC
+cat "$CH_NOREC"
+chmod 700 "${CH_CFG}/channel/${CH_INST}"
+CH_TOBOX_AFTER=$(find "${CH_REPO}/.agent-box/channel/to-box" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+printf 'rc=%s  to-box files: %s -> %s\n' "$CH_NOREC_RC" "$CH_TOBOX_BEFORE" "$CH_TOBOX_AFTER"
+if [ "$CH_NOREC_RC" -ne 0 ] && [ "$CH_TOBOX_AFTER" = "$CH_TOBOX_BEFORE" ] \
+   && grep -q "as this host's record for ${CH_INST}" "$CH_NOREC" \
+   && grep -q '^agentbox: ' "$CH_NOREC" && ! grep -q 'Permission denied' "$CH_NOREC"; then
+    ok "a request this host could not record was refused before it was published, in this tool's own words"
+else
+    bad "a request was published (or reported by bash) with no private record (rc=${CH_NOREC_RC}, ${CH_TOBOX_BEFORE} -> ${CH_TOBOX_AFTER})"
+fi
+
 printf -- '\n--- --task reaches the mount, which is what the box reads ---\n'
 CH_TASKTEXT="verifying the login branch"
 run_bounded 30 "${TMP_ROOT}/ch-task.out" ch_box channel "$CH_REPO" --task "$CH_TASKTEXT"
@@ -763,19 +786,43 @@ else
 fi
 
 printf -- '\n--- A12: a forged host-status does not become the host'"'"'s own words ---\n'
-printf 'seen: 1999-01-01T00:00:00Z\ntask: FORGEDTASK\nlast: FORGEDLAST\n' \
-    > "${CH_REPO}/.agent-box/channel/host-status"
+# The forgery is planted THROUGH A SYMLINK on purpose. `channel` rewrites the
+# mount's host-status from its private copy before it renders (bin/agentbox
+# channel_touch_host, then channel_render_*), so a forged plain file is already
+# gone by the time anything could read it and this check would pass even for an
+# implementation that renders from the mount. channel_touch_host skips a symlink,
+# so the forged bytes are still there while the command runs — which is what
+# makes the assertion mean something. The target is outside the mailbox and
+# host-owned, so nothing here writes into the guest's own file either way.
+CH_FORGED_TARGET="${CH_ROOT}/forged-host-status"
+printf 'seen: 1999-01-01T00:00:00Z\ntask: FORGEDTASK\nlast: FORGEDLAST\n' > "$CH_FORGED_TARGET"
+rm -f "${CH_REPO}/.agent-box/channel/host-status"
+ln -s "$CH_FORGED_TARGET" "${CH_REPO}/.agent-box/channel/host-status"
 CH_FORGE="${TMP_ROOT}/ch-forge.out"
 run_bounded 30 "$CH_FORGE" ch_box channel "$CH_REPO"
 cat "$CH_FORGE"
 CH_FORGEJ="${TMP_ROOT}/ch-forge.json"
 run_bounded 30 "$CH_FORGEJ" ch_box channel "$CH_REPO" --json
 cat "$CH_FORGEJ"
-if ! grep -q FORGED "$CH_FORGE" && ! grep -q FORGED "$CH_FORGEJ" \
-   && grep -qF "task: ${CH_TASKTEXT}" "$CH_FORGE"; then
+CH_FORGE_LEFT=$(grep -c FORGED "$CH_FORGED_TARGET" | tr -d ' ')
+printf 'forged lines still in place while the command ran: %s (0 would make this check vacuous)\n' \
+    "$CH_FORGE_LEFT"
+if [ "$CH_FORGE_LEFT" -eq 2 ] && ! grep -q FORGED "$CH_FORGE" && ! grep -q FORGED "$CH_FORGEJ" \
+   && grep -qF "task: ${CH_TASKTEXT}" "$CH_FORGE" \
+   && [ "$(jq -r '.host.task' "$CH_FORGEJ")" = "$CH_TASKTEXT" ]; then
     ok "the host side line and the JSON host object come from the host's private copy"
 else
-    bad "a guest-written host-status reached the host's own output"
+    bad "a guest-written host-status reached the host's own output (${CH_FORGE_LEFT} forged lines survived)"
+fi
+# Back to a plain file, which is what the mount carries in ordinary use and what
+# the steps after this one read.
+rm -f "${CH_REPO}/.agent-box/channel/host-status"
+run_bounded 30 "${TMP_ROOT}/ch-unforge.out" ch_box channel "$CH_REPO"
+if [ -f "${CH_REPO}/.agent-box/channel/host-status" ] \
+   && ! grep -q FORGED "${CH_REPO}/.agent-box/channel/host-status"; then
+    ok "the courtesy copy on the mount is rewritten from the private record"
+else
+    bad "the courtesy host-status was not rewritten from the private record"
 fi
 
 printf -- '\n--- a message from the box, and the hook that names it ---\n'
@@ -1057,6 +1104,128 @@ if [ "$(jq -r '.to_host[0].state' "$CH_LISTJ")" = "read" ] \
     ok "the host's state for the message and the box's own object are both in the JSON"
 else
     bad "channel --json did not carry the host state and the guest object"
+fi
+
+printf -- '\n--- the newest message is visible past the name bound ---\n'
+# to-host keeps messages for 30 days, so an ordinary box crosses the 1000-name
+# bound by itself. The bound is applied AFTER the sort, or the "newest 200" are an
+# arbitrary subset of the directory's own order and the newest real handoff can be
+# missing from the counts, from --wait and from handoff's default id.
+# 1200 filler names, and the newest message written last. Whether ONE named
+# message survives a bound applied before the sort depends on the order the
+# filesystem happens to list a directory in, so the assertion is not about that
+# one name: it is that the 200 ids reported are exactly the 200 highest-sorting
+# names present. Dropping 200 of 1201 names before the sort cannot leave that set
+# intact by luck.
+"$PY" - "$CH_TOHOST" "$CH_TODAY" <<'CHPY'
+import os, sys
+d, today = sys.argv[1], sys.argv[2]
+for n in range(1200):
+    name = "%s-%02d%02d%02d-01.md" % (today, n // 3600, (n // 60) % 60, n % 60)
+    with open(os.path.join(d, name), "w") as f:
+        f.write("created: 2026-01-01T00:00:00Z\ntype: note\n\nfiller\n")
+with open(os.path.join(d, "%s-235959-00.md" % today), "w") as f:
+    f.write("created: 2026-01-01T00:00:00Z\ntype: handoff\nsubject: the newest\n\nread me\n")
+print("names in to-host now:", len(os.listdir(d)))
+CHPY
+CH_MANY="${TMP_ROOT}/ch-many.json"
+run_bounded 90 "$CH_MANY" ch_box channel "$CH_REPO" --json
+if "$PY" - "$CH_MANY" "$CH_TOHOST" "${CH_TODAY}-235959-00" <<'CHPY'
+import json, os, sys
+doc, d, newest = sys.argv[1], sys.argv[2], sys.argv[3]
+got = [r["id"] for r in json.load(open(doc))["to_host"]]
+names = sorted(n[:-3] for n in os.listdir(d) if n.endswith(".md"))
+want = names[-200:]
+print("names: %d  reported: %d  newest reported: %s (expected %s)"
+      % (len(names), len(got), got[0] if got else None, newest))
+missing = [i for i in want if i not in got]
+print("of the 200 newest names, missing from the report:", len(missing), missing[:3])
+sys.exit(0 if (got and got[0] == newest and not missing) else 1)
+CHPY
+then
+    ok "the newest 200 names are the 200 reported, with 1201 names in the mailbox"
+else
+    bad "the bound on names dropped some of the newest ones before sorting them"
+fi
+find "$CH_TOHOST" -maxdepth 1 -name "${CH_TODAY}-*-01.md" -delete
+rm -f "${CH_TOHOST}/${CH_TODAY}-235959-00.md"
+printf 'names left in to-host: %s\n' "$(find "$CH_TOHOST" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')"
+
+printf -- '\n--- a renderer that closes its object early cannot inject a host key ---\n'
+# The guest user has sudo over the renderer, and its JSON is embedded as the value
+# of `untrusted`. A blob that starts `{` and ends `}` but closes its object early
+# would make the renderer's own `box`, `instance` and `state` siblings of this
+# machine's — a box name and a state of the guest's choosing on an unbarred line
+# of a document the host reads as its own words.
+CH_FORGER="${CH_ROOT}/guest-forger"
+cat > "$CH_FORGER" <<'CHFORGE'
+#!/usr/bin/env bash
+shift
+FORGED='"box":"OTHER-BOX","instance":"agent-box-victim","state":"stopped","generated_at":"1999-01-01T00:00:00Z","id":"19990101-000000-00"'
+case "$*" in
+    *--channel-list*--json*) printf '{"standing":null},%s,"zz":{"x":0}\n' "$FORGED" ;;
+    *--channel-read*--json*) printf '{"branch":"agent/fix"},%s,"zz":{"x":0}\n' "$FORGED" ;;
+    *) exit 1 ;;
+esac
+CHFORGE
+chmod +x "$CH_FORGER"
+# run_bounded merges stderr into its file, and a --json mode promises JSON on
+# stdout ALONE — the reason a refusal is on stderr in the first place. So stdout
+# goes to its own file here and run_bounded's file holds stderr, which is then
+# asserted to be where the sentence is.
+ch_forged_json() { local out="$1"; shift; FAKE_LIMA_SHELL="$CH_FORGER" ch_box "$@" > "$out"; }
+CH_INJ="${TMP_ROOT}/ch-inject.json"
+run_bounded 30 "${TMP_ROOT}/ch-inject.err" ch_forged_json "$CH_INJ" channel "$CH_REPO" --json
+cat "$CH_INJ"
+CH_INJH="${TMP_ROOT}/ch-inject-handoff.json"
+run_bounded 30 "${TMP_ROOT}/ch-inject-handoff.err" ch_forged_json "$CH_INJH" \
+    handoff "$CH_REPO" "$CH_MSG" --json --peek
+cat "$CH_INJH"
+cat "${TMP_ROOT}/ch-inject-handoff.err"
+if jq -e . "$CH_INJ" >/dev/null 2>&1 && jq -e . "$CH_INJH" >/dev/null 2>&1 \
+   && [ "$(jq -r '.box' "$CH_INJ")" = "app" ] && [ "$(jq -r '.state' "$CH_INJ")" = "running" ] \
+   && [ "$(jq -r '.untrusted' "$CH_INJ")" = "null" ] \
+   && [ "$(jq -r '.box' "$CH_INJH")" = "app" ] && [ "$(jq -r '.id' "$CH_INJH")" = "$CH_MSG" ] \
+   && [ "$(jq -r '.untrusted' "$CH_INJH")" = "null" ] \
+   && ! grep -q 'OTHER-BOX' "$CH_INJ" && ! grep -q 'OTHER-BOX' "$CH_INJH"; then
+    ok "a blob that is not one balanced object is refused whole, and every host key is this machine's"
+else
+    bad "SECURITY: the box's renderer put its own keys into this host's JSON"
+fi
+if jq -r '.degraded' "$CH_INJ" | grep -q 'not one JSON object' \
+   && grep -q 'not one JSON object' "${TMP_ROOT}/ch-inject-handoff.err"; then
+    ok "and both modes say why the guest object is absent, handoff's on stderr so stdout stays JSON"
+else
+    bad "the refusal was silent: no reason in degraded, or none on handoff's stderr"
+fi
+
+printf -- '\n--- --done with no id closes the message that was read ---\n'
+# The ordinary flow is read it, answer out of band, close it — by which time the
+# message is `read`, not `unread`. A default id search that only ever found an
+# unread message made that closing a silent no-op.
+CH_DONE="${TMP_ROOT}/ch-done.out"
+run_bounded 30 "$CH_DONE" ch_box handoff "$CH_REPO" --done
+CH_DONE_RC=$BOUNDED_RC
+cat "$CH_DONE"
+CH_DONEJ="${TMP_ROOT}/ch-done.json"
+run_bounded 30 "$CH_DONEJ" ch_box_guest channel "$CH_REPO" --json
+CH_DONE_STATE=$(jq -r --arg id "$CH_MSG" '.to_host[] | select(.id == $id) | .state' "$CH_DONEJ")
+CH_DONE_VERDICT=$(jq -r --arg id "$CH_MSG" '.to_host[] | select(.id == $id) | .verdict' "$CH_DONEJ")
+printf 'rc=%s  state: %s  verdict: %s\n' "$CH_DONE_RC" "$CH_DONE_STATE" "$CH_DONE_VERDICT"
+if [ "$CH_DONE_RC" -eq 0 ] && grep -qF "$CH_MSG" "$CH_DONE" && grep -q 'is closed' "$CH_DONE" \
+   && [ "$CH_DONE_STATE" = "done" ] && [ "$CH_DONE_VERDICT" = "closed" ] \
+   && grep -q "^${CH_MSG} closed " "${CH_CFG}/channel/${CH_INST}/done"; then
+    ok "--done with no id closed the read message and recorded it privately"
+else
+    bad "--done with no id did not close the message that had been read (state ${CH_DONE_STATE})"
+fi
+CH_NOTHING="${TMP_ROOT}/ch-nothing.out"
+run_bounded 30 "$CH_NOTHING" ch_box handoff "$CH_REPO" --done
+cat "$CH_NOTHING"
+if [ "$BOUNDED_RC" -eq 0 ] && grep -q 'nothing open to close' "$CH_NOTHING"; then
+    ok "a second --done says there is nothing open to close"
+else
+    bad "--done with nothing open did not say so"
 fi
 
 printf -- '\n--- and it all came out of a fake: no VM was involved ---\n'

@@ -1872,6 +1872,15 @@ channel_mv_onto() {
 # the count is the whole report. `-size +0c` skips a reservation a crash left
 # behind, `-type f` skips a planted symlink or FIFO, and a name holding a newline
 # arrives as two lines that both fail the shape.
+#
+# `sort` comes BEFORE the 1000-name bound, which is the whole point of the bound
+# being there: `find` lists a directory in its own order, so truncating first
+# made the "newest 200" an arbitrary subset of a mailbox that holds more than
+# 1000 names, and the newest real handoff could be absent from the counts, from
+# `--wait` and from `handoff`'s default id. to-host keeps messages for 30 days,
+# so an ordinary box reaches 1000 names by itself. The bound stays, after the
+# sort, as what keeps this bounded: the newest 1000 names, of which the newest
+# 200 valid ids are kept.
 CH_IDS=()
 CH_SKIPPED=0
 channel_ids() {
@@ -1889,7 +1898,7 @@ channel_ids() {
             CH_SKIPPED=$((CH_SKIPPED + 1))
         fi
     done <<EOF
-$(find "$dir" -maxdepth 1 -type f -size +0c -name '[0-9]*.md' 2>/dev/null | head -n 1000)
+$(find "$dir" -maxdepth 1 -type f -size +0c -name '[0-9]*.md' 2>/dev/null | sort | tail -n 1000)
 EOF
     [ "${#CH_IDS[@]}" -gt 0 ] || return 0
     sorted=$(printf '%s\n' "${CH_IDS[@]}" | sort | tail -n 200)
@@ -2069,15 +2078,69 @@ channel_bar() {
 }
 
 # Guest JSON, clamped to what json.dumps can legitimately have produced:
-# printable ASCII, a bounded size, and it has to start `{` and end `}`. Anything
-# else is absent — `null` and a reason, never a half-parsed object.
+# printable ASCII, a bounded size, and ONE balanced object that closes at the
+# last byte. Anything else is absent — `null` and a reason, never a half-parsed
+# object.
+#
+# The structure check is the load-bearing half. This blob is embedded as the
+# value of `untrusted` in a document this host prints, so a blob that closes its
+# object early — `{"standing":null},"box":"OTHER","state":"stopped","z":{}`,
+# which starts `{` and ends `}` like any other — would put the renderer's own
+# top-level keys into that document beside the host's, and a blob with one brace
+# too many would end the document early. Both were measured against the
+# bytes-only version of this function.
 channel_json_clamp() {
     local f="${1:?}" s
     s=$(head -c 262144 "$f" 2>/dev/null | LC_ALL=C tr -cd '\040-\176') || return 1
     case "$s" in
-        \{*\}) printf '%s' "$s" ;;
+        \{*\}) ;;
         *) return 1 ;;
     esac
+    channel_json_shape_ok "$s" || return 1
+    printf '%s' "$s"
+}
+
+# Is this string ONE balanced JSON object, ending at its last byte? Deliberately
+# a shape check and not a parser: it is what stops the embedding above from being
+# subverted, and it is bounded work with no dependency the host CLI does not
+# already have (no jq, no python3, no awk) — `sed` and `tr`, which every other
+# line of this section already uses.
+#
+# Escape pairs go first, so `\"` cannot read as a quote and `\\` cannot swallow
+# the quote after it. Then every quoted string goes, which leaves structure only;
+# structure holding a byte that JSON never has outside a string — a quote, from an
+# unterminated one, or a letter from a bare word — is refused. Then the bracket
+# skeleton has its outermost pair stripped and every adjacent pair inside it
+# removed: what is between them reduces to nothing only for one object that spans
+# the whole string. An object that closed early leaves a `}` or a `}{`; a
+# mis-nested one leaves `{]`; a second object leaves `}{`. Each reduction pass
+# removes one level of nesting, and the passes are counted, so a string nested
+# deeper than 100 levels is refused rather than scanned further — the guest's own
+# documents nest four deep.
+#
+# Reduction is `sed`'s and not bash's: `${mid//\{\}/}` on the skeleton of an
+# 80 KB document took 89 SECONDS (measured), where this takes 45 ms. The passes
+# are separate `-e` arguments because BSD sed refuses one script argument that
+# long ("unterminated substitute pattern" at 3600 characters, measured).
+channel_json_shape_ok() {
+    local s="${1-}" rest skel mid i=0
+    local -a reduce=()
+    s=$(printf '%s' "$s" | LC_ALL=C sed 's/\\./ /g' | LC_ALL=C sed 's/"[^"]*"/ /g') || return 1
+    rest=$(printf '%s' "$s" | LC_ALL=C sed 's/[][{}:,0-9.eE+-]//g; s/[truefalsn]//g; s/ //g') || return 1
+    [ -z "$rest" ] || return 1
+    skel=$(printf '%s' "$s" | LC_ALL=C tr -cd '{}[]') || return 1
+    case "$skel" in
+        \{*\}) ;;
+        *) return 1 ;;
+    esac
+    mid=${skel#\{}
+    mid=${mid%\}}
+    while [ "$i" -lt 100 ]; do
+        reduce+=(-e 's/{}//g;s/\[\]//g')
+        i=$((i + 1))
+    done
+    mid=$(printf '%s' "$mid" | LC_ALL=C sed "${reduce[@]}") || return 1
+    [ -z "$mid" ]
 }
 
 # Does this file hold a configured term? Preflight's own preparation of the term
@@ -2557,9 +2620,14 @@ EOF
     return 0
 }
 
-# The same facts as data. The guest object is nested under `untrusted` and the
-# host's keys come after it, so a renderer that emitted a duplicate key cannot
-# override one of them (jq and Python are both last-key-wins).
+# The same facts as data. The guest object is nested under `untrusted`, which is
+# the FIRST key, so that EVERY host key comes after it and a renderer that
+# emitted a duplicate key cannot override one of them (jq and Python are both
+# last-key-wins). channel.md 1.3 spells `box` first and `untrusted` fifth while
+# giving that rationale in the same sentence; the four keys it puts first were
+# exactly the ones a duplicate could have overridden, so the rationale is what is
+# built. channel_json_clamp is the other half: it refuses a blob that would close
+# its object early and make its keys siblings of these rather than a duplicate.
 channel_render_json() {
     local repo="${1:?}" inst="${2:?}" state="${3:?}" guest_raw="${4-}"
     local untrusted="null" degraded="null" lower sdir id st verdict first=1 i tobox
@@ -2568,16 +2636,23 @@ channel_render_json() {
     sdir=$(channel_state_dir "$inst") || sdir="/nonexistent"
     if [ "$state" != "Running" ]; then
         degraded=$(json_str "${inst} is ${lower}; the box's renderer was not called")
-    elif [ -n "$guest_raw" ] && [ -s "$guest_raw" ] && untrusted=$(channel_json_clamp "$guest_raw"); then
-        :
-    else
+    elif [ -z "$guest_raw" ] || [ ! -s "$guest_raw" ]; then
         untrusted="null"
         degraded=$(json_str "the box's renderer did not answer")
+    elif untrusted=$(channel_json_clamp "$guest_raw"); then
+        :
+    else
+        # It answered with something; it is just not one JSON object this side
+        # will embed. Said as its own reason, because "did not answer" would send
+        # the operator looking at the wrong thing.
+        untrusted="null"
+        degraded=$(json_str "the box's renderer answered with something that is not one JSON object; none of it is in this document")
     fi
-    printf '{"box":%s,"instance":%s,"state":%s,"generated_at":%s' \
+    printf '{"untrusted":%s' "$untrusted"
+    printf ',"box":%s,"instance":%s,"state":%s,"generated_at":%s' \
         "$(json_str "${inst#agent-box-}")" "$(json_str "$inst")" "$(json_str "$lower")" \
         "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
-    printf ',"untrusted":%s,"degraded":%s' "$untrusted" "$degraded"
+    printf ',"degraded":%s' "$degraded"
     seen=$(channel_host_get "$inst" seen 2>/dev/null || true)
     task=$(channel_host_get "$inst" task 2>/dev/null || true)
     printf ',"host":{"seen_at":%s,"task":%s}' \
@@ -2664,7 +2739,7 @@ channel_json_or_null() {
 # crosses — and this side re-applies a cap, a control strip and the bar, because
 # the guest user has sudo over that reader.
 cmd_handoff() {
-    local repo inst id="" as_json=0 peek=0 mark_done=0 force=0 sdir st state
+    local repo inst id="" as_json=0 peek=0 mark_done=0 force=0 sdir st state none
     local i tmpd raw args=()
     split_args "" "$@"
     check_operands 1 2 "handoff <repo> [id] [--json] [--peek] [--done] [--force-unsafe]"
@@ -2685,7 +2760,10 @@ cmd_handoff() {
     require_instance "$inst"
     channel_dir_or_die "$repo"
     sdir=$(channel_state_dir "$inst") || die "cannot use ${CHANNEL_STATE_DIR} for ${inst}"
-    [ -d "$sdir" ] || die "cannot use ${sdir} as this host's record for ${inst}"
+    # Writable, not merely present: `read` and `done` are appended below, and a
+    # bare redirect onto a directory this host cannot write prints bash's own
+    # error naming an internal path instead of a sentence from here.
+    { [ -d "$sdir" ] && [ -w "$sdir" ]; } || die "cannot use ${sdir} as this host's record for ${inst}"
 
     if [ "${#ABX_POSV[@]}" -gt 1 ]; then
         id="${ABX_POSV[1]}"
@@ -2693,7 +2771,12 @@ cmd_handoff() {
         [ -n "$CH_TO_HOST" ] && [ -f "${CH_TO_HOST}/${id}.md" ] \
             || die "no message ${id} from box ${inst#agent-box-}"
     else
-        # The newest name this host has not printed.
+        # The newest name this host has not printed — except for `--done`, which
+        # takes the newest still OPEN, unread or already read. The ordinary flow
+        # is read it, answer it out of band, close it: by the time `--done` runs
+        # the message is `read`, and an unread-only search made that closing a
+        # silent no-op, which left the message announced at every SessionStart
+        # and held for 30 days instead of 7.
         channel_ids "$CH_TO_HOST"
         i=${#CH_IDS[@]}
         while [ "$i" -gt 0 ]; do
@@ -2701,16 +2784,22 @@ cmd_handoff() {
             st=$(channel_to_host_state "$sdir" "${CH_IDS[$i]}")
             case "${st%% *}" in
                 unread) id="${CH_IDS[$i]}"; break ;;
+                read)   [ "$mark_done" -eq 0 ] || { id="${CH_IDS[$i]}"; break; } ;;
             esac
         done
         if [ -z "$id" ]; then
+            if [ "$mark_done" -eq 1 ]; then
+                none="nothing open to close from box ${inst#agent-box-}"
+            else
+                none="no unread messages from box ${inst#agent-box-}"
+            fi
             # In --json mode stdout carries JSON or nothing: a consumer reads an
             # empty stdout as "nothing to read", and the sentence still reaches a
             # person, on stderr.
             if [ "$as_json" -eq 1 ]; then
-                info "no unread messages from box ${inst#agent-box-}" >&2
+                info "$none" >&2
             else
-                info "no unread messages from box ${inst#agent-box-}"
+                info "$none"
             fi
             return 0
         fi
@@ -2880,7 +2969,12 @@ channel_handoff_text() {
 channel_handoff_json() {
     local repo="${1:?}" inst="${2:?}" id="${3:?}" raw="${4:?}" peek="${5:-0}"
     local untrusted state v
-    untrusted=$(channel_json_clamp "$raw") || untrusted="null"
+    # `handoff --json` has no `degraded` key to carry the reason, so a refusal is
+    # said on stderr: stdout stays JSON or nothing, which is this mode's contract.
+    untrusted=$(channel_json_clamp "$raw") || {
+        untrusted="null"
+        info "the box's reader answered with something that is not one JSON object; the body is not in this document. Read it without --json to see it behind the bar." >&2
+    }
     # The host check needs the branch and the commit, and in this mode they are
     # in the guest's own JSON rather than on a META line. Same two validators.
     CH_MSG_BRANCH=""; CH_MSG_COMMIT=""
@@ -2890,9 +2984,13 @@ channel_handoff_json() {
     if valid_commit "$v"; then CH_MSG_COMMIT="$v"; fi
     channel_host_check "$repo"
     if [ "$peek" -eq 1 ]; then state="unread"; else state="read"; fi
-    printf '{"id":%s,"box":%s,"instance":%s,"untrusted":%s,"state":%s,"host_check":{"branch":%s,"head":%s,"host_head":%s,"commits_after":%s}}\n' \
+    # `untrusted` first, for channel_render_json's reason: every host key after it
+    # wins a duplicate, and the clamp has already refused a blob that would make
+    # its keys siblings instead of duplicates.
+    printf '{"untrusted":%s,"id":%s,"box":%s,"instance":%s,"state":%s,"host_check":{"branch":%s,"head":%s,"host_head":%s,"commits_after":%s}}\n' \
+        "$untrusted" \
         "$(json_str "$id")" "$(json_str "${inst#agent-box-}")" "$(json_str "$inst")" \
-        "$untrusted" "$(json_str "$state")" \
+        "$(json_str "$state")" \
         "$(json_str "$CH_CHECK_BRANCH")" "$(json_str "$CH_CHECK_HEAD")" \
         "$(channel_json_or_null "$CH_CHECK_HOST_HEAD")" \
         "$( [ -n "$CH_CHECK_AFTER" ] && printf '%s' "$CH_CHECK_AFTER" || printf 'null' )"
@@ -2964,6 +3062,15 @@ cmd_request() {
     fi
     subject=$(host_clip "$subject" 120)
 
+    # This host's own record is checked BEFORE anything is published: a request
+    # that is live in the box while this side has no note of having sent it reads
+    # as `foreign` with nothing queued, and a verdict that was never recorded
+    # leaves the handoff it answered open. cmd_handoff makes the same check for
+    # the same reason.
+    sdir=$(channel_state_dir "$inst") || { rm -rf "$tmpd"; die "cannot use ${CHANNEL_STATE_DIR} for ${inst}"; }
+    { [ -d "$sdir" ] && [ -w "$sdir" ]; } \
+        || { rm -rf "$tmpd"; die "cannot use ${sdir} as this host's record for ${inst}; nothing was sent"; }
+
     channel_dir_or_die "$repo" create
     [ -n "$CH_TO_BOX" ] || { rm -rf "$tmpd"; die "could not create ${repo}/.agent-box/channel"; }
     tobox="$CH_TO_BOX"
@@ -3002,11 +3109,23 @@ cmd_request() {
     }
     rm -rf "$tmpd" 2>/dev/null || true
 
-    sdir=$(channel_state_dir "$inst") || die "cannot use ${CHANNEL_STATE_DIR} for ${inst}"
-    printf '%s|%s|%s|%s|%s\n' "$id" "${re:--}" "${verdict:--}" "$now" "$subject" >> "${sdir}/sent"
+    # The file is on the mount now, so a failure here is reported and not fatal:
+    # the box may already have taken the request, and a non-zero exit invites the
+    # operator to send it a second time. Each append is checked, because the
+    # alternative is bash's own redirect error naming an internal path — and
+    # because a silent failure here is what makes `channel` disagree with what
+    # the box has.
+    # `2>/dev/null` BEFORE the append, not after: redirections are performed left
+    # to right, so the other order still lets bash print its own message.
+    if ! printf '%s|%s|%s|%s|%s\n' "$id" "${re:--}" "${verdict:--}" "$now" "$subject" 2>/dev/null >> "${sdir}/sent"; then
+        info "WARNING: request ${id} is on the mount but could not be recorded in ${sdir}/sent; ${PROG} channel ${repo} will list it as 'foreign' until that is fixed"
+    fi
     if [ -n "$verdict" ]; then
-        printf '%s %s %s\n' "$re" "$verdict" "$now" >> "${sdir}/done"
-        channel_safe_create "${tohost}/${re}.done" ''
+        if printf '%s %s %s\n' "$re" "$verdict" "$now" 2>/dev/null >> "${sdir}/done"; then
+            channel_safe_create "${tohost}/${re}.done" ''
+        else
+            info "WARNING: request ${id} is on the mount but the verdict ${verdict} could not be recorded in ${sdir}/done; message ${re} stays open on this side"
+        fi
     fi
     channel_touch_host "$repo" "$inst" "request ${id}"
     backfill_instance_repo "$inst" "$repo"
