@@ -230,31 +230,45 @@ that come next: **may I stop this box, or delete it — and what would I lose?**
 ```
 BOX                            VM        FOOTPRINT  VERDICT    ACTION  BOX-ONLY  WHY
 agent-box-example              running   7.4G       active     keep    1.2G      a run is working
-agent-box-other                running   6.1G       attention  ask     412M      1 handoff from this box is unread
-agent-box-third                stopped   5.0G       spent      keep    0         nothing is only inside this box
-agent-box-fourth               stopped   4.2G       unknown    ask     ?         never triaged while running; start it to see
+agent-box-other                running   6.1G       attention  keep    411M      1 handoff from this box is unread
+agent-box-third                running   5.3G       idle       ask     0         a standing session is open; stopping the box would end it
+agent-box-fourth               stopped   5.0G       parked     ask     ? 09-18   the last reading found work only inside this box (09-18)
+agent-box-fifth                stopped   4.2G       spent      keep    0         nothing is only inside this box
+agent-box-sixth                stopped   3.8G       unknown    ask     ?         never triaged while running; start it to see
 ```
 
 - **VERDICT** is one of `active`, `waiting`, `attention`, `idle`, `parked`,
-  `spent` or `unknown`; **ACTION** is `keep`, `pause`, `remove` or `ask`. `ask`
-  is the honest answer when the box holds something only a person can judge —
-  an open standing session, an unread handoff, a queued request, commits on an
-  `agent/` branch that are on no remote.
+  `spent` or `unknown`; **ACTION** is `keep`, `pause`, `remove` or `ask`.
+- **ACTION is narrower than it looks, and deliberately so.** A running box is
+  asked about only when its verdict is `idle` and something a stop would end is
+  open: a standing session, or a request still queued for it. Anything more
+  urgent than `idle` — a working run, a lost run, leftovers, an unread handoff —
+  sets the verdict and the action stays `keep`, because the row has already told
+  you the thing you needed to know and stopping the box is not what it is asking
+  for. A stopped box is asked about when it is `parked` (the last reading found
+  work only inside it, or there are commits on `agent/` branches that are on no
+  remote) or `unknown` (nothing has ever read it). `pause` appears only for an
+  idle box while memory is scarce, and `remove` only for a `spent` box while
+  disk is scarce; neither is ever printed just because a box looks quiet.
 - **BOX-ONLY** is what exists only inside that box: run transcripts, the
   session's own state, repositories in the guest home, Docker volumes and
   images. That number is the reason `remove` is a considered answer rather than
   an obvious one. A stopped box still reports it, from a watermark `triage`
-  recorded the last time the box was running — and the row says `no-reading`
-  rather than `0` when there has never been one.
+  recorded the last time the box was running — the column is then `? 09-18` (the
+  watermark said yes, with its date) or `0` (it said no), never a byte figure,
+  and a plain `?` when there has never been a reading at all. In `--json` that
+  last case is the reason code `no-reading`; the text column only ever shows `?`.
 - **FOOTPRINT** is what the box costs on this Mac, measured from the instance
   directory, never from the configured disk size.
 
-Two scarcity lines can appear above the table, each printed with the numbers it
-came from: **disk**, when there is not enough free space to create another box
-of the largest size you already use; and **compute**, when the running VMs have
-been promised more memory than the Mac has. The second is about *commitment*,
-not measured residency — whether the hypervisor takes that memory up front or
-grows into it is not something this tool measures, and the line says so.
+One `scarce:` line closes the footer below the table, always, printed with the
+numbers it came from: `none`, `disk` (there is not enough free space to create
+another box of the largest size you already use), `compute` (the running VMs
+have been promised more memory than the Mac has) or `both`. `compute` is about
+*commitment*, not measured residency — whether the hypervisor takes that memory
+up front or grows into it is not something this tool measures, and the line says
+so in its own word, *promised*. A `note:` line follows it when this Mac's memory
+could not be read at all. Nothing is printed above the header row.
 
 There is no `--watch`. One pass over every box is cheap; a loop is a guest call
 per running box every few seconds, aimed at boxes you did not name — the same
@@ -547,10 +561,16 @@ Four things worth knowing before you rely on it:
   `dirty:` claim in a handoff is what you have, and it is behind the bar.
 - **It is disposable, and two guards keep it so.** A refresh refuses if the bench
   has modified tracked files, and refuses if it holds a commit the repository does
-  not — printing the exact `git fetch` command that moves that commit into a new
-  ref in the repository, never onto a checked-out branch. Untracked files are not
-  counted, because untracked files in a bench are the build; so something you
-  wrote by hand in there and never committed is not protected by `--remove`.
+  not — printing, rather than leaving you to reconstruct it, the exact command
+  that moves those commits back: a `git cherry-pick` of the bench's extra commits,
+  oldest first, run **in the mounted repository** and carrying the same three
+  protections every git command this tool prints carries (`--no-pager`,
+  `core.fsmonitor=false`, `core.hooksPath=/dev/null`). Read it before you paste
+  it: a cherry-pick applies onto whatever branch the repository is standing on
+  right now, so check that branch first — this does not put the commits somewhere
+  out of the way, and a conflict lands in your own working tree. Untracked files
+  are not counted, because untracked files in a bench are the build; so something
+  you wrote by hand in there and never committed is not protected by `--remove`.
 - **It is excluded from Time Machine**, for the same reason `~/.lima` is: it fills
   up with dependency trees that are rebuildable by definition.
 - **It runs code the box wrote, on the host, outside the VM.** That is the point

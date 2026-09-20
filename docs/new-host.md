@@ -492,9 +492,12 @@ agentbox triage ~/dev/<repo>
 ```
 
 The verdict is `keep`, `pause`, `remove` or `ask`, with what is only inside the box
-beside it. `ask` means a person has to judge — an unread handoff, a queued request,
-commits on an `agent/` branch that are on no remote. `pause` is the first command
-below, `remove` the second.
+beside it. `ask` means stopping or deleting would end something only a person can
+decide about — an open standing session or a queued request while the box runs;
+work found only inside it, or commits on an `agent/` branch that are on no remote,
+once it is stopped. An unread handoff raises the verdict and leaves the action at
+`keep`, so read the WHY column rather than the ACTION alone. `pause` is the first
+command below, `remove` the second.
 
 ```
 agentbox stop    ~/dev/<repo>       # keep the box, free the memory

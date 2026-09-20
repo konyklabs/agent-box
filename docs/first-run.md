@@ -314,9 +314,13 @@ Before you delete anything, ask what only that box holds:
 
 It answers `keep`, `pause`, `remove` or `ask`, and it prints what is only inside
 the box beside the verdict: run transcripts, the standing session's state,
-repositories in the guest home, Docker volumes. `ask` means something there needs
-a person's judgement — an unread handoff, a queued request, commits on an `agent/`
-branch that are on no remote. `pause` is `agentbox stop`; `remove` is the command
+repositories in the guest home, Docker volumes. `ask` means stopping or deleting
+the box would end something only a person can decide about — a standing session
+that is open, or a request still queued for it, while the box is running; work the
+last reading found only inside it, or commits on an `agent/` branch that are on no
+remote, once it is stopped. Other things worth knowing — an unread handoff among
+them — raise the verdict instead and leave the action at `keep`; the WHY column is
+the part that tells you. `pause` is `agentbox stop`; `remove` is the command
 below.
 
 ```

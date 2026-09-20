@@ -2183,6 +2183,12 @@ that installs a mixture of two versions. The three Python tools are pinned
 through hash-locked, universal requirement files compiled by `uv`, so the whole
 transitive set is fixed, not just the top-level name.
 
+Two things in the baseline are nonetheless not pinned, one by choice and one by
+upstream's arrangement. That is the next entry, and `guest/toolchain.pins` and
+`host/refresh-pins.sh` both point a reader at it by name.
+
+## Why Claude Code is the one version the box does not pin
+
 One tool is deliberately unpinned: Claude Code. `CLAUDE_CODE_VERSION="latest"` is
 written in the pins file as an explicit statement rather than an omission, because
 the CLI's currency is a feature and not a hazard, background self-update is
@@ -2521,9 +2527,15 @@ decision and it is not yet measured here.
 Disposability is the rule that makes the bench safe to delete, and two guards
 enforce it rather than trusting it. A refresh refuses if the bench has modified
 tracked files, and refuses if the bench holds a commit the repository does not —
-printing the exact `git fetch` line that moves that commit into a *new* ref in the
-repository, never onto a checked-out branch, and carrying the same three
-protections every printed git command carries. Untracked files are deliberately
+printing the exact line that moves those commits back rather than leaving the
+operator to re-type the fix or do surgery: a `git cherry-pick` of the bench's
+extra commits, oldest first, run **in the mounted repository** and carrying the
+same three protections every printed git command carries. That line is a
+convenience, not a guarantee, and the documentation is explicit about the half it
+cannot make safe: a cherry-pick applies onto whatever branch the repository is
+standing on when it is pasted, so the operator checks that branch first. The
+tool does not choose the branch for them — it knows which commits are stranded,
+not which branch they belong on. Untracked files are deliberately
 **not** counted: untracked files in a bench are the build, and counting them would
 refuse every refresh, which would defeat the purpose. The honest consequence is
 that something written by hand in the bench and never committed is not protected
