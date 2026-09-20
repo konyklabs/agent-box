@@ -4757,6 +4757,246 @@ fi
 # ---- end slot:8j2 ----
 
 # ---- slot:8j3 (owner S2) ----
+printf -- '\n--- (8j3) what a run left running is shown, attributed, and never trusted ---\n'
+#
+# A run that was hard-killed never swept, so its ledger is the only record of
+# what it started. These two runs are fabricated rather than driven: the case
+# under test is the ledger a dead run leaves behind, and a run that dies the way
+# this needs cannot also be asked to prove it died. Both ids are far in the past,
+# so neither can ever be the newest run another step asserts about, and both are
+# removed at the end of this block.
+LEFT_RUNID=20260104-000000
+UNSWEPT_RUNID=20260104-000001
+# A port inside the guest, where the host's forwarded ports mean nothing.
+# Derived from this run's pid like every other port here, never hardcoded.
+LEFT_PORT=$((FORWARD_PORT + 500))
+
+LEFT_BEFORE="${TMP_ROOT}/leftovers-before.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$LEFT_BEFORE" 2>&1
+printf 'leftovers before this block plants anything: %s\n' \
+    "$(jq -c '.boxes[0].leftovers' "$LEFT_BEFORE" 2>/dev/null)"
+if jq -e --arg p "tcp:${LEFT_PORT}" \
+      '.boxes[0].leftovers | type == "object" and (.procs | type == "number") and (.ports | index($p) | not)' \
+      "$LEFT_BEFORE" >/dev/null 2>&1; then
+    ok "the box reports a leftovers object that does not yet name the port this block binds"
+else
+    bad "there is no leftovers reading, or it already names tcp:${LEFT_PORT}; the checks below would be vacuous"
+fi
+
+LEFT_PLANT="${TMP_ROOT}/leftovers-plant.out"
+guest bash -l > "$LEFT_PLANT" 2>&1 <<SH
+set -u
+umask 077
+# setsid, so the listener belongs to no process group a run owns: this is the
+# escapee a sweep cannot reach and status therefore has to show.
+setsid python3 -m http.server ${LEFT_PORT} --bind 127.0.0.1 >/dev/null 2>&1 </dev/null &
+sleep 2
+p=\$(pgrep -f "http.server ${LEFT_PORT}" | head -1)
+echo "LISTENER_PID=\${p:-none}"
+d="\$HOME/.agent-box/runs/${LEFT_RUNID}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${LEFT_RUNID}","model":"sonnet","branch":null,"brief":"leftovers","started_at":"2026-01-04T00:00:00Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+# A run that observed three things, closed none of them and swept. The port's
+# detail carries a credential the way an agent's own command line could.
+{
+  printf '{"ts":"2026-01-04T00:00:00Z","phase":"baseline","kind":"port","value":"tcp:22","detail":null}\n'
+  printf '{"ts":"2026-01-04T00:01:00Z","phase":"observed","kind":"port","value":"tcp:%s","detail":"pid %s CLAUDE_CODE_OAUTH_TOKEN=%s"}\n' \
+      '${LEFT_PORT}' "\$p" '${FAKE_TOKEN}'
+  printf '{"ts":"2026-01-04T00:01:00Z","phase":"observed","kind":"proc","value":"%s","detail":"python3 -m http.server %s"}\n' \
+      "\$p" '${LEFT_PORT}'
+  printf '{"ts":"2026-01-04T00:02:00Z","phase":"survived","kind":"port","value":"tcp:%s","detail":"still bound after the sweep"}\n' \
+      '${LEFT_PORT}'
+  printf '{"ts":"2026-01-04T00:02:00Z","phase":"swept","kind":null,"value":null,"detail":null}\n'
+} > "\$d/owned.jsonl"
+chmod 600 "\$d/owned.jsonl"
+# The same shape without the sweep's closing line: a run that was hard-killed,
+# whose survivor count is unknown rather than zero.
+u="\$HOME/.agent-box/runs/${UNSWEPT_RUNID}"
+rm -rf "\$u"; mkdir -p "\$u"; chmod 700 "\$u"
+printf 'exit:lost\n' > "\$u/status"
+printf '{"runid":"${UNSWEPT_RUNID}","model":"sonnet","branch":null,"brief":"unswept","started_at":"2026-01-04T00:00:01Z","tmux":null,"max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$u/meta.json"
+printf '{"ts":"2026-01-04T00:00:02Z","phase":"observed","kind":"tmux","value":"abx-gone","detail":null}\n' > "\$u/owned.jsonl"
+chmod 600 "\$u/owned.jsonl"
+# The guest's own answer about the port, printed before anything is asserted.
+(exec 3<>/dev/tcp/127.0.0.1/${LEFT_PORT}) 2>/dev/null && echo "PORT_BOUND=yes" || echo "PORT_BOUND=no"
+SH
+cat "$LEFT_PLANT"
+if grep -q 'PORT_BOUND=yes' "$LEFT_PLANT" && grep -qE 'LISTENER_PID=[0-9]+' "$LEFT_PLANT"; then
+    ok "the fabricated run's listener is bound in the guest and has a pid, so the checks below are not vacuous"
+else
+    bad "the fabricated listener never came up; the leftovers checks below would prove nothing"
+fi
+
+LEFT_JSON="${TMP_ROOT}/leftovers.json"
+run_bounded 60 "$LEFT_JSON" "$AGENTBOX" leftovers "$CLEAN_REPO" --json
+cat "$LEFT_JSON"
+LEFT_TEXT="${TMP_ROOT}/leftovers.txt"
+run_bounded 60 "$LEFT_TEXT" "$AGENTBOX" leftovers "$CLEAN_REPO"
+cat "$LEFT_TEXT"
+if jq -e --arg r "$LEFT_RUNID" --arg p "tcp:${LEFT_PORT}" \
+      'map(select(.runid == $r and .value == $p)) | length == 1' "$LEFT_JSON" >/dev/null 2>&1; then
+    ok "leftovers --json names the surviving port and the run that left it"
+else
+    bad "leftovers --json did not name tcp:${LEFT_PORT} against run ${LEFT_RUNID}"
+fi
+if grep -q "$LEFT_RUNID" "$LEFT_TEXT" && grep -q "tcp:${LEFT_PORT}" "$LEFT_TEXT"; then
+    ok "the text table names the run and the port as well"
+else
+    bad "the text table did not name the run and the port"
+fi
+if grep -qF "$FAKE_TOKEN" "$LEFT_JSON" "$LEFT_TEXT" \
+   || grep -qF "$FAKE_HEAD" "$LEFT_JSON" "$LEFT_TEXT" \
+   || grep -qF "$FAKE_TAIL" "$LEFT_JSON" "$LEFT_TEXT"; then
+    bad "SECURITY: the credential in the ledger's detail reached the host"
+else
+    ok "the credential in the ledger's detail never reached the host, whole or in part"
+fi
+if grep -q 'redacted' "$LEFT_JSON"; then
+    ok "the credential was redacted rather than the row being dropped"
+else
+    bad "the credential-shaped detail was not redacted"
+fi
+
+LEFT_STATUS="${TMP_ROOT}/leftovers-status.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$LEFT_STATUS" 2>&1
+printf 'leftovers with the survivor up: %s\n' "$(jq -c '.boxes[0].leftovers' "$LEFT_STATUS" 2>/dev/null)"
+if jq -e --arg r "$LEFT_RUNID" --arg p "tcp:${LEFT_PORT}" \
+      '.boxes[0].leftovers | (.ports | index($p)) != null and (.runs | index($r)) != null
+       and .procs >= 1 and .truncated == false' \
+      "$LEFT_STATUS" >/dev/null 2>&1; then
+    ok "status --json folds the same rows: the port, the process and the run that left them"
+else
+    bad "status --json did not fold the survivor into leftovers"
+fi
+
+LEFT_RUNSJ="${TMP_ROOT}/leftovers-runs.json"
+"$AGENTBOX" runs "$CLEAN_REPO" --json > "$LEFT_RUNSJ" 2>&1
+jq -c --arg r "$LEFT_RUNID" --arg u "$UNSWEPT_RUNID" \
+    'map(select(.runid == $r or .runid == $u) | {runid, state, survivors})' "$LEFT_RUNSJ"
+if jq -e --arg r "$LEFT_RUNID" 'map(select(.runid == $r))[0].survivors >= 1' "$LEFT_RUNSJ" >/dev/null 2>&1; then
+    ok "runs --json counts the survivor against the run that swept and still left it"
+else
+    bad "runs --json did not count the survivor for run ${LEFT_RUNID}"
+fi
+if jq -e --arg u "$UNSWEPT_RUNID" \
+      'map(select(.runid == $u))[0] | has("survivors") and .survivors == null' \
+      "$LEFT_RUNSJ" >/dev/null 2>&1; then
+    ok "a run whose ledger has no sweep reports survivors as null, not as zero"
+else
+    bad "a run that never swept was reported as having left nothing"
+fi
+
+printf -- '\n--- (8j3) a hostile ledger row is capped and redacted, never executed ---\n'
+# The rows themselves are the untrusted part: `value` is a path or a name the
+# agent chose and `detail` is a command line it chose. This feeds the guest's own
+# reader the shapes an agent would plant. `detail` is DISPLAYED text by design —
+# "python3 -m http.server 5173" is the whole point of the field — so the
+# assertions are that nothing ran, that no credential crossed, and that no
+# terminal escape or unbounded path did; not that a payload's words are absent.
+rm -f "$PWN_MARKER"
+LEFT_HOSTILE="${TMP_ROOT}/leftovers-hostile.json"
+guest bash -l > "$LEFT_HOSTILE" 2>&1 <<SH
+set -u
+esc=\$(printf '\033]0;pwned\007')
+long="/work/\$(printf 'A%.0s' \$(seq 400))"
+jq -nc --arg d '${HOSTILE_STATE}' --arg t '${FAKE_TOKEN}' --arg e "\$esc" --arg l "\$long" \
+  '[{runid:"../../.ssh",kind:"port",value:\$t,detail:\$d,since:"not a time"},
+    {runid:"${LEFT_RUNID}",kind:"worktree",value:\$l,detail:\$e,since:"2026-01-04T00:00:00Z"},
+    {runid:"${LEFT_RUNID}",kind:"proc",value:"4127\nno leftovers",detail:null,since:null},
+    {runid:"${LEFT_RUNID}",kind:"tmux",value:"srv",detail:null,since:"2026-01-04T00:00:00Z"},
+    {runid:"${LEFT_RUNID}",kind:"tmux",value:"srv",detail:"a second row for the same pair",since:null}]' \
+  | python3 /opt/agent-box/guest/run-format.py --survivors-in --json
+SH
+cat "$LEFT_HOSTILE"
+if [ -e "$PWN_MARKER" ]; then
+    bad "SECURITY: a ledger row executed a command on the host"
+    rm -f "$PWN_MARKER"
+else
+    ok "no ledger row executed anything on the host"
+fi
+if jq -e . "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "the hostile rows still come back as parsable JSON"
+else
+    bad "a hostile ledger row broke the reader's output"
+fi
+if grep -qF "$FAKE_TOKEN" "$LEFT_HOSTILE" || grep -qF "$FAKE_HEAD" "$LEFT_HOSTILE" \
+   || grep -qF "$FAKE_TAIL" "$LEFT_HOSTILE"; then
+    bad "SECURITY: a credential-shaped row value reached the host"
+else
+    ok "the credential-shaped row value was redacted"
+fi
+if LC_ALL=C grep -q "$(printf '\033')" "$LEFT_HOSTILE"; then
+    bad "SECURITY: a terminal escape from a ledger row reached the host's terminal"
+else
+    ok "the terminal escape in a row's detail was stripped"
+fi
+if jq -e 'map(select(.kind == "worktree")) | length == 1 and (.[0].value | length) <= 200' \
+      "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "an unbounded worktree path is capped at 200 characters"
+else
+    bad "a row's value was not capped"
+fi
+if jq -e 'map(select(.runid == null)) | length == 1' "$LEFT_HOSTILE" >/dev/null 2>&1 \
+   && ! grep -q '\.ssh' "$LEFT_HOSTILE"; then
+    ok "a runid that is not a runid reads as unattributed and is not echoed"
+else
+    bad "a row carried a runid that is not a run id"
+fi
+if jq -e 'map(select(.kind == "tmux")) | length == 1' "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "two rows for one (kind, value) pair are folded into one"
+else
+    bad "the same pair was reported twice"
+fi
+if jq -e 'map(select(.since == null)) | length >= 1' "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "a timestamp that is not a timestamp reads as absent"
+else
+    bad "an unparsable timestamp was passed through"
+fi
+# `scrub` strips control characters but keeps \n on purpose (a newline is not a
+# terminal escape), and a path or a session name the agent chose may legally
+# contain one. Every displayed field is therefore collapsed to its first line.
+if jq -e '[.[] | .kind, .value, (.detail // "-"), (.runid // "-"), (.since // "-")]
+          | map(contains("\n")) | any | not' "$LEFT_HOSTILE" >/dev/null 2>&1; then
+    ok "no field of any row carries a newline the guest chose"
+else
+    bad "SECURITY: a newline from a ledger row reached a field the host prints"
+fi
+# The consequence of that newline, in the form an operator actually reads: the
+# five-column table. One row must never print a second line of its own — a
+# forged row, or a line that reads like `agentbox`'s own output.
+LEFT_FORGE="${TMP_ROOT}/leftovers-forged.txt"
+guest bash -l > "$LEFT_FORGE" 2>&1 <<SH
+set -u
+jq -nc '[{runid:"${LEFT_RUNID}",kind:"worktree",value:"/work/.wt/a\nno leftovers",detail:"branch x",since:null},
+         {runid:null,kind:"tmux",value:"srv\nagentbox: the box is clean",detail:null,since:null}]' \
+  | python3 /opt/agent-box/guest/run-format.py --survivors-in
+SH
+cat "$LEFT_FORGE"
+if [ "$(grep -c . "$LEFT_FORGE")" -eq 3 ] && ! grep -q '^no leftovers' "$LEFT_FORGE" \
+   && ! grep -q '^agentbox:' "$LEFT_FORGE"; then
+    ok "a newline inside a row's value cannot forge a line in the table"
+else
+    bad "SECURITY: a row's value printed a line of its own in the leftovers table"
+fi
+
+printf -- '\n--- (8j3) the survivor display is live, not sticky ---\n'
+guest bash -l > /dev/null 2>&1 <<SH
+p=\$(pgrep -f "http.server ${LEFT_PORT}" | head -1)
+case "\$p" in ''|*[!0-9]*) ;; *) kill -9 "\$p" 2>/dev/null ;; esac
+rm -rf "\$HOME/.agent-box/runs/${LEFT_RUNID}" "\$HOME/.agent-box/runs/${UNSWEPT_RUNID}"
+SH
+sleep 2
+LEFT_AFTER="${TMP_ROOT}/leftovers-after.json"
+"$AGENTBOX" status "$CLEAN_REPO" --json > "$LEFT_AFTER" 2>&1
+printf 'leftovers once the listener and the run records are gone: %s\n' \
+    "$(jq -c '.boxes[0].leftovers' "$LEFT_AFTER" 2>/dev/null)"
+if jq -e --arg p "tcp:${LEFT_PORT}" \
+      '.boxes[0].leftovers | (.ports | index($p) | not)' "$LEFT_AFTER" >/dev/null 2>&1; then
+    ok "the port is gone from leftovers once nothing is bound to it"
+else
+    bad "leftovers still names tcp:${LEFT_PORT} after the listener was killed"
+fi
 # ---- end slot:8j3 ----
 
 printf -- '\n--- no token fragment left this step ---\n'
