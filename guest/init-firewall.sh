@@ -96,6 +96,11 @@ read_egress_mode() {
             printf 'deny' ;;
     esac
 }
+
+# IFS is left alone deliberately: with IFS=$'\n\t', `log a b` would join its
+# arguments with a newline instead of a space.
+log() { printf '%s\n' "$*"; }
+
 # `--mode <m>` overrides the file for THIS run only, and nothing writes the
 # file. That is what makes `agentbox egress` transactional: the new mode is
 # applied and verified first, and the file is written only once it has held.
@@ -231,10 +236,6 @@ take_fw_lock() {
     flock -w "$secs" 9 || return 1
     return 0
 }
-
-# IFS is left alone deliberately: with IFS=$'\n\t', `log a b` would join its
-# arguments with a newline instead of a space.
-log() { printf '%s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Chain plumbing
