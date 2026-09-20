@@ -1000,17 +1000,25 @@ def _session_age(value):
 
 
 def _session_last_event(value):
-    """The two fields the contract names, and nothing that rode along beside."""
+    """The two fields the contract names, and nothing that rode along beside.
+
+    Scrubbed BEFORE it is cut, never after: hooks.jsonl is agent-writable, and a
+    credential that straddles the cut would otherwise be trimmed below the
+    redactor's 20-character floor and keep its leading characters. The whole
+    credential has to be there for the redactor to see it.
+    """
     if not isinstance(value, dict):
         return None
     ts = value.get("ts")
     event = value.get("event")
-    if not isinstance(ts, str) and not isinstance(event, str):
+    ts = first_line(scrub(ts), DETAIL_LIMIT) if isinstance(ts, str) else None
+    event = first_line(scrub(event), DETAIL_LIMIT) if isinstance(event, str) else None
+    # Two blank strings are no event at all, and they must read the same on the
+    # second pass as on the first: box-status.sh pipes `sessions --json` into
+    # --sessions, so every row goes through here twice per `status` refresh.
+    if ts is None and event is None:
         return None
-    return {
-        "ts": first_line(ts, DETAIL_LIMIT) if isinstance(ts, str) else None,
-        "event": first_line(event, DETAIL_LIMIT) if isinstance(event, str) else None,
-    }
+    return {"ts": ts, "event": event}
 
 
 def _session_produced(kind, value):
@@ -1042,7 +1050,18 @@ def _session_state(kind, runid, raw, mapped):
     the only two words it can say about itself.
     """
     if kind == "run":
-        return Run(runid).state if runid else "unknown"
+        if not runid:
+            return "unknown"
+        run = Run(runid)
+        # A regular file, or no answer. `sessions` is the one caller that reaches
+        # a run directory named by a TMUX SESSION rather than by all_runids(), so
+        # the directory need not exist and nothing filtered what is in it: the
+        # agent can put a FIFO or a device where the status goes, and the read
+        # would then block forever, with no timeout anywhere between here and the
+        # host's terminal. Nothing but a regular file is a status.
+        if not os.path.isfile(os.path.join(run.dir, "status")):
+            return "unknown"
+        return run.state
     if kind == "session":
         if raw == "running":
             return "running"
@@ -1050,8 +1069,11 @@ def _session_state(kind, runid, raw, mapped):
             return "ended"
         # No raw status in the row at all means this row has been through here
         # already: box-status.sh pipes `sessions --json` into --sessions, so the
-        # mapping runs twice over the same rows and must not undo itself.
-        if raw is None and mapped in SESSION_STATES:
+        # mapping runs twice over the same rows and must not undo itself. The
+        # type test is not decoration: `in` on a frozenset raises TypeError for
+        # an unhashable value, and one list from a future producer would turn a
+        # single bad row into a traceback instead of a row that says unknown.
+        if raw is None and isinstance(mapped, str) and mapped in SESSION_STATES:
             return mapped
         return "unknown"
     return "unknown"
@@ -1079,7 +1101,10 @@ def _clean_sessions(sessions):
         if not isinstance(item, dict):
             continue
         kind = item.get("kind")
-        if kind not in SESSION_KINDS:
+        # isinstance first: `in` on a frozenset hashes its argument, and a list
+        # or an object here would raise TypeError and lose the whole list --
+        # every key of the box's status object with it, on the --box-json path.
+        if not isinstance(kind, str) or kind not in SESSION_KINDS:
             kind = "other"
         runid = item.get("runid")
         if not (isinstance(runid, str) and RUNID_RE.match(runid)):

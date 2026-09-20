@@ -570,10 +570,17 @@ session_raw_state() {
 # `null` for every other kind of row, and always valid JSON, so --argjson
 # cannot lose the whole row to a missing meta.json (the last_event_json rule).
 session_produced_json() {
-    local name="${1:?}" runid out
+    local name="${1:?}" runid out dir
     runid=$(session_runid "$name")
     [ -n "$runid" ] || { printf 'null'; return 0; }
-    out=$(jq -cn --arg b "$(meta_field "$(abx_run_dir "$runid")" branch)" \
+    dir=$(abx_run_dir "$runid")
+    # A regular file, or the same answer a missing meta.json already gives. The
+    # run id here comes from a TMUX SESSION NAME, so nothing says the run
+    # directory exists or that meta.json is a file: a FIFO in its place would
+    # block jq, and with it `agentbox sessions` and every `status` that folds
+    # this box in. The same rule abx_status_read follows for the status.
+    [ -f "${dir}/meta.json" ] || { printf '{"branch":null}'; return 0; }
+    out=$(jq -cn --arg b "$(meta_field "$dir" branch)" \
         '{branch: (if $b == "" then null else $b end)}' 2>/dev/null) || out=""
     [ -n "$out" ] || out='null'
     printf '%s' "$out"
