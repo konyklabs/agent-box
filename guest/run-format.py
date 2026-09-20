@@ -29,6 +29,9 @@ Modes:
   run-format.py --survivors-in [--json]      format a leftovers list from stdin
   run-format.py --box-json ...               one JSON line describing this box
   run-format.py --box-text ...               the same, as one line of text
+  run-format.py --box-triage --triage-facts JSON
+                                             this box's triage verdict, and the
+                                             watermark line the host records
 """
 
 from __future__ import annotations
@@ -1898,13 +1901,379 @@ def cmd_box_text(args):
 # One finished verdict about this box, built in the guest because the verdict
 # needs the run state and the host is not allowed to parse guest bytes. The
 # host's own facts come in as arguments (`--triage-facts`), which is why nothing
-# here has to reach back to the host for anything. `cmd_box_triage` belongs to
-# the triage slice; the skeleton owns the name, the caps and the dispatch.
+# here has to reach back to the host for anything.
+#
+# `--triage-facts` is ONE JSON object, built by guest/box-triage.sh with `jq -n`
+# out of what it gathered in this box and what the host told it. Every value is
+# read through `_count` or `_word` below, so a gatherer that went wrong, a
+# missing command or a hostile string lands as `null` or is ignored rather than
+# reaching the output: this program prints to the operator's terminal, and one
+# box must never be able to spoil the report for the rest of the fleet.
+#
+# Two lines are printed, and the second one is the only thing the host reads
+# back out of this call:
+#
+#   1. the verdict object (or, with `text` set in the facts, the padded text
+#      fragment the host prints after its own three columns)
+#   2. `boxonly=yes|no bytes=<digits>` — the watermark, which the host validates
+#      by `case` and records against the instance so that a STOPPED box can
+#      still answer "is there work only in there". Nothing else crosses in a
+#      shape the host inspects.
+
+TRIAGE_VERDICTS = ("active", "waiting", "attention", "idle", "parked", "spent", "unknown")
+TRIAGE_ACTIONS = ("keep", "pause", "remove", "ask")
+
+# The closed set of reason codes, documented and asserted. A consumer may switch
+# on a code; `text` is display-only and capped. Every code below is a literal in
+# this file and nothing from the facts ever becomes one -- which is what makes
+# "only listed codes are emitted" a property rather than a hope.
+TRIAGE_CODES = (
+    "run-active",
+    "session-working",
+    "run-waiting",
+    "session-waiting",
+    "run-lost",
+    "leftovers",
+    "firewall-unknown",
+    "handoff-unread",
+    "session-open",
+    "request-queued",
+    "box-only-state",
+    "guest-repo",
+    "unexported-commits",
+    "dirty-tree",
+    "bench-stale",
+    "no-reading",
+    "repo-gone",
+    "not-git",
+    "box-silent",
+)
+
+# The vocabularies each fact is allowed to use. A word outside its set is not an
+# error to report, it is a fact nobody supplied.
+STANDING_STATES = ("working", "idle", "waiting", "gone")
+SCARCE_WORDS = ("none", "disk", "compute", "both")
+BENCH_WORDS = ("yes", "no", "stale")
+REPO_WORDS = ("ok", "missing", "not-git")
+FIREWALL_WORDS = ("deny", "observe", "open", "unknown")
+
+# run-ctl.sh's own vocabulary, which bin/agentbox:valid_run_state also accepts.
+_RUN_STATE_RE = re.compile(r"^(running|unknown|exit:(?:stopped|lost|waiting|[0-9]{1,6}))$")
+
+# At most six reasons, so a box with a lot wrong with it cannot flood a terminal
+# or a porthole header. The order they are collected in is their priority.
+MAX_REASONS = 6
+# A count larger than this is not a count, it is somebody's idea of a joke.
+COUNT_MAX = 10 ** 15
 
 
-def cmd_box_triage(_args):
-    print("run-format: the box triage is not built in this checkout", file=sys.stderr)
-    return 1
+def _count(value):
+    """A non-negative integer from one fact, or None. Never raises.
+
+    Every number in the facts object was produced by a `wc -l`, a `du -sk` or a
+    host argument, and each of those can be empty, a word, or absent. One
+    mis-shaped value must not stop the box being reported at all -- the same
+    rule the host applies to a guest number before arithmetic.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        number = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    if number < 0 or number > COUNT_MAX:
+        return None
+    return number
+
+
+def _word(value, allowed, default=None):
+    """One of `allowed`, or the default. A long or hostile string is not a word."""
+    return value if isinstance(value, str) and value in allowed else default
+
+
+def _human_bytes(number):
+    """A byte count as a short human string: the BOX-ONLY column's whole job."""
+    if number is None:
+        return "?"
+    for unit, size in (("G", 1024 ** 3), ("M", 1024 ** 2), ("K", 1024)):
+        if number >= size:
+            scaled = float(number) / size
+            return ("%.1f%s" % (scaled, unit)) if scaled < 10 else ("%d%s" % (scaled, unit))
+    return "%d" % number
+
+
+def _leftover_count(value):
+    """How many things earlier runs left running, from item 4's object or list.
+
+    Tolerant on purpose: the ledger reader is another slice's, its shape is
+    `{procs, ports[], worktrees[], tmux[], runs[], truncated}` for `status`, and
+    a list of rows is what a survivors call returns. Anything else is "nobody
+    answered", which is not the same as zero.
+    """
+    if isinstance(value, list):
+        return len(value)
+    if isinstance(value, dict):
+        total = 0
+        for key in ("procs", "ports", "worktrees", "tmux"):
+            item = value.get(key)
+            if isinstance(item, list):
+                total += len(item)
+            else:
+                number = _count(item)
+                if number is not None:
+                    total += number
+        return total
+    return None
+
+
+def _triage_facts(raw):
+    """The facts object, or None when it did not parse."""
+    try:
+        parsed = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _box_only_object(facts, as_of):
+    return {
+        "known": True,
+        "as_of": as_of,
+        "state_bytes": _count(facts.get("state_bytes")),
+        "claude_state_bytes": _count(facts.get("claude_state_bytes")),
+        "transcripts": _count(facts.get("transcripts")),
+        "docker_images": _count(facts.get("docker_images")),
+        "docker_volumes": _count(facts.get("docker_volumes")),
+        "guest_repos": _count(facts.get("guest_repos")),
+        "home_files": _count(facts.get("home_files")),
+    }
+
+
+def _box_only_categories(box_only):
+    """The categories a destroy would take, named, largest question first.
+
+    Naming them is the point. "Box-only" as one number is the answer that made
+    an operator destroy a box with a named volume in it; "2 docker volumes"
+    is the answer that does not.
+
+    Ordered by how irreplaceable the thing is, which is not how large it is: a
+    repository and a named volume first, then the loose files an agent wrote into
+    the home instead of the mount (a patch, a note -- nothing reproduces those),
+    then docker images and transcripts, which a rebuild and a re-run can replace.
+    """
+    named = []
+    for key, one, many in (
+        ("guest_repos", "git repository", "git repositories"),
+        ("docker_volumes", "docker volume", "docker volumes"),
+        ("home_files", "file in the box's home", "files in the box's home"),
+        ("docker_images", "docker image", "docker images"),
+        ("transcripts", "run transcript", "run transcripts"),
+    ):
+        number = box_only.get(key)
+        if number:
+            named.append("%d %s" % (number, one if number == 1 else many))
+    return named
+
+
+def _triage_reasons(facts, box_only):
+    """Every applicable reason, in priority order, and the verdict-bearing ones.
+
+    Returns (reasons, verdict). Reasons are additive -- an active box with
+    uncommitted work says both -- while the verdict comes from the first
+    verdict-bearing reason that applies, so precedence is visible here rather
+    than spread across branches.
+    """
+    reasons = []
+    verdict = None
+
+    run_state = facts.get("run_state")
+    run_state = run_state if isinstance(run_state, str) and _RUN_STATE_RE.match(run_state) else None
+    standing = _word(facts.get("standing"), STANDING_STATES)
+    firewall = _word(facts.get("firewall"), FIREWALL_WORDS, "unknown")
+    leftovers = _leftover_count(facts.get("leftovers"))
+    handoffs = _count(facts.get("handoffs_unread")) or 0
+    requests = _count(facts.get("requests_queued")) or 0
+    unexported = _count(facts.get("unexported_commits")) or 0
+    dirty = _count(facts.get("dirty_files")) or 0
+    bench = _word(facts.get("bench"), BENCH_WORDS)
+    repo = _word(facts.get("repo"), REPO_WORDS, "ok")
+
+    def add(code, text, gives=None):
+        nonlocal verdict
+        reasons.append({"code": code, "text": first_line(text, REASON_LIMIT)})
+        if gives and verdict is None:
+            verdict = gives
+
+    # Verdict-bearing, in priority order.
+    if run_state == "running":
+        add("run-active", "a run is working", "active")
+    if standing == "working":
+        add("session-working", "a standing session is working", "active")
+    if run_state == "exit:waiting":
+        add("run-waiting", "a run is waiting for an answer", "waiting")
+    if standing == "waiting":
+        add("session-waiting", "a standing session is waiting for an answer", "waiting")
+    if run_state == "exit:lost":
+        add("run-lost", "the newest run is lost; nobody knows how it ended", "attention")
+    if leftovers:
+        add(
+            "leftovers",
+            "%d thing%s an earlier run left running are still there"
+            % (leftovers, "" if leftovers == 1 else "s"),
+            "attention",
+        )
+    if firewall == "unknown":
+        add("firewall-unknown", "the firewall mode cannot be read in this box", "attention")
+    if handoffs:
+        add(
+            "handoff-unread",
+            "%d handoff%s from this box %s unread"
+            % (handoffs, "" if handoffs == 1 else "s", "is" if handoffs == 1 else "are"),
+            "attention",
+        )
+
+    # Not verdict-bearing: they change the ACTION, or they are simply worth
+    # saying. `session-open` is X3's: a stop ends a standing session, so a box
+    # with one open is asked about rather than paused.
+    if standing == "idle":
+        add("session-open", "a standing session is open; stopping the box would end it")
+    if requests:
+        add(
+            "request-queued",
+            "%d request%s queued for this box"
+            % (requests, " is" if requests == 1 else "s are"),
+        )
+    named = _box_only_categories(box_only)
+    if named:
+        add("box-only-state", "only inside this box: %s" % ", ".join(named))
+    repos = box_only.get("guest_repos")
+    if repos:
+        add(
+            "guest-repo",
+            "%d git repositor%s in the box's home %s on no host disk at all"
+            % (repos, "y" if repos == 1 else "ies", "is" if repos == 1 else "are"),
+        )
+    if unexported:
+        # NEVER "only inside the box": /work IS the host's repository directory,
+        # so these commits survive a destroy. They are a reason to finish the
+        # work, not a reason to keep a VM, and this is the one misunderstanding
+        # the command exists to prevent.
+        add(
+            "unexported-commits",
+            "%d commit%s on agent branches are on no remote"
+            % (unexported, "" if unexported == 1 else "s"),
+        )
+    if dirty:
+        add(
+            "dirty-tree",
+            "%d file%s in the working tree %s not committed"
+            % (dirty, "" if dirty == 1 else "s", "is" if dirty == 1 else "are"),
+        )
+    if bench == "stale":
+        add("bench-stale", "the bench is behind the branch this box is on")
+    if repo == "missing":
+        add("repo-gone", "the repository directory is not on the host any more")
+    elif repo == "not-git":
+        add("not-git", "the mounted directory is not a git repository")
+
+    return reasons[:MAX_REASONS], verdict
+
+
+def _triage_action(verdict, reasons, scarce):
+    if verdict != "idle":
+        return "keep"
+    codes = {reason["code"] for reason in reasons}
+    # A stop ends a standing session and loses what a queued request was for.
+    # Both are answered by asking, never by pausing behind the operator's back.
+    if "session-open" in codes or "request-queued" in codes:
+        return "ask"
+    if scarce in ("compute", "both"):
+        return "pause"
+    return "keep"
+
+
+def _triage_stand_in(text_mode):
+    """Every key present, saying the box did not answer. The host has the same
+    literal for the case where this program never ran at all."""
+    obj = {
+        "verdict": "unknown",
+        "action": "ask",
+        "reasons": [{"code": "box-silent", "text": "the box did not answer the triage call"}],
+        "box_only": {
+            "known": False,
+            "as_of": None,
+            "state_bytes": None,
+            "claude_state_bytes": None,
+            "transcripts": None,
+            "docker_images": None,
+            "docker_volumes": None,
+            "guest_repos": None,
+            "home_files": None,
+        },
+        "dirty_files": None,
+    }
+    if text_mode:
+        return "%-10s %-7s %-9s %s" % (
+            obj["verdict"],
+            obj["action"],
+            "?",
+            obj["reasons"][0]["text"],
+        )
+    return json.dumps(obj, separators=(",", ":"))
+
+
+def cmd_box_triage(args):
+    facts = _triage_facts(args.triage_facts)
+    # The mode travels inside the facts object rather than as a flag of its own:
+    # the argument list is the skeleton's, and the payload is this mode's.
+    text_mode = bool(facts.get("text")) if facts else False
+    if facts is None:
+        # The facts are this box's own, so unparsable facts mean the gatherer
+        # broke, not that somebody attacked the host. Either way the honest
+        # answer is the stand-in, with every key present, and no watermark: a
+        # reading that did not happen must not be recorded as one.
+        print(_triage_stand_in(text_mode))
+        print("run-format: the triage facts did not parse; reporting this box as silent",
+              file=sys.stderr)
+        return 0
+
+    as_of = facts.get("as_of")
+    as_of = as_of if isinstance(as_of, str) and parse_ts(as_of) else None
+    box_only = _box_only_object(facts, as_of)
+    reasons, verdict = _triage_reasons(facts, box_only)
+    verdict = verdict or "idle"
+    scarce = _word(facts.get("scarce"), SCARCE_WORDS, "none")
+    action = _triage_action(verdict, reasons, scarce)
+
+    categories = _box_only_categories(box_only)
+    bytes_total = (box_only["state_bytes"] or 0) + (box_only["claude_state_bytes"] or 0)
+
+    if text_mode:
+        why = reasons[0]["text"] if reasons else "nothing is only inside this box"
+        column = _human_bytes(bytes_total) if categories else "0"
+        print(scrub("%-10s %-7s %-9s %s" % (verdict, action, column, why)))
+    else:
+        obj = {
+            "verdict": verdict,
+            "action": action,
+            "reasons": reasons,
+            "box_only": box_only,
+            # The working tree's dirty count is a GUEST fact since the host may
+            # not run `git status` in a mounted repository (docs/decisions.md),
+            # so it is reported beside `box_only` rather than inside the host's
+            # `unexported` object where the shape once put it.
+            "dirty_files": _count(facts.get("dirty_files")),
+        }
+        print(json.dumps(scrub_obj(obj), separators=(",", ":")))
+
+    # The watermark. `yes` is by CATEGORY, not by byte count: ~/.agent-box and
+    # ~/.claude exist in every box and a box with no transcript, no repository, no
+    # loose file in its home and no docker volume holds no work, whatever it
+    # weighs. The byte count is the two state directories only, so a box whose one
+    # box-only thing is a loose file reads `yes` with a small number beside it --
+    # the categories are the claim, the bytes are only the size of the state dirs.
+    print("boxonly=%s bytes=%d" % ("yes" if categories else "no", bytes_total))
+    return 0
 
 
 def cmd_scrub_stdin(_args):
