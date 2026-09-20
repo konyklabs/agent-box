@@ -1915,10 +1915,17 @@ step "3i. the other half of the cheap suite: test/no-vm.sh"
 # this one's evidence for that one. It builds its own fixtures and passes its own
 # AGENT_BOX_CONFIG_DIR wherever it runs a whole command, so it neither reads nor
 # writes the hermetic config directory this run is using.
+#
+# EVERY line of it is prefixed, and that is not cosmetic. This transcript is read
+# as evidence, and the process for reading it is "judge the RESULT: line": an
+# unprefixed `RESULT: 102 passed, 0 failed` from the nested suite lands ABOVE this
+# run's own verdict, so the first `^RESULT:` in a transcript of a FAILED run would
+# say zero failures. One `^RESULT:` line per suite; the nested one is quoted by
+# the ok/bad below, which is what a nested verdict is for.
 NOVM_OUT="${TMP_ROOT}/no-vm.out"
 bash "${BOX_DIR}/test/no-vm.sh" > "$NOVM_OUT" 2>&1
 rc=$?
-cat "$NOVM_OUT"
+sed 's/^/no-vm| /' "$NOVM_OUT"
 if [ "$rc" -eq 0 ]; then
     ok "test/no-vm.sh passed ($(grep '^RESULT:' "$NOVM_OUT" | tail -1))"
 else

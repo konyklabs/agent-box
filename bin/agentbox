@@ -6012,13 +6012,29 @@ cmd_toolcheck() {
 # the version, so the commit is what this prints — and the working tree's state
 # with it, because a dirty checkout is a version nothing can reconstruct.
 #
-# `log` and `diff` are the two verbs repo_git forbids, and this is the one place
-# they are right: repo_git guards a repository MOUNTED INTO A BOX, whose
-# `.git/config` the agent can write. This checkout is mounted read-only, so no
-# box can name a program in it — the only writer is the operator. `--no-pager`
-# stays anyway: git starts a pager only when ITS OWN stdout is a terminal, both
-# values here are captured, and the flag is what keeps that true of the next
-# caller that prints one of them straight through instead.
+# `log` and `diff` are two of the verbs repo_git's contract excludes, so these
+# calls do not go through the helper — but they carry the same three protections
+# inline, because the assumption that would have excused leaving them off is
+# false. /opt/agent-box is this checkout mounted READ-ONLY, so nothing a box
+# writes there reaches it; `agentbox create <this checkout>` is refused nowhere,
+# and then this very directory is /work, `writable: true`, and the agent owns its
+# `.git/config`. MEASURED (git 2.55.0): with `core.fsmonitor` planted in such a
+# repository, `git --no-pager diff --quiet HEAD` RUNS it — on the host, as the
+# operator — and the same call with `-c core.fsmonitor=false` does not (`log -1`
+# alone does not either, but it is one flag away from a verb that would).
+# `--no-pager` closes `pager.<verb>`: git starts a pager only when ITS OWN stdout
+# is a terminal, both values here are captured, and the flag is what keeps that
+# true of the next caller that prints one of them straight through instead.
+#
+# What the flags do NOT close, because git has no switch that does: a
+# `filter.<x>.clean` in that config, bound by a `.gitattributes` in the tree,
+# runs under every probe that reads the WORKING TREE — `diff --quiet HEAD`,
+# `diff-index HEAD`, `diff-files` and `status` all trip it (measured; only
+# `diff-index --cached`, which cannot see an unstaged edit, stays quiet). Saying
+# `(clean)`/`(dirty)` at all means reading the working tree, so that one is named
+# and not hidden: closing it needs a decision about self-hosted boxes (refuse
+# `create` on this checkout, or skip the probe when it is inside a box's recorded
+# repo), which is a follow-up and not this command's to make.
 #
 # A tarball install must not die here, and must not answer with a neighbouring
 # repository's commit either: `.git` beside the script (a directory in a clone, a
@@ -6031,11 +6047,13 @@ cmd_version() {
 
     local commit="" state=""
     if command -v git >/dev/null 2>&1 && [ -e "${BOX_DIR}/.git" ]; then
-        commit=$(git --no-pager -C "$BOX_DIR" log -1 --format='%h %cs' 2>/dev/null) || commit=""
+        commit=$(git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+            -C "$BOX_DIR" log -1 --format='%h %cs' 2>/dev/null) || commit=""
         # HEAD, not a bare `diff`: a change that is staged and not committed is
         # as much a version nobody else has as an unstaged one.
         if [ -n "$commit" ]; then
-            if git --no-pager -C "$BOX_DIR" diff --quiet HEAD 2>/dev/null; then
+            if git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null \
+                -C "$BOX_DIR" diff --quiet HEAD 2>/dev/null; then
                 state="(clean)"
             else
                 state="(dirty)"
