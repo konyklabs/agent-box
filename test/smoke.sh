@@ -91,7 +91,8 @@ PASS=0
 FAIL=0
 # Advisory. Counted and printed, never fatal, and deliberately a third category
 # rather than a quiet pass: a check that is allowed not to hold still has to say
-# when it did not. Exactly one check uses it — see cdn.playwright.dev below.
+# when it did not. Two checks use it — cdn.playwright.dev below, and the `::1`
+# listener in step 3f, which a host with no IPv6 loopback cannot plant.
 WARN=0
 
 hr()   { printf '%s\n' '==============================================================='; }
@@ -828,6 +829,131 @@ if jq -e '.ports[0].host.pid | type == "number"' "$PF_PORTS_JSON" >/dev/null 2>&
 else
     bad "the holder's pid is not a number"
 fi
+
+printf -- '\n--- a port held on an address a forward does not use ---\n'
+# The other half of "is this port free", and the half an address-blind probe gets
+# wrong: a forward binds 127.0.0.1 and nothing else (lima's own template
+# documents hostIP's default as that), so a listener on `::1` — what a dev server
+# that resolves `localhost` and binds the first answer gets on a Mac — holds the
+# port for `localhost` and leaves the forward perfectly bindable. Refusing there
+# refuses a box that would have worked, and `create` has no escape flag.
+#
+# MEASURED, one python listener per case, each time asking whether a second
+# process can still bind 127.0.0.1: `127.0.0.1`, `0.0.0.0` and a dual-stack `::`
+# take it with them (EADDRINUSE), `::1` and a v6-only `::` do not.
+V6_PORT=$((PROBE_PORT + 1))
+_t=0
+while [ "$_t" -lt 40 ] && ! host_port_free "$V6_PORT"; do
+    V6_PORT=$((V6_PORT + 1))
+    [ "$V6_PORT" -le 27999 ] || V6_PORT=20000
+    _t=$((_t + 1))
+done
+unset _t
+"$PY" -m http.server "$V6_PORT" --bind ::1 >/dev/null 2>&1 &
+V6_LISTENER_PID=$!
+SMOKE_BG_PIDS+=("$V6_LISTENER_PID")
+_t=0
+while [ "$_t" -lt 15 ]; do
+    [ -z "$(lsof -nP -iTCP:"$V6_PORT" -sTCP:LISTEN -t 2>/dev/null)" ] || break
+    sleep 1; _t=$((_t + 1))
+done
+unset _t
+V6_LSOF=$(lsof -nP -iTCP:"$V6_PORT" -sTCP:LISTEN -F pcn 2>/dev/null)
+printf '%s\n' "$V6_LSOF"
+# Two vacuity guards, in opposite directions: the port has to be held on `::1`
+# where lsof can see it, and 127.0.0.1 has to still be bindable beside it. A host
+# with no `::1` on its loopback cannot show this at all, and says so rather than
+# passing quietly.
+if printf '%s' "$V6_LSOF" | grep -qF "[::1]:${V6_PORT}" \
+    && "$PY" -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1)
+" "$V6_PORT" 2>/dev/null; then
+    ok "port ${V6_PORT} is held on [::1] where lsof can see it, and 127.0.0.1 is still bindable"
+
+    V6_REPO="${TMP_ROOT}/v6-${SMOKE_ID}"
+    V6_INSTANCE="agent-box-v6-${SMOKE_ID}"
+    mkdir -p "$V6_REPO"
+    git init -q "$V6_REPO"
+    printf 'A throwaway repository for the address-scope checks.\n' > "${V6_REPO}/hello.txt"
+    V6_CREATE_OUT="${TMP_ROOT}/v6-create.out"
+    run_bounded 120 "$V6_CREATE_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        "$AGENTBOX" create "$V6_REPO" --egress deny --forward "$V6_PORT"
+    cat "$V6_CREATE_OUT"
+    if grep -qE "host port ${V6_PORT} is already bound" "$V6_CREATE_OUT"; then
+        bad "create refused a forward Lima can bind: the probe read the port and not the address"
+    else
+        ok "create did not refuse a forward whose host address is free"
+    fi
+    if grep -qE "NOTE: host port ${V6_PORT} is held on \[::1\]" "$V6_CREATE_OUT"; then
+        ok "it said so in a NOTE naming the address, so 'localhost' answering elsewhere is not a mystery"
+    else
+        bad "create said nothing about the listener on the other address"
+    fi
+    # It got as far as building, which only the fake limactl refuses — the proof
+    # that the port check let it past rather than dying quietly somewhere else.
+    if grep -q 'create is not implemented' "$V6_CREATE_OUT"; then
+        ok "and it carried on to limactl, which is where the fake stops it"
+    else
+        bad "create stopped before limactl for some other reason"
+    fi
+
+    printf 'repo=%s\nforward=%s\n' "$V6_REPO" "$V6_PORT" \
+        > "${AGENT_BOX_CONFIG_DIR}/instances/${V6_INSTANCE}"
+    printf '%s|Stopped|%s|4|6GiB|40GiB|%s\n' "$V6_INSTANCE" "$V6_REPO" "${PF_DIR}/${V6_INSTANCE}" \
+        > "${PF_DIR}/instances"
+    V6_START_OUT="${TMP_ROOT}/v6-start.out"
+    run_bounded 120 "$V6_START_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        "$AGENTBOX" start "$V6_REPO"
+    tail -2 "$V6_START_OUT"
+    if grep -qE "host port ${V6_PORT}, which ${V6_INSTANCE} forwards, is held" "$V6_START_OUT"; then
+        bad "start refused a box whose forward Lima can bind"
+    else
+        ok "start did not refuse a box whose forward's host address is free"
+    fi
+    if grep -q 'start is not implemented' "$V6_START_OUT"; then
+        ok "start reached the start itself, which only the fake limactl refused"
+    else
+        bad "start did not reach limactl"
+    fi
+
+    printf '%s|Running|%s|4|6GiB|40GiB|%s\n' "$V6_INSTANCE" "$V6_REPO" "${PF_DIR}/${V6_INSTANCE}" \
+        > "${PF_DIR}/instances"
+    V6_SHELL="${TMP_ROOT}/v6-fake-shell"
+    printf '#!/usr/bin/env bash\nprintf "%s yes any\\n"\n' "$V6_PORT" > "$V6_SHELL"
+    chmod 755 "$V6_SHELL"
+    V6_PORTS_JSON="${TMP_ROOT}/v6-ports.json"
+    run_bounded 60 "$V6_PORTS_JSON" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        FAKE_LIMA_SHELL="$V6_SHELL" "$AGENTBOX" ports "$V6_INSTANCE" --json
+    cat "$V6_PORTS_JSON"
+    if jq -e '.ports[0].host.conflict == false and .ports[0].host.bound == false' "$V6_PORTS_JSON" >/dev/null 2>&1; then
+        ok "ports calls the host side of that forward free, not a conflict"
+    else
+        bad "ports marked a bindable forward as a conflict"
+    fi
+    if jq -e '.ports[0].host.held_elsewhere | test("\\[::1\\]")' "$V6_PORTS_JSON" >/dev/null 2>&1; then
+        ok "and it still names the other listener, in held_elsewhere"
+    else
+        bad "ports dropped the other listener instead of naming it"
+    fi
+    V6_PORTS_TXT="${TMP_ROOT}/v6-ports.txt"
+    run_bounded 60 "$V6_PORTS_TXT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        FAKE_LIMA_SHELL="$V6_SHELL" "$AGENTBOX" ports "$V6_INSTANCE"
+    cat "$V6_PORTS_TXT"
+    if grep -qE "free \(held on \[::1\]\)" "$V6_PORTS_TXT"; then
+        ok "the text HOST column reads free, with the other address in brackets"
+    else
+        bad "the text HOST column does not read free for a bindable forward"
+    fi
+    rm -f "${AGENT_BOX_CONFIG_DIR}/instances/${V6_INSTANCE}" "$V6_SHELL" \
+        "$V6_CREATE_OUT" "$V6_START_OUT" "$V6_PORTS_JSON" "$V6_PORTS_TXT"
+    rm -rf "$V6_REPO"
+else
+    adv "advisory: this host could not hold ${V6_PORT} on [::1] where lsof can see it, so the address-scope checks were skipped"
+fi
+kill "$V6_LISTENER_PID" 2>/dev/null || true
+wait "$V6_LISTENER_PID" 2>/dev/null || true
 
 printf -- '\n--- clean up what this step planted ---\n'
 # `wait` after the kill, not only the kill: without it the shell reports the job
