@@ -88,10 +88,17 @@ set -uo pipefail
 R="$2"; M="$3"
 rm -f "${M}"/RAN-*
 if [ -t 1 ]; then printf 'stdout: a terminal\n'; else printf 'stdout: not a terminal\n'; fi
-repo_git "$R" rev-parse --abbrev-ref HEAD >/dev/null
-repo_git "$R" rev-list --count HEAD >/dev/null
-repo_git "$R" symbolic-ref --short HEAD >/dev/null
-repo_git "$R" for-each-ref --format='%(refname:short)' refs/heads >/dev/null
+# Deliberately NOT redirected: git decides whether to page from its OWN
+# stdout's isatty(), so piping each call to /dev/null here would make every
+# call look like a non-terminal regardless of the pty this script runs under
+# (or does not), and the pty-based assertion below would pass whether or not
+# repo_git carries --no-pager. Real repo output is allowed to reach this
+# script's own stdout, same as vacuous.sh; the caller only greps for the
+# markers, never for the repository's text.
+repo_git "$R" rev-parse --abbrev-ref HEAD
+repo_git "$R" rev-list --count HEAD
+repo_git "$R" symbolic-ref --short HEAD
+repo_git "$R" for-each-ref --format='%(refname:short)' refs/heads
 if [ -n "$(ls -A "$M" 2>/dev/null)" ]; then ls "$M" | sed 's/^/RAN: /'; else printf 'nothing from the repository ran\n'; fi
 SH
     cat > "${rg}/vacuous.sh" <<'SH'
