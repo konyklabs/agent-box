@@ -973,6 +973,328 @@ fi
 # ---- end slot:3f ----
 
 # ---- slot:3g (owner H2) ----
+# ===========================================================================
+step "3g. bench: a host-side clone of the box's branch, and no VM in sight"
+# ===========================================================================
+#
+# `bench` works from the repository and from the host's own record, so the whole
+# command is testable before any box exists: this step never calls limactl and
+# never creates one. Its own repository, not $CLEAN_REPO — $CLEAN_REPO is mounted
+# into the box four steps from now, and a bench for it would outlive this step.
+#
+# TRAP, and the reason the path comparison below resolves both sides: $TMP_ROOT is
+# under /var/folders, and /var is a symlink to /private/var. `bench` reports the
+# path it was handed after abs_repo, the shell here has the unresolved one, and a
+# raw string comparison of the two fails while everything is correct.
+
+BENCH_REPO="${TMP_ROOT}/bench-${SMOKE_ID}"
+BENCH_BRANCH="agent/smoke-${SMOKE_ID}"
+BENCH_INSTANCE="agent-box-bench-${SMOKE_ID}"
+BENCH_PATH="${AGENT_BOX_CONFIG_DIR}/bench/${BENCH_INSTANCE}"
+BENCH_META="${AGENT_BOX_CONFIG_DIR}/instances/${BENCH_INSTANCE}"
+BENCH_OUT="${TMP_ROOT}/bench.out"
+mkdir -p "$BENCH_REPO"
+git init -q "$BENCH_REPO"
+git -C "$BENCH_REPO" config user.name  'smoke test'
+git -C "$BENCH_REPO" config user.email 'smoke@localhost'
+git -C "$BENCH_REPO" checkout -q -b "$BENCH_BRANCH"
+printf 'first\n'  > "${BENCH_REPO}/one.txt"
+git -C "$BENCH_REPO" add one.txt
+git -C "$BENCH_REPO" commit -q -m 'first commit'
+printf 'second\n' > "${BENCH_REPO}/two.txt"
+git -C "$BENCH_REPO" add two.txt
+git -C "$BENCH_REPO" commit -q -m 'second commit'
+
+"$AGENTBOX" bench "$BENCH_REPO" --json > "$BENCH_OUT" 2>"${BENCH_OUT}.err"
+bench_rc=$?
+cat "${BENCH_OUT}.err"
+cat "$BENCH_OUT"
+if [ "$bench_rc" -eq 0 ] && jq -e . "$BENCH_OUT" >/dev/null 2>&1; then
+    ok "bench --json created the bench and printed one JSON object and nothing else"
+else
+    bad "bench --json exited ${bench_rc} and its stdout is not a single JSON object"
+fi
+# Outside the repository, not merely elsewhere in it: a bench inside the mount
+# would be readable and writable by the agent, which is the one thing it is not.
+BENCH_REAL=$(cd "$BENCH_PATH" 2>/dev/null && pwd -P)
+REPO_REAL=$(cd "$BENCH_REPO" && pwd -P)
+case "${BENCH_REAL:-/nowhere}/" in
+    "${REPO_REAL}"/*) bad "the bench is inside the repository the box can see" ;;
+    *)                ok  "bench created a checkout outside the repository it came from" ;;
+esac
+# The branch and the commit the repository is on, read host-side with no guest.
+BENCH_HEAD=$(git -C "$BENCH_PATH" rev-parse HEAD 2>/dev/null)
+REPO_HEAD=$(git -C "$BENCH_REPO" rev-parse HEAD)
+BENCH_ON=$(git -C "$BENCH_PATH" symbolic-ref --quiet --short HEAD 2>/dev/null)
+if [ -n "$BENCH_HEAD" ] && [ "$BENCH_HEAD" = "$REPO_HEAD" ] && [ "$BENCH_ON" = "$BENCH_BRANCH" ]; then
+    ok "the bench is on the branch the repository is on, at the same commit"
+else
+    bad "the bench is on '${BENCH_ON}' at '${BENCH_HEAD}', not '${BENCH_BRANCH}' at '${REPO_HEAD}'"
+fi
+# This assertion encodes the clone-not-worktree decision. Without it a later
+# simplification to `git worktree add` passes every other check in this step —
+# and leaves a host path inside .git for the agent to read, and a second checkout
+# that git can prune from inside the mount.
+if [ ! -d "${BENCH_REPO}/.git/worktrees" ]; then
+    ok "git recorded no worktree inside the repository the box can see"
+else
+    bad "the repository now has .git/worktrees; the bench is not a clone"
+fi
+# --no-local, the other half of it: hardlinked objects are the same inodes as
+# files the guest can rewrite. A plain local clone gives link count 2.
+BENCH_OBJ=$(find "${BENCH_PATH}/.git/objects" -type f 2>/dev/null | head -1)
+if [ -z "$BENCH_OBJ" ]; then
+    bad "the bench has no object files at all, so the link-count check would be vacuous"
+else
+    BENCH_LINKS=$(stat -f %l "$BENCH_OBJ")
+    printf -- '--- %s has %s link(s) ---\n' "${BENCH_OBJ##*/}" "$BENCH_LINKS"
+    if [ "$BENCH_LINKS" = "1" ]; then
+        ok "the bench's object store is a copy, not hardlinks into the repository"
+    else
+        bad "a bench object file has ${BENCH_LINKS} links; the clone was not --no-local"
+    fi
+fi
+# Both bench keys in the host's record: that is what lets a bare box name and
+# destroy's hook find this directory later.
+if [ "$(grep -c '^bench=' "$BENCH_META" 2>/dev/null || true)" = "1" ] \
+   && [ "$(grep -c "^bench_branch=${BENCH_BRANCH}\$" "$BENCH_META" 2>/dev/null || true)" = "1" ]; then
+    ok "the host's record gained bench= and bench_branch="
+else
+    bad "the host's record does not carry both bench keys"
+    cat "$BENCH_META" 2>/dev/null || true
+fi
+
+# The brief's actual requirement: a build in the bench stays in the bench.
+mkdir -p "${BENCH_PATH}/node_modules"
+printf 'built on the host\n' > "${BENCH_PATH}/node_modules/marker"
+printf 'third\n' > "${BENCH_REPO}/three.txt"
+git -C "$BENCH_REPO" add three.txt
+git -C "$BENCH_REPO" commit -q -m 'third commit'
+"$AGENTBOX" bench "$BENCH_REPO" --json > "$BENCH_OUT" 2>"${BENCH_OUT}.err"
+bench_rc=$?
+cat "${BENCH_OUT}.err"
+cat "$BENCH_OUT"
+if [ ! -e "${BENCH_REPO}/node_modules" ]; then
+    ok "node_modules built in the bench did not appear in the repository"
+else
+    bad "node_modules leaked into the repository"
+fi
+BENCH_HEAD=$(git -C "$BENCH_PATH" rev-parse HEAD 2>/dev/null)
+REPO_HEAD=$(git -C "$BENCH_REPO" rev-parse HEAD)
+if [ "$bench_rc" -eq 0 ] && [ "$BENCH_HEAD" = "$REPO_HEAD" ] \
+   && [ -f "${BENCH_PATH}/node_modules/marker" ] \
+   && [ "$(jq -r '[.created, .refreshed, .advanced_by] | @tsv' "$BENCH_OUT" 2>/dev/null)" = "$(printf 'false\ttrue\t1')" ]; then
+    ok "a second bench call refreshed to the new commit and kept the build"
+else
+    bad "the refresh did not advance by one commit while keeping the build"
+fi
+
+# The listing, in both forms.
+"$AGENTBOX" bench --list > "${BENCH_OUT}.list" 2>&1
+cat "${BENCH_OUT}.list"
+"$AGENTBOX" bench --list --json > "${BENCH_OUT}.listjson" 2>&1
+cat "${BENCH_OUT}.listjson"
+if grep -qF "$BENCH_PATH" "${BENCH_OUT}.list" \
+   && [ "$(jq -r --arg b "$BENCH_PATH" '[.benches[] | select(.bench == $b)] | length' "${BENCH_OUT}.listjson" 2>/dev/null)" = "1" ]; then
+    ok "bench --list names this bench in both forms"
+else
+    bad "bench --list did not name this bench in both forms"
+fi
+
+# The bare box name. `repo=` is written by create and by the backfill at start,
+# neither of which has run here, so this plants the one line they would have
+# written — and then the record is the only place the repository can come from,
+# because bench never calls limactl.
+if grep -q '^repo=' "$BENCH_META" 2>/dev/null; then
+    bad "setup error: the record already carries repo=, so the bare-name path is not being tested"
+else
+    printf 'repo=%s\n' "$REPO_REAL" >> "$BENCH_META"
+    "$AGENTBOX" bench "bench-${SMOKE_ID}" > "${BENCH_OUT}.bare" 2>&1
+    bench_rc=$?
+    cat "${BENCH_OUT}.bare"
+    if [ "$bench_rc" -eq 0 ] && grep -qF "$BENCH_PATH" "${BENCH_OUT}.bare"; then
+        ok "a bare box name found its repository in the host's record"
+    else
+        bad "a bare box name did not resolve through the record (exit ${bench_rc})"
+    fi
+fi
+# And the box whose record has no repository: it must say what to pass instead of
+# handing git an empty repository name and an empty branch.
+"$AGENTBOX" bench "agent-box-norecord-${SMOKE_ID}" > "${BENCH_OUT}.norec" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.norec"
+if [ "$bench_rc" -ne 0 ] && grep -q 'no repository recorded' "${BENCH_OUT}.norec"; then
+    ok "a box with no recorded repository is told to pass the path"
+else
+    bad "a box with no recorded repository was not refused clearly (exit ${bench_rc})"
+fi
+
+# Neither guard may be crossed while somebody's work is on the wrong side of it.
+printf 'edited on the host\n' >> "${BENCH_PATH}/one.txt"
+"$AGENTBOX" bench "$BENCH_REPO" > "${BENCH_OUT}.dirty" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.dirty"
+"$AGENTBOX" bench "$BENCH_REPO" --remove > "${BENCH_OUT}.dirtyrm" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.dirtyrm"
+if [ "$bench_rc" -ne 0 ] && [ "$rm_rc" -ne 0 ] \
+   && grep -q '1 modified files' "${BENCH_OUT}.dirty" \
+   && grep -q '1 modified files' "${BENCH_OUT}.dirtyrm" \
+   && [ -d "$BENCH_PATH" ]; then
+    ok "bench refused both a refresh and a remove of a bench with modified files"
+else
+    bad "a bench with modified files was not protected (refresh ${bench_rc}, remove ${rm_rc})"
+fi
+git -C "$BENCH_PATH" checkout -q -- one.txt
+
+# A fix made IN the bench is the case the refusal exists for, and the refusal has
+# to carry the one command that gets it back — with the three protections any git
+# command run inside a mounted repository needs, because that is where the
+# cherry-pick half of it runs.
+printf 'fixed on the host\n' > "${BENCH_PATH}/fix.txt"
+git -C "$BENCH_PATH" add fix.txt
+git -C "$BENCH_PATH" -c user.name='smoke test' -c user.email='smoke@localhost' \
+    commit -q -m 'a fix made in the bench'
+"$AGENTBOX" bench "$BENCH_REPO" --remove > "${BENCH_OUT}.ahead" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.ahead"
+if [ "$rm_rc" -ne 0 ] && grep -q '1 commits that are not in' "${BENCH_OUT}.ahead" \
+   && grep -q 'cherry-pick' "${BENCH_OUT}.ahead" \
+   && grep -q -- '--no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null' "${BENCH_OUT}.ahead" \
+   && [ -d "$BENCH_PATH" ]; then
+    ok "a commit that exists only in the bench is refused, with the protected route back"
+else
+    bad "a bench-only commit was not protected, or the printed route lacks the protections"
+fi
+git -C "$BENCH_PATH" reset -q --hard "refs/remotes/origin/${BENCH_BRANCH}"
+
+# The same guard, for a branch the bench is NOT standing on. `checkout -B` resets
+# the REQUESTED branch, so a guard that measures only the branch HEAD is on lets a
+# local branch made in the bench be reset with no check: silently, exit 0, with
+# "already at" printed over it. `rm -rf` is the same gap — it takes every branch in
+# the directory at once. Both were measured that way before the guards existed.
+BENCH_OTHER="agent/other-${SMOKE_ID}"
+git -C "$BENCH_REPO" branch "$BENCH_OTHER"
+git -C "$BENCH_PATH" fetch -q --prune -- origin
+git -C "$BENCH_PATH" checkout -q -b "$BENCH_OTHER" "refs/remotes/origin/${BENCH_OTHER}"
+printf 'fixed on the host, on another branch\n' > "${BENCH_PATH}/fix-other.txt"
+git -C "$BENCH_PATH" add fix-other.txt
+git -C "$BENCH_PATH" -c user.name='smoke test' -c user.email='smoke@localhost' \
+    commit -q -m 'a fix made in the bench on a branch it is not standing on'
+BENCH_ONLY=$(git -C "$BENCH_PATH" rev-parse HEAD)
+git -C "$BENCH_PATH" checkout -q "$BENCH_BRANCH"
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_OTHER" > "${BENCH_OUT}.other" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.other"
+BENCH_OTHER_NOW=$(git -C "$BENCH_PATH" rev-parse "refs/heads/${BENCH_OTHER}" 2>/dev/null)
+printf -- '--- %s is at %s; the bench-only commit was %s ---\n' \
+    "$BENCH_OTHER" "${BENCH_OTHER_NOW:-gone}" "$BENCH_ONLY"
+if [ "$bench_rc" -ne 0 ] && [ "$BENCH_OTHER_NOW" = "$BENCH_ONLY" ] \
+   && grep -qF "commits on '${BENCH_OTHER}'" "${BENCH_OUT}.other" \
+   && grep -q -- '--no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null' "${BENCH_OUT}.other"; then
+    ok "a refresh to another branch refuses instead of resetting a commit only the bench has"
+else
+    bad "a refresh to ${BENCH_OTHER} did not protect ${BENCH_ONLY} (exit ${bench_rc})"
+fi
+# And --remove, from a bench whose own HEAD is on a clean branch: the guards are
+# about the directory `rm -rf` deletes, not about HEAD.
+"$AGENTBOX" bench "$BENCH_REPO" --remove > "${BENCH_OUT}.otherrm" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.otherrm"
+if [ "$rm_rc" -ne 0 ] && [ -d "$BENCH_PATH" ] \
+   && [ "$(git -C "$BENCH_PATH" rev-parse "refs/heads/${BENCH_OTHER}" 2>/dev/null)" = "$BENCH_ONLY" ]; then
+    ok "--remove refuses a bench whose only copy of a commit is on another branch"
+else
+    bad "--remove discarded ${BENCH_ONLY}, which nothing else had (exit ${rm_rc})"
+fi
+# The other half of that guard, or it would be a guard against the command: a
+# branch the bench is not standing on and holds nothing of its own on is still
+# switched to, and switched back from. Both directions, because a refusal of every
+# `--branch` that differs from HEAD's would pass the two checks above.
+git -C "$BENCH_PATH" branch -f "$BENCH_OTHER" "refs/remotes/origin/${BENCH_OTHER}"
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_OTHER" > "${BENCH_OUT}.switch" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.switch"
+BENCH_ON=$(git -C "$BENCH_PATH" symbolic-ref --quiet --short HEAD 2>/dev/null)
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_BRANCH" > "${BENCH_OUT}.switchback" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.switchback"
+BENCH_BACK=$(git -C "$BENCH_PATH" symbolic-ref --quiet --short HEAD 2>/dev/null)
+if [ "$bench_rc" -eq 0 ] && [ "$BENCH_ON" = "$BENCH_OTHER" ] \
+   && [ "$rm_rc" -eq 0 ] && [ "$BENCH_BACK" = "$BENCH_BRANCH" ]; then
+    ok "a branch the bench holds nothing of its own on is still switched to, and back"
+else
+    bad "a legitimate switch was blocked (to ${BENCH_OTHER}: ${bench_rc} on '${BENCH_ON}'; back: ${rm_rc} on '${BENCH_BACK}')"
+fi
+git -C "$BENCH_PATH" branch -D "$BENCH_OTHER" > /dev/null 2>&1
+git -C "$BENCH_REPO" branch -D "$BENCH_OTHER" > /dev/null 2>&1
+git -C "$BENCH_PATH" fetch -q --prune -- origin
+
+# The branch the bench is on, deleted in the repository. A refresh's fetch --prune
+# then takes origin/<branch> with it, and the bare `rev-list origin/<branch>..HEAD`
+# both guards are built on exits 128 — under `set -e` that is the whole command
+# gone with git's raw error, and a bench nobody can judge removed or kept by
+# accident. The raw command is run here so the refusal is not vacuous.
+git -C "$BENCH_REPO" checkout -q -b keep
+git -C "$BENCH_REPO" branch -D "$BENCH_BRANCH"
+"$AGENTBOX" bench "$BENCH_REPO" --branch keep > "${BENCH_OUT}.gone" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.gone"
+git -C "$BENCH_PATH" rev-list --count "refs/remotes/origin/${BENCH_BRANCH}..HEAD" \
+    > "${BENCH_OUT}.raw" 2>&1
+raw_rc=$?
+if [ "$raw_rc" -eq 0 ]; then
+    bad "the pruned ref is still readable, so the deleted-branch refusal is vacuous here"
+else
+    printf -- '--- the unguarded rev-list this refuses instead of running (exit %s) ---\n' "$raw_rc"
+    cat "${BENCH_OUT}.raw"
+    if [ "$bench_rc" -ne 0 ] && grep -qF "no origin/${BENCH_BRANCH}" "${BENCH_OUT}.gone" \
+       && [ -d "$BENCH_PATH" ]; then
+        ok "a bench whose branch is gone from the repository is refused, not reset"
+    else
+        bad "the deleted-branch case was not refused clearly (exit ${bench_rc})"
+    fi
+fi
+"$AGENTBOX" bench "$BENCH_REPO" --remove > "${BENCH_OUT}.gonerm" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.gonerm"
+if [ "$rm_rc" -ne 0 ] && [ -d "$BENCH_PATH" ]; then
+    ok "and --remove refuses it too, rather than guessing"
+else
+    bad "--remove removed a bench it could not judge (exit ${rm_rc})"
+fi
+
+"$AGENTBOX" bench "$BENCH_REPO" --remove --force > "${BENCH_OUT}.force" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.force"
+"$AGENTBOX" bench --list --json > "${BENCH_OUT}.listjson" 2>&1
+cat "${BENCH_OUT}.listjson"
+if [ "$rm_rc" -eq 0 ] && [ ! -e "$BENCH_PATH" ] \
+   && [ "$(jq -r --arg b "$BENCH_PATH" '[.benches[] | select(.bench == $b)] | length' "${BENCH_OUT}.listjson" 2>/dev/null)" = "0" ] \
+   && [ "$(grep -c '^bench=$' "$BENCH_META" 2>/dev/null || true)" = "1" ]; then
+    ok "bench --remove --force took the bench away and cleared the record"
+else
+    bad "--remove --force left the bench, the listing or the record behind (exit ${rm_rc})"
+fi
+
+# The one git verb the host must never run in a mounted repository, asserted
+# against the source rather than against behaviour: `status`, `diff` and `log -p`
+# run core.fsmonitor and clean filters, both of which the box writes. Comment
+# lines are dropped (this section explains itself at length) and the surviving
+# call sites must every one of them be the bench's own directory. `[$]` rather
+# than `\$` keeps the pattern a literal for grep and for shellcheck alike.
+grep -n 'git .*status' "$AGENTBOX" | grep -v ':[[:space:]]*#' > "${BENCH_OUT}.gitstatus"
+printf -- '--- git status call sites in %s ---\n' "${AGENTBOX##*/}"
+cat "${BENCH_OUT}.gitstatus"
+STATUS_SITES=$(grep -c '^' "${BENCH_OUT}.gitstatus" | tr -d ' ')
+STATUS_IN_BENCH=$(grep -c 'git -C "[$]bench" status' "${BENCH_OUT}.gitstatus" | tr -d ' ')
+if [ "${STATUS_SITES:-0}" -gt 0 ] && [ "$STATUS_SITES" = "$STATUS_IN_BENCH" ]; then
+    ok "every git status in the CLI runs inside the bench, which the host owns"
+else
+    bad "${STATUS_SITES} git status call sites, ${STATUS_IN_BENCH} of them in the bench"
+fi
+
+rm -rf "$BENCH_REPO" "$BENCH_META" "${BENCH_OUT}" "${BENCH_OUT}".*
 # ---- end slot:3g ----
 
 # ---- slot:3h (owner C2) ----
