@@ -32,6 +32,15 @@ Keep the mount and your day-to-day working copy separate for as long as the
 box exists. Pull the agent's branch across with `git fetch ~/dev/<repo>
 agent/<branch>` when you want it.
 
+**The host side of the same rule is the bench.** When you need to build and run
+the agent's branch yourself — which is what checking a handoff means —
+`agentbox bench ~/dev/<repo>` makes a clone outside the mount and checks that
+branch out there. Build in it, run the project's own CI command in it, and
+`~/dev/<repo>` never acquires a Linux `.venv` or a `node_modules` that the next
+run overwrites. It is disposable by design: it refuses to refresh over modified
+tracked files or over a commit the repository does not have, and it sees
+committed work only. See [daily-use.md](daily-use.md), "The bench".
+
 ## 2. Credentials live in the guest, not in the mount
 
 The box holds one credential by design, the model token. An application
@@ -109,7 +118,26 @@ write those three commands down in a `tests/README.md` (or a `Makefile` /
 file first; the brief points at it. The first refactor slice can be "make
 these commands true".
 
-Two rules that matter more in a box than on a laptop:
+**Make it the command CI runs, not an equivalent of it.** The box tells the agent
+this as a convention — run `mise run test`, `just check`, `make lint`, the npm
+script, exactly as the workflow invokes it — because a task runner usually wraps
+setup, environment and flags around the raw tool, so `ruff check .` can pass while
+`mise run lint` fails. The repository's part of that bargain is that the command
+exists and the workflow is readable: `actionlint` is in every box, and the agent is
+told to read the workflow file rather than reconstruct the command from it.
+
+**Pin your tools where the box can see it.** Every box carries the same baseline —
+`uv`, `ruff`, Node, `mise`, `trufflehog`, `actionlint`, `dprint`, `basedpyright`,
+`semgrep`, Playwright and Chromium — and `agentbox toolcheck <repo>` compares that
+baseline against what the repository itself asks for: `mise.toml` and its siblings,
+`.tool-versions`, `.python-version`, `.nvmrc`, `.node-version`, `pyproject.toml`,
+`uv.lock`, `package.json`, `package-lock.json`, and the setup actions in the
+workflow files. Exit 11 means the two differ, with `file:line` for each. The
+project wins, and the findings are printed above every brief — so a repository that
+pins its versions in one of those files gets a box that knows about it, and one that
+pins them only in prose does not.
+
+Two more rules that matter more in a box than on a laptop:
 
 - **Environments outside the tree.** `UV_PROJECT_ENVIRONMENT`, a venv under
   `~/.venvs`, `npm ci` inside the service directory only. The brief should
@@ -129,17 +157,34 @@ A server that must accept the Playwright browser but nothing else should bind
 `127.0.0.1`. If a service checks that its clients are loopback, keep that
 check; it is doing its job.
 
+Two consequences of that being fixed at create time. `create` **refuses** a host
+port something on the Mac already holds, naming the port and the process, because
+a forward Lima cannot bind is a forward that silently does not answer; the same
+check runs at `start`, since a port can be taken while a box is stopped. And when
+a forwarded page will not load, `agentbox ports <repo>` says which side is quiet —
+including the one real trap, a guest service bound to the guest's own interface
+address rather than to `127.0.0.1` or `0.0.0.0`, which is a working listener that
+no forward can reach.
+
+Chromium is in every box already, shared at `$PLAYWRIGHT_BROWSERS_PATH`, so the
+first test run downloads nothing. A repository that pins its own Playwright version
+still installs that version in its own environment; it only needs a download if it
+pins a version whose build is not the one the box has, which `toolcheck` tells you
+before a test run does.
+
 ## 6. Size the box for the monorepo
 
 A handful of services, a compose stack and a browser is not the default
 profile. Start at:
 
 ```
-agentbox create ~/dev/<repo> --docker --playwright --egress observe \
+agentbox create ~/dev/<repo> --docker --egress observe \
     --cpus 6 --memory 12GiB --disk 80GiB
 ```
 
-`resize` can change all three later; the disk only grows.
+`resize` can change all three later; the disk only grows. Without `--docker` the
+defaults are 4 CPUs, 6GiB and 40GiB — the disk default allows for the toolchain,
+which costs about 2.6 GiB of guest disk (measured on one Mac, 2026-09-20).
 
 ## 7. Write the brief before the run
 
@@ -159,6 +204,10 @@ live tier, and the stop conditions. A vague brief is guesswork in the VM.
 - [ ] Credentials staged for `~/app.env` in the guest, test-tier only.
 - [ ] Live hosts listed in `allowlist.local`, or the box is `observe` for the
       first run.
-- [ ] One command per tier written down in the repository.
+- [ ] One command per tier written down in the repository, and it is the command
+      CI runs rather than an equivalent of it.
+- [ ] Tool versions pinned in a file the box can read (`mise.toml`,
+      `.tool-versions`, `pyproject.toml`, `package.json`), not only in prose;
+      `agentbox toolcheck <repo>` then reports where they differ from the box's.
 - [ ] The brief names the mode, the tier commands, the cost of live, and the
       stop conditions.

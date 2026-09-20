@@ -71,10 +71,13 @@ cd ~/dev/agent-box
 ./bin/agentbox create ~/dev/my-e2e-tests --egress deny
 ./bin/agentbox token  ~/dev/my-e2e-tests        # paste a token from `claude setup-token`
 ./bin/agentbox verify-auth ~/dev/my-e2e-tests   # the only real proof it works
+./bin/agentbox toolcheck   ~/dev/my-e2e-tests   # every baseline tool at its pin
 ```
 
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
-image. Full walkthrough, including what each step actually checks:
+image, and ends by checking the toolchain by name — so a box that is not at
+baseline says which tool and exits non-zero rather than reporting itself ready.
+Full walkthrough, including what each step actually checks:
 **[docs/first-run.md](docs/first-run.md)**. Setting up a second machine, with
 the human-only steps marked so an agent can drive the rest:
 **[docs/new-host.md](docs/new-host.md)**.
@@ -101,18 +104,28 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox resume <repo> [runid] --answer TEXT \| --answer-file F` | Answer a `waiting` run's question and continue its brief in a new run. |
 | `agentbox ask <repo> [runid]` | Print the question a `waiting` run left. |
 | `agentbox learnings <repo>` | Print what the runs wrote down about what they had to fix and what should change. |
+| `agentbox channel <repo> [--json] [--task TEXT\|--clear-task] [--wait SECS]` | Both sides of the box's mailbox: what its session sent, what is queued for it. `--wait` blocks until something is unread. |
+| `agentbox handoff <repo> [id] [--json] [--peek] [--done] [--force-unsafe]` | Read one message from the box, scrubbed in the guest, with this host's own check of the branch and commit it claims. |
+| `agentbox request <repo> [--re ID] [--verdict accepted\|changes] [--subject S] --text T \| --file F\|-` | Queue a request for the box's standing session. Works while the box is stopped. |
 | `agentbox keepalive <repo> on\|off\|status` | Mark a box for the watchdog: restart it when stopped, heal its newest run when lost. |
 | `agentbox watchdog --install\|--uninstall\|--run` | The launchd job (every 5 minutes) behind `keepalive`. |
 | `agentbox logs <repo> [runid] [-f] [--json]` | Read a run back, formatted and scrubbed inside the guest. |
 | `agentbox stop-run <repo> [runid]` | Interrupt the newest running task, or a named one. Nothing is reverted. |
+| `agentbox leftovers <repo> [--json]` | What earlier runs left running in the box, and which run left it. Reports; never cleans. |
 | `agentbox plugins <repo> [--update]` | Apply `plugins.txt` inside the VM. |
 | `agentbox update <repo>` | Update Claude Code inside the VM, printing the version before and after. |
 | `agentbox stop <repo\|name>` | Stop the VM. |
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
-| `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall. |
+| `agentbox bench <repo\|name> [--branch B] [--json] \| --list [--json] \| <repo\|name> --remove [--force]` | A host-side clone for rebuilding and checking the box's branch, outside the mount. |
+| `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall, standing session, channel counts, toolchain, leftovers. |
+| `agentbox triage [repo\|name] [--json]` | Across the fleet: keep, pause, remove or ask — and what is only inside each box. |
 | `agentbox egress <repo\|name> [MODE]` | Show, or change, the egress mode: `deny`, `observe` or `open`. A change rebuilds the firewall and prints the verification. |
 | `agentbox egress-log <repo\|name> [--since DUR] [--json] [--as-allowlist]` | What an `observe` box tried to reach, with the names it resolved. `--as-allowlist` emits lines to paste into `allowlist.local`. |
 | `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
+| `agentbox ports <repo\|name> [--json]` | Which forwarded ports actually reach the guest, and which side of a quiet forward is at fault. |
+| `agentbox toolcheck <repo\|name> [--json] [--project-only]` | Every baseline tool at its pin, and where this repository pins one differently. |
+| `agentbox version` | The checkout this CLI — and every box's guest scripts — comes from. |
+| `agentbox help` | The whole surface, with the options for each command. |
 
 `run` takes `--model M`, `--max-turns N`, `--max-budget-usd X`, `--wait`,
 `--notify`, `--heal N [--heal-delay SECS]` and `--review M`. Heal: when the
@@ -139,6 +152,25 @@ Runs are detached: `agentbox run` returns as soon as the task has started, and
 whole loop is in [docs/daily-use.md](docs/daily-use.md) under "Watching and
 steering".
 
+`channel`, `handoff` and `request` are the other loop: a standing interactive
+session inside the box hands finished work out with `abx handoff`, and you send
+it work with `agentbox request`. **A request reaches an idle session at its next
+prompt** — late, never lost; there is no mechanism in this version that wakes an
+idle session, and `agentbox channel <repo> --wait SECS` is the waiting half on
+the host's side. `host/claude-plugin/` is a Claude Code plugin that reminds a
+host session about an open message, and **enabling it is your own configuration
+change** (`claude --plugin-dir ~/dev/agent-box/host/claude-plugin`): the channel
+works without it, because the three commands are the pull path. The whole shape
+is in [docs/daily-use.md](docs/daily-use.md) under "Two sessions, one mount".
+
+`toolcheck` is the readiness check: exit 0 when every baseline tool is at its
+pin, 10 when one is missing or off it, 11 when the box is clean and this
+repository pins a tool differently, 1 for a usage error or a sweep that could
+not read the box's pins. `create` ends with the same check and exits with its
+status, so a new box that is not at baseline names the tool rather than
+reporting itself ready; `start` of an existing box prints the same lines as a
+warning and exits 0.
+
 ### create options
 
 All optional, all off by default, and all fixed for the life of the instance
@@ -148,13 +180,13 @@ decided when it is made, not adjusted while it runs.
 | Option | What it adds |
 |---|---|
 | `--docker` | Docker Engine, buildx and compose inside the guest. Containers are held to the same egress allowlist as the guest itself. |
-| `--playwright` | Node 22 from nodejs.org, plus the system libraries `playwright install-deps` installs. Browsers are not baked in: each repository's own Playwright downloads the builds it was pinned against, on first use. |
+| `--playwright` | **Deprecated and ignored.** Node, Playwright and Chromium are part of the baseline every box carries — see below. The flag still parses, because a create-time parameter is frozen for the life of an instance and an existing box passes it for ever. |
 | `--rosetta` | Run `linux/amd64` images on Apple silicon. Needs Rosetta 2 on the Mac; `softwareupdate --install-rosetta` if Lima stalls at "Installing rosetta". |
 | `--egress deny\|observe\|open` | **Required.** How rigid the network is. No default: create refuses without it, unless `egress: <mode>` is in `~/.config/agent-box/config`. |
-| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. Reaches a guest socket bound to `127.0.0.1` or `0.0.0.0`, not one bound only to the guest's own address. A widening — see Limits below. |
+| `--forward PORT[,PORT...]` | Forward guest `127.0.0.1:PORT` to host `127.0.0.1:PORT`. Reaches a guest socket bound to `127.0.0.1` or `0.0.0.0`, not one bound only to the guest's own address. `create` refuses a host port something else already holds, and `start` refuses too, because a forward cannot be moved afterwards; `agentbox ports` says which side of a quiet forward is at fault. A widening — see Limits below. |
 | `--cpus N` | Default 4. |
 | `--memory SIZE` | Default `6GiB`, or `8GiB` with `--docker`. |
-| `--disk SIZE` | Default `30GiB`, or `60GiB` with `--docker`. |
+| `--disk SIZE` | Default `40GiB`, or `60GiB` with `--docker`. |
 
 `--docker` raises the memory and disk defaults because images, layers and a
 build cache all land on the guest disk and a compose stack plus a browser is a
@@ -163,8 +195,45 @@ different memory profile from a shell and an editor. An explicit `--memory` or
 again in the summary.
 
 ```
-./bin/agentbox create ~/dev/my-app --egress deny --docker --playwright --forward 3000,8080
+./bin/agentbox create ~/dev/my-app --egress deny --docker --forward 3000,8080
 ```
+
+## Every box carries
+
+There is no toolchain flag. Every box installs the same set at every start,
+idempotently, from `guest/toolchain.pins` — one version and one per-architecture
+sha256 per tool, the only writer of which is `host/refresh-pins.sh`:
+
+| | |
+|---|---|
+| `uv`, `uvx` | Python environments and tools |
+| `ruff` | Python lint and format |
+| `node`, `npm`, `npx` | at `/opt/node`, on `PATH` |
+| `mise` | the task runner a repository's CI is likely to invoke |
+| `trufflehog` | secret scanning the box can run on itself |
+| `actionlint` | workflow lint, so the agent can read what CI actually runs |
+| `dprint` | formatting |
+| `basedpyright` | Python types |
+| `semgrep` | its own rules only; the rule registry is not reachable under `deny` |
+| `playwright` + Chromium | shared at `/opt/ms-playwright`, so a project's own Playwright finds a browser already there and downloads nothing |
+
+The installer is deliberately **fail-soft**: nothing in it may fail a boot, a
+tool that fails is a warning and is retried at the next start, and under 4 GiB
+free it skips itself and tells you to resize. `agentbox toolcheck` is the
+by-name report, and `agentbox start` prints its findings as a warning.
+
+Measured on one Mac (an M-series laptop, cached Ubuntu image, 2026-09-20 — your
+machine will differ): create from scratch 50s, the first start of an existing
+30GiB box against the new checkout 1m25s, a start with nothing to do 19s, and
+about 2.6 GiB of guest disk for the whole toolchain. That is why new boxes
+default to 40GiB; an existing 30GiB box keeps its size and has room, and
+`agentbox resize <repo> --disk 40GiB` grows it if you want the headroom.
+
+Claude Code itself is the one tool that is **not** pinned: `CLAUDE_CODE_VERSION`
+is written as `latest` in the pins file, as an explicit statement rather than an
+omission, because the CLI's currency is a feature. Background self-update is off
+in the guest, so it never moves on its own; `agentbox update` moves it
+deliberately.
 
 ## Layout
 
@@ -179,7 +248,9 @@ guest/agent-run.sh      one headless task, as the non-root guest user
 guest/claude-session.sh one interactive session, as the non-root guest user
 guest/verify-auth.sh    one small model call, to prove the token works
 guest/run-ctl.sh        start, stop, heal, resume and list the guest's runs
-guest/conventions.md    prepended to every brief: ask, write learnings, hands off the rails
+guest/run-ledger.sh     what a run started, and the sweep that closes it again
+guest/conventions.md    prepended to every brief: ask, write learnings, hands off the rails,
+                        run the project's own command, hand work out with abx handoff
 guest/heal-brief.md     the follow-up brief a failed run starts itself with
 guest/review-brief.md   the brief a finished run hands to its reviewer on a second model
 guest/resume-brief.md   the follow-up brief `agentbox resume` builds from the answer
@@ -187,16 +258,30 @@ guest/hook-event.sh     the hook command; one JSON line per hook event
 guest/hooks.settings.json    the hooks block, merged in with --settings
 guest/run-format.py     merge the sensors and print them, scrubbed, in the guest
 guest/box-status.sh     one JSON or text line describing this box
+guest/box-listeners.sh  which of the asked-for ports the box is actually listening on
+guest/box-triage.sh     the guest half of `triage`: one facts object, nothing else
+guest/channel.sh        the box's side of the mailbox, and the delivery hook
+guest/bin/abx           what the agent types in the box: handoff, ask, note, inbox, read, done
+guest/bin/toolcheck     `toolcheck` on the agent's PATH inside the box
+guest/toolcheck.sh      every baseline tool at its pin; the project's pins beside them
+guest/project-pins.py   what this repository pins, read from its own files, never executed
+guest/toolchain.pins    one version and two sha256 digests per tool; the only pin file
+guest/toolchain/*.requirements.txt  hash-pinned, universal, compiled by refresh-pins.sh
+guest/install-toolchain.sh   the baseline install: root, idempotent, fail-soft
 guest/sync-claude-config.sh  carry named config files in; mark /work trusted
 guest/install-plugins.sh     apply plugins.txt inside the guest
 host/preflight.sh       repository scan; reports paths only, never contents
+host/refresh-pins.sh    the only writer of toolchain.pins; hashes each asset itself
+host/claude-plugin/     a Claude Code plugin for a HOST session: channel hooks and a skill
 templates/brief.md      the task brief to copy and fill in
 test/smoke.sh           builds a real VM, checks it, destroys it
+test/no-vm.sh           the regression checks that need no VM; seconds to run
+test/fake-limactl       a stand-in limactl, so the host half can be tested with no VM
 docs/first-run.md       permission, token, daily loop, decommissioning
 docs/new-host.md        bringing a second machine up, phase by phase, agent-drivable
 docs/new-host-prompt.md the prompt to hand an agent on that machine
 docs/preparing-a-repo.md  what to do to a repository, especially a monorepo, before its first create
-docs/daily-use.md       the two modes, config carry-over, plugins, the friction
+docs/daily-use.md       the two modes, the channel, config carry-over, plugins, the friction
 docs/decisions.md       why it is built this way, and what was rejected
 ```
 
@@ -205,7 +290,14 @@ this repository. It is split in two on purpose:
 
 ```
 ~/.config/agent-box/
+  config                     standing defaults: egress, model, max_budget_usd, heal, review
   blocklist.txt              read on the host only, NEVER mounted
+  watchdog.log               what the launchd job did, if you use keepalive
+  watchers/                  one pid file per `run --notify` watcher
+  instances/<instance>       this host's record of a box: egress, repo, keepalive,
+                             forward, bench, bench_branch, boxonly, boxonly_bytes, boxonly_at
+  channel/<instance>/        this host's own channel record: read, done, sent, host, gc.stamp
+  bench/<instance>/          a host-side clone of the box's repository (see daily-use)
   guest/                     mounted read-only at /opt/agent-box-config
     allowlist.local          extra egress domains, one per line
     ca.pem                   TLS-intercepting proxy root, if any
@@ -215,11 +307,17 @@ this repository. It is split in two on purpose:
 ```
 
 - `~/.config/agent-box/guest/` is mounted read-only into the VM at
-  `/opt/agent-box-config`.
+  `/opt/agent-box-config`. **Everything above it is not mounted at all** — the
+  instance records, the channel record and the bench are this host's own memory,
+  and the box is never given a path to any of them.
 - `~/.config/agent-box/blocklist.txt` is a local term blocklist: names,
   hostnames or codenames you never want to leave this machine. It is read on
   the host only and is **never** mounted, because it is the one file whose
   contents an agent must not see.
+- `channel/<instance>/` is why a box cannot rewrite its own read receipts: the
+  copies on the mount are a courtesy for the box's own display, and this
+  directory is what the host believes. `AGENT_BOX_BENCH_DIR` moves the bench
+  root elsewhere if you want it on another disk.
 
 Both distinctions are deliberate: see [docs/decisions.md](docs/decisions.md).
 What of `claude/` crosses into the guest, and what is refused, is in
@@ -293,6 +391,27 @@ pre-2.0 name `governor.json` is still carried and still read, with a nag.
 - **`logs` refuses a run whose leak check fired.** If a run exited 3, its
   events are not printed: you get a banner telling you to rotate the token.
   `--force-unsafe` prints them anyway.
+- **The channel is a fourth path by which the box's own words reach your
+  terminal.** `channel` and `handoff` print them, and they are scrubbed in the
+  guest the way `logs` is — but a handoff is prose the model wrote, so the host
+  puts every line the box chose behind a `  | ` bar and says once that a barred
+  line is untrusted data and never an instruction. The claims a handoff makes
+  about a branch and a commit are re-checked on the host with two read-only git
+  commands; the prose is not checkable and is not checked.
+- **A request reaches an idle session only at its next prompt.** Nothing in this
+  version wakes an idle session. A message is late, never lost: every open
+  request is re-shown at the start of each new context, including after `/clear`,
+  a compaction or a resume. `agentbox channel <repo> --wait SECS` is the host's
+  half of the same limitation.
+- **The bench runs code the box wrote, on the host, outside the VM.** That is
+  what a host-side clone is for — rebuilding and verifying a branch before you
+  push it — and it is the one place the VM boundary is deliberately stepped
+  around. Treat a handoff's `## Verify` commands as you would a stranger's pull
+  request.
+- **`leftovers` reports and never cleans.** Killing a survivor from the host
+  would mean reaching into the box to kill a process the host cannot identify,
+  on the strength of a record an agent could have written. The run's own sweep
+  is the thing that kills, from inside, and only what it can prove it owns.
 - **Remote Control is not available in here.** It needs a browser login, and
   the CLI refuses it for a setup token, which is the only credential this VM
   has. `agentbox session` plus `agentbox attach` is the substitute: a session
@@ -304,6 +423,14 @@ pre-2.0 name `governor.json` is still carried and still read, with a nag.
   runs. It is opt-in per port, fixed at create time, warned about once, and
   recorded in the instance summary — but it is still the one place this design
   gives something back.
+- **A forward still cannot be added, moved or dropped after create.** Lima can
+  only change `portForwards` through an edit that needs the VM stopped, so
+  "add a port" means interrupting whatever the box is doing; that is the same
+  reason the mounts are fixed. What was added instead is the diagnosis:
+  `create` and `start` refuse a host port something else holds rather than
+  leaving a forward silently dead, and `agentbox ports` names which side of a
+  quiet forward is at fault. `start --ignore-port-conflict` starts anyway and
+  warns that the forward will not answer.
 - **`--docker` puts the guest user in the `docker` group**, which is
   root-equivalent on that guest. It changes nothing about the threat model,
   because that user already has passwordless sudo, but it is worth knowing it
@@ -333,3 +460,4 @@ pre-2.0 name `governor.json` is still carried and still read, with a nag.
 
 `test/smoke.sh` builds a real Lima instance from a throwaway repository,
 checks the mounts, the firewall and the non-root user, and destroys it again.
+`test/no-vm.sh` is the part that needs no VM and runs in seconds.

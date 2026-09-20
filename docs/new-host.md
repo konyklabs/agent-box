@@ -103,8 +103,13 @@ uv tool install git+https://github.com/konyklabs/porthole
 limactl --version           # 2.x
 gitleaks version            # 8.x
 agentbox 2>&1 | head -3     # usage text, not "command not found"
+agentbox version            # the checkout's commit, its date, clean or dirty
 porthole --version          # v0.x
 ```
+
+Record `agentbox version` in the local note (phase 10): the same checkout is
+mounted read-only into every box, so its commit is the version of the guest
+scripts as much as of the CLI.
 
 ## 4. Host configuration directory
 
@@ -115,6 +120,13 @@ mkdir -p ~/.config/agent-box/guest/claude ~/.config/agent-box/guest/plugin-dir
 touch ~/.config/agent-box/guest/allowlist.local
 printf 'egress: deny\n' > ~/.config/agent-box/config
 ```
+
+Only `guest/` is mounted into a VM. The commands create four more things in the
+parent directory as they go and none of them is yours to edit or is ever mounted:
+`instances/<instance>` (what this host recorded about a box), `channel/<instance>/`
+(this host's own record of the messages it read and sent), `bench/<instance>/` (a
+host-side clone of a box's repository, once something asks for one) and
+`watchers/`. The whole tree is in `docs/daily-use.md`, "Host configuration layout".
 
 Then the four files, in this order.
 
@@ -212,23 +224,30 @@ echo "exit $?"
 Exit 0 continues. Exit 1 lists paths; fix or exclude them and re-run. Do not
 create a box against a repository that fails preflight.
 
-Create, with the profile the tests need. For a browser-tested application
-stack that is Docker plus Playwright; leave either off if the repository does
-not use it, because the profile is fixed for the life of the box:
+Create, with the profile the tests need. `--docker` is the only profile flag that
+still does anything — Node, Playwright and a browser are part of every box now —
+and it is fixed for the life of the instance:
 
 ```
-agentbox create ~/dev/<repo> --docker --playwright --egress deny
+agentbox create ~/dev/<repo> --docker --egress deny
 ```
+
+`--playwright` still parses and is ignored; there is no harm in a script that
+still passes it, because a create-time parameter is frozen for a box's life.
 
 Add `--forward 3000` (or whichever port) only if a person wants to open the app
 in a browser on the Mac. It is the one widening in the design and it is fixed
-at create time.
+at create time. If something on the Mac already holds that port, `create` refuses
+and names the port and the process — free the port and run it again.
 
 What to expect: preflight runs again, the effective sizing is printed
-(defaults with `--docker`: 4 CPUs, 8GiB, 60GiB), the egress mode is printed with
-where it came from, then Lima downloads the Ubuntu image (several minutes, once
-per host) and provisions. First boot installs Docker, Node 22, the Playwright
-system libraries and the plugins from `plugins.txt`. A summary follows.
+(defaults with `--docker`: 4 CPUs, 8GiB, 60GiB; without it, 4 CPUs, 6GiB, 40GiB),
+the egress mode is printed with where it came from, then Lima downloads the Ubuntu
+image (several minutes, once per host) and provisions. First boot installs Docker
+if it was asked for, the plugins from `plugins.txt`, and the box's toolchain —
+under the firewall it has just built, so the create is itself the proof that the
+allowlist admits what the box needs (about 2.6 GiB of guest disk; measured on one
+Mac, 2026-09-20). A summary follows, and then the by-name toolchain check.
 
 Where it can stop, and what that means:
 
@@ -239,14 +258,22 @@ Where it can stop, and what that means:
 - Boot completes but the plugin step says the marketplace was unreachable:
   the VM is fine and has no plugins yet. Continue to phase 7 and run
   `agentbox plugins ~/dev/<repo>` after the firewall check passes.
+- **`create` ends with `NOT READY: <tool> …` and a non-zero exit**: the box
+  exists and is usable, and a tool is missing or off its pin. Not a reason to
+  destroy it. Report the lines verbatim; `agentbox start` retries the install,
+  and `agentbox toolcheck` is the report.
 
 **Check:**
 
 ```
 agentbox status
+agentbox toolcheck ~/dev/<repo>; echo "exit $?"
 ```
 
-One line for the new box, `running`, `fw=deny`, a Claude Code version, `runs=0`.
+One line for the new box, `running`, `fw=deny`, a Claude Code version, `runs=0`,
+and `tools=ok`; then `exit 0` from `toolcheck`. `create`'s own exit status says
+the same thing at the moment it finishes — note it, since a shell that runs
+another command loses it.
 
 ## 6. The token — human, in a separate terminal
 
@@ -294,8 +321,29 @@ shell in `/work`; from there `curl -sS -o /dev/null -w '%{http_code}\n'
 https://<a staging host>` should return a status code, not a connection
 refused. Type the host name in that shell; do not put it in a report.
 
-**Check:** verify-auth `pass`, firewall-check all `PASS` or `SKIP`, one staging
-host reachable if the allowlist names one.
+Then the box's own tools, which is a different question from its credential:
+
+```
+agentbox toolcheck ~/dev/<repo>
+echo "exit $?"
+```
+
+Exit 0 is baseline. Exit 10 names the tools that are missing or off their pin —
+report them; the next `agentbox start` retries the install. Exit 11 means the box
+is at baseline and **this repository pins something differently**, printed with
+`file:line`; that is information for whoever writes the brief, not a failure. If a
+forward was asked for:
+
+```
+agentbox ports ~/dev/<repo>
+```
+
+Every forwarded port should read `yes` under REACHES once something in the box is
+listening on it, and the table names which side is quiet when one does not.
+
+**Check:** verify-auth `pass`, firewall-check all `PASS` or `SKIP`, toolcheck
+exit 0 (or 11 with the project's own pins named), one staging host reachable if
+the allowlist names one.
 
 ## 7b. The application's credentials, into the guest
 
@@ -390,7 +438,7 @@ refreshes the set if it does not.
 When nobody can say what the tests talk to, do not guess an allowlist:
 
 ```
-agentbox create ~/dev/<repo> --docker --playwright --egress observe
+agentbox create ~/dev/<repo> --docker --egress observe
 # token, verify-auth, firewall-check as above; then run the suite for a day
 agentbox egress-log ~/dev/<repo> --since 24h
 agentbox egress-log ~/dev/<repo> --since 24h --as-allowlist >> ~/.config/agent-box/guest/allowlist.local
@@ -415,7 +463,7 @@ switch every service reads, the live tier's cost stated at the top of its
 README, and a box sized for several services:
 
 ```
-agentbox create ~/dev/<monorepo> --docker --playwright --egress observe \
+agentbox create ~/dev/<monorepo> --docker --egress observe \
     --cpus 6 --memory 12GiB --disk 80GiB
 ```
 
@@ -437,6 +485,17 @@ names removed.
 
 ## 11. Stop, rotate, decommission
 
+Ask first what only that box holds:
+
+```
+agentbox triage ~/dev/<repo>
+```
+
+The verdict is `keep`, `pause`, `remove` or `ask`, with what is only inside the box
+beside it. `ask` means a person has to judge — an unread handoff, a queued request,
+commits on an `agent/` branch that are on no remote. `pause` is the first command
+below, `remove` the second.
+
 ```
 agentbox stop    ~/dev/<repo>       # keep the box, free the memory
 agentbox destroy ~/dev/<repo>       # delete the VM, its disk and the token file
@@ -453,10 +512,15 @@ case run `agentbox token` on each.
 |---|---|---|
 | 2 | `sysctl kern.hv_support` | `1` |
 | 3 | `agentbox`, `porthole --version` | usage text; a version |
+| 3 | `agentbox version` | a commit, a date, `(clean)` |
 | 4 | `ls ~/.config/agent-box` | `blocklist.txt` mode 600 in the parent, nothing named blocklist under `guest/` |
 | 5 | `agentbox preflight` | exit 0 |
-| 5 | `agentbox status` | `running`, `fw=deny`, `runs=0` |
+| 5 | `agentbox create` | exit 0; exit 10 with `NOT READY:` lines is a usable box that is not at baseline |
+| 5 | `agentbox status` | `running`, `fw=deny`, `runs=0`, `tools=ok` |
 | 7 | `agentbox verify-auth` | `pass` and a reply |
 | 7 | `agentbox firewall-check` | all `PASS`; container lines `PASS` after `docker pull alpine:3` |
+| 7 | `agentbox toolcheck` | exit 0; exit 11 names the repository's own pins and is information, not a failure |
+| 7 | `agentbox ports` (only with `--forward`) | each forwarded port `yes`, or a named reason |
 | 7b | `sh -c 'set -a; . ~/app.env'` in the guest | `sourced ok` |
 | 8 | `agentbox runs` | one `done`, exit 0; or `waiting` with a question you can answer |
+| 11 | `agentbox triage` | a verdict per box; `ask` means a person decides, never the agent |
