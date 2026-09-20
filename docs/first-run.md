@@ -89,7 +89,7 @@ and plugins to install inside the VM, one directive per line, `#` for comments.
 
 ```
 marketplace konyklabs/claude-plugins
-install governor@konyklabs-plugins
+install supervisor@konyklabs-plugins
 ```
 
 The marketplace **name** comes from the marketplace's own manifest and is not
@@ -105,10 +105,11 @@ only, straight from the read-only mount.
 
 **`~/.config/agent-box/guest/claude/`** — optional. The pieces of your own
 Claude Code setup you want in the VM: `CLAUDE.md`, `settings.json`,
-`governor.json` and `rules/*.md`. Those names and nothing else — the copy is an
-allowlist, and a `.credentials.json` or a `*.token` left in there is refused
-with a message rather than skipped in silence. What crosses and what does not
-is listed in [daily-use.md](daily-use.md).
+`supervisor.json` (and the pre-2.0 `governor.json`) and `rules/*.md`. Those
+names and nothing else — the copy is an allowlist, and a `.credentials.json`
+or a `*.token` left in there is refused with a message rather than skipped in
+silence. What crosses and what does not is listed in
+[daily-use.md](daily-use.md).
 
 **`~/.config/agent-box/guest/ca.pem`** — only if your network intercepts TLS. If
 `curl https://api.anthropic.com` on the host fails with a certificate error,
@@ -120,6 +121,14 @@ The `guest/` subdirectory — and only that subdirectory — is mounted **read-o
 into the VM**, at `/opt/agent-box-config`. Nothing is copied into the agent-box
 checkout, so none of these strings ever enters a git repository. It may be
 empty, and `agentbox create` creates it if it is missing.
+
+The commands write four more things into the **parent** directory as they go, and
+none of them is mounted or is yours to edit: `instances/<instance>` (what this
+host recorded about a box — its egress mode, its repository, its forwards),
+`channel/<instance>/` (this host's own record of the messages it read and sent),
+`bench/<instance>/` (a host-side clone of the repository, once you ask for one)
+and `watchers/` (a pid file per `run --notify`). The full tree is in
+[daily-use.md](daily-use.md) under "Host configuration layout".
 
 ### Choosing an egress mode
 
@@ -193,6 +202,16 @@ which is not the same as what it SHOULD.
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
 image. Subsequent instances reuse the cached image.
 
+The first boot also installs the box's toolchain — `uv`, `ruff`, Node, `mise`,
+`trufflehog`, `actionlint`, `dprint`, `basedpyright`, `semgrep`, Playwright and a
+shared Chromium — **under the firewall it just built**, not in an open window, so
+the create is itself the proof that the allowlist admits what the box needs. That
+adds a minute or two. `create` then ends by checking every tool by name and exits
+with that check's status: 0 at baseline, 10 with `NOT READY: <tool> …` lines if
+something is missing or off its pin. The box exists and is usable either way; the
+exit status and the last lines are what say it is not at baseline. Later starts
+install nothing and print `All toolchain pins already satisfied`.
+
 The token goes straight from your terminal into the VM. It is never written to
 a file on the host, never passed as a command-line argument, and never put in
 the environment.
@@ -222,6 +241,20 @@ If it fails, in this order:
 3. Check whether a managed Claude Code configuration on this device restricts
    which accounts may sign in.
 
+Then the readiness check, which is about the box's tools rather than its
+credential:
+
+```
+./bin/agentbox toolcheck ~/dev/my-e2e-tests
+```
+
+Exit 0 means every baseline tool is at its pin and this repository pins nothing
+differently. Exit 10 names the tools that are missing or off their pin — a
+warning, not a broken box, and the next `agentbox start` retries the install.
+Exit 11 means the box is at baseline and **this repository asks for a different
+version** of something, with `file:line` for each; the project wins, and the
+agent is told to install its version before trusting a result.
+
 To look around inside the VM for any other reason:
 
 ```
@@ -244,12 +277,21 @@ mean to review as a diff.
 5. Push it yourself, under your own identity, if you are happy with it.
 
 The full JSON transcript of each run stays **inside the VM**, under
-`~/.agent-box/runs/`. Only a short scrubbed summary is written to the host, at
-`<repo>/.agent-box/last-run.txt`, excluded through the repository's
-`.git/info/exclude` rather than its tracked `.gitignore`. That split is
-deliberate: the transcript is the model's own output, and the model's input is
-the repository, so it does not belong on the host's disk. See
-`docs/decisions.md`.
+`~/.agent-box/runs/`. What crosses to the host is a short scrubbed summary, at
+`<repo>/.agent-box/last-run.txt`, and — if you use the two-session loop — the
+mailbox at `<repo>/.agent-box/channel/`, whose messages are scrubbed in the guest
+the same way. Both are excluded from git: the directory carries its own
+`.gitignore` of `*`, and the repository's `.git/info/exclude` covers it too,
+rather than its tracked `.gitignore`, because the work repository belongs to
+someone else. That split is deliberate: the transcript is the model's own output,
+and the model's input is the repository, so it does not belong on the host's disk.
+See `docs/decisions.md`.
+
+There is a third, interactive mode alongside those two: `agentbox claude <repo>`
+becomes the box's **standing session**, hands work out with `abx handoff`, and
+receives work through `agentbox request`. It is worth reading
+[daily-use.md](daily-use.md), "Two sessions, one mount", before you rely on it —
+in particular that a request reaches an idle session only at its next prompt.
 
 After every run the transcript, `git status` and both diffs are checked for
 fragments of the token. If one turns up, the run exits 3 with a loud warning and
@@ -264,13 +306,36 @@ uses unless told otherwise, and reach for a larger model deliberately.
 
 ## 7. Decommissioning and rotation
 
+Before you delete anything, ask what only that box holds:
+
+```
+./bin/agentbox triage ~/dev/my-e2e-tests
+```
+
+It answers `keep`, `pause`, `remove` or `ask`, and it prints what is only inside
+the box beside the verdict: run transcripts, the standing session's state,
+repositories in the guest home, Docker volumes. `ask` means stopping or deleting
+the box would end something only a person can decide about — a standing session
+that is open, or a request still queued for it, while the box is running; work the
+last reading found only inside it, or commits on an `agent/` branch that are on no
+remote, once it is stopped. Other things worth knowing — an unread handoff among
+them — raise the verdict instead and leave the action at `keep`; the WHY column is
+the part that tells you. `pause` is `agentbox stop`; `remove` is the command
+below.
+
 ```
 ./bin/agentbox destroy ~/dev/my-e2e-tests
 ```
 
-That deletes the VM and its disk image, and with it the token file. Then revoke
-the token itself at **claude.ai → Settings → Claude Code**. Both halves matter:
-deleting the VM removes the copy, revoking removes the credential.
+That deletes the VM and its disk image, and with it the token file, the box's
+host-side record (`instances/<instance>`) and its bench if it had one. Two things
+stay, both deliberately: the mailbox under `<repo>/.agent-box/channel/`, because
+it is in the repository directory and that is yours, and this host's matching
+channel record under `~/.config/agent-box/channel/<instance>/`, so that a box you
+recreate under the same name does not re-announce every message the old one sent.
+Delete both by hand if you want a clean slate. Then revoke the token itself at
+**claude.ai → Settings → Claude Code**. Both halves matter: deleting the VM
+removes the copy, revoking removes the credential.
 
 Rotating is the same two steps in reverse: revoke the old token, mint a new one
 with `claude setup-token`, run `agentbox token` again.

@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+# agent-box — `toolcheck`, on PATH inside the box.
+#
+# The conventions tell the agent that `toolcheck` lists where this repository
+# pins a tool differently. `agentbox toolcheck` is a HOST command, which an agent
+# inside the box cannot run, so the name it is told about has to exist here:
+# guest/lib.sh puts /opt/agent-box/guest/bin on PATH for every guest script, and
+# provisioning puts it on PATH for every shell.
+#
+# A wrapper rather than a copy or a symlink: the script resolves guest/lib.sh
+# relative to its own directory, so it has to be run from where it lives.
+set -uo pipefail
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/toolcheck.sh" "$@"

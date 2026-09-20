@@ -230,7 +230,7 @@ cmd_stop() {
             # signal and the sentence would not be true.
             printf 'run-ctl: WARNING: pgrep is not installed, so only the CLI itself will be signalled, not its children\n' >&2
         fi
-        for pid in $(descendants_deepest_first "$claude_pid"); do
+        for pid in $(abx_descendants_deepest_first "$claude_pid"); do
             kill -INT "$pid" 2>/dev/null && signalled=$((signalled + 1))
         done
         [ "$signalled" -gt 0 ] || printf 'run-ctl: WARNING: could not signal the CLI (pid %s)\n' "$claude_pid" >&2
@@ -429,16 +429,6 @@ newest_running() {
     printf '%s\n' "$newest"
 }
 
-# Depth-first pid list under a root pid, children before parents.
-descendants_deepest_first() {
-    local root="${1:?}" child
-    # shellcheck disable=SC2046  # one pid per line is exactly what is wanted.
-    for child in $(pgrep -P "$root" 2>/dev/null); do
-        descendants_deepest_first "$child"
-    done
-    printf '%s\n' "$root"
-}
-
 # ---------------------------------------------------------------------------
 # sessions
 # ---------------------------------------------------------------------------
@@ -446,6 +436,13 @@ descendants_deepest_first() {
 # The raw list, as JSON, built by jq so that a session name containing a quote
 # or a brace cannot forge or erase an entry. Printing is somebody else's job:
 # see cmd_sessions.
+#
+# Seven fields per row, because "this box has three tmux sessions" does not say
+# which of them did the work: `kind` and `runid` name the row's owner, `produced`
+# names what a run left behind, and `raw_state` is the status file's own word,
+# mapped to the reported vocabulary by run-format.py. Every one of them arrives
+# through --arg or --argjson: the name is agent-chosen, and the only reason a
+# name full of JSON cannot forge a row is that nothing here concatenates.
 sessions_json() {
     local now raw name created fmt first=1
     now=$(date +%s)
@@ -464,9 +461,16 @@ sessions_json() {
         [ "$first" -eq 1 ] || printf ','
         first=0
         jq -cn --arg name "$name" \
+               --arg kind "$(session_kind "$name")" \
+               --arg runid "$(session_runid "$name")" \
+               --arg raw_state "$(session_raw_state "$name")" \
                --argjson age "$((now - created))" \
                --argjson last "$(last_event_json "$name")" \
-               '{name: $name, age_s: $age, last_event: $last}'
+               --argjson produced "$(session_produced_json "$name")" \
+               '{name: $name, kind: $kind,
+                 runid: (if $runid == "" then null else $runid end),
+                 raw_state: $raw_state, age_s: $age, last_event: $last,
+                 produced: $produced}'
     done <<< "$raw"
     printf ']'
 }
@@ -507,6 +511,81 @@ last_event_json() {
     printf '%s' "$out"
 }
 
+# Did this session do the work, or does it only share the disk? Three answers,
+# and the same prefix routing session_hooks_file above already does:
+#
+#   run      the session a run started: `run-` and a valid run id, so there is a
+#            run directory with a status, a brief and a branch behind it
+#   session  a name with a session directory of its own under ~/.agent-box —
+#            the standing session, and anything else agent-box itself tracks
+#   other    neither: a shell somebody opened, a devserver the agent started
+#
+# A name is checked before it is used to build a path, and `run-` wins over a
+# session directory of the same name: a run id is the more specific claim.
+session_kind() {
+    local name="${1:?}"
+    case "$name" in
+        run-*)
+            if abx_valid_runid "${name#run-}"; then printf 'run'; return 0; fi ;;
+    esac
+    if abx_valid_session_name "$name" && [ -d "$(abx_session_dir "$name")" ]; then
+        printf 'session'
+        return 0
+    fi
+    printf 'other'
+}
+
+# The run id behind a `run-` session, or nothing at all. Nothing becomes `null`
+# in the row, which is the honest answer for a session that is not a run's.
+session_runid() {
+    local name="${1:?}"
+    case "$name" in
+        run-*) abx_valid_runid "${name#run-}" && printf '%s' "${name#run-}" ;;
+    esac
+    return 0
+}
+
+# The status FILE's word for whichever directory the row names, not a derived
+# state: `running`, `exit:<code>`, `exit:stopped`, `exit:lost` or `unknown`,
+# through abx_status_read, so bytes that are none of those are never echoed.
+#
+# The mapping to what a caller reads lives in run-format.py, in one place for
+# both vocabularies. For a `session` row that raw word is all there is, and it
+# maps to running / ended / unknown. For a `run` row run-format.py reads the run
+# directory itself instead of trusting this, because the two markers that turn
+# an exit code into `stopped` or `waiting` are files beside the status that no
+# single word can carry.
+session_raw_state() {
+    local name="${1:?}" dir
+    case "$(session_kind "$name")" in
+        run)     dir=$(abx_run_dir "${name#run-}") ;;
+        session) dir=$(abx_session_dir "$name") ;;
+        *)       printf 'unknown'; return 0 ;;
+    esac
+    printf '%s' "$(abx_status_read "$dir")"
+}
+
+# What a run produced, which is the branch its work is on: the one fact that
+# tells a finished run apart from a session that merely ran in the same box.
+# `null` for every other kind of row, and always valid JSON, so --argjson
+# cannot lose the whole row to a missing meta.json (the last_event_json rule).
+session_produced_json() {
+    local name="${1:?}" runid out dir
+    runid=$(session_runid "$name")
+    [ -n "$runid" ] || { printf 'null'; return 0; }
+    dir=$(abx_run_dir "$runid")
+    # A regular file, or the same answer a missing meta.json already gives. The
+    # run id here comes from a TMUX SESSION NAME, so nothing says the run
+    # directory exists or that meta.json is a file: a FIFO in its place would
+    # block jq, and with it `agentbox sessions` and every `status` that folds
+    # this box in. The same rule abx_status_read follows for the status.
+    [ -f "${dir}/meta.json" ] || { printf '{"branch":null}'; return 0; }
+    out=$(jq -cn --arg b "$(meta_field "$dir" branch)" \
+        '{branch: (if $b == "" then null else $b end)}' 2>/dev/null) || out=""
+    [ -n "$out" ] || out='null'
+    printf '%s' "$out"
+}
+
 # ---------------------------------------------------------------------------
 # latest
 # ---------------------------------------------------------------------------
@@ -518,6 +597,9 @@ last_event_json() {
 # The status file keeps the code the run exited with; a `stopped` marker beside
 # it says the run was interrupted. `exit:3` is never reinterpreted: it is the
 # leak check's, and `logs` keys its refusal off exactly that string.
+#
+# Every state emitted here must be accepted by bin/agentbox:valid_run_state, or
+# the host silently calls it unknown (agent-box#24).
 derived_state() {
     local dir="${1:?}" raw
     raw=$(abx_status_read "$dir")
@@ -780,7 +862,7 @@ base_commit_of() {
 }
 
 cmd_review() {
-    local of="" parent_state="" dir state reviewer base ahead child brief origin_line obrief slug
+    local of="" parent_state="" dir state reviewer base ahead child brief origin_line obrief
     while [ $# -gt 0 ]; do
         case "$1" in
             --of)           of="${2:?--of needs a run id}"; shift 2 ;;
@@ -809,7 +891,7 @@ cmd_review() {
 
     base=$(base_commit_of "$dir") || die "run ${of} recorded no base commit; cannot bound the diff"
     ahead=$(git -C "$ABX_WORK_DIR" rev-list --count "${base}..HEAD" 2>/dev/null) || ahead=""
-    case "$ahead" in ''|*[!0-9]*) die "cannot count commits past ${base} in ${ABX_WORK}" ;; esac
+    case "$ahead" in ''|*[!0-9]*) die "cannot count commits past ${base} in ${ABX_WORK_DIR}" ;; esac
     if [ "$ahead" -eq 0 ] && [ -z "$(git -C "$ABX_WORK_DIR" status --porcelain 2>/dev/null)" ]; then
         printf 'nothing to review: no commits past %s and a clean tree\n' "$(git -C "$ABX_WORK_DIR" rev-parse --short "$base")"
         return 2
@@ -847,7 +929,6 @@ cmd_review() {
     # that dies on the environment is healed like any other run.
     local heal_left; heal_left=$(meta_field "$dir" heal_left)
     case "$heal_left" in ''|*[!0-9]*) heal_left=0 ;; esac
-    slug=$(meta_field "$dir" slug); [ -n "$slug" ] || slug="task"
     start_followup "$dir" "$of" "$brief" "$child" "$heal_left" review "$reviewer" \
         || die "could not start the review run for ${of}"
 }

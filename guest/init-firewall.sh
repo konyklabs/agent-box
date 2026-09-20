@@ -96,6 +96,11 @@ read_egress_mode() {
             printf 'deny' ;;
     esac
 }
+
+# IFS is left alone deliberately: with IFS=$'\n\t', `log a b` would join its
+# arguments with a newline instead of a space.
+log() { printf '%s\n' "$*"; }
+
 # `--mode <m>` overrides the file for THIS run only, and nothing writes the
 # file. That is what makes `agentbox egress` transactional: the new mode is
 # applied and verified first, and the file is written only once it has held.
@@ -115,6 +120,17 @@ for _i in "$@"; do
     case "$_i" in
         --verify-only) ABX_VERIFY_ONLY=1 ;;
         --docker-hook) ABX_DOCKER_HOOK=1 ;;
+        # Only the separated form is read above, so `--mode=deny` would fall
+        # through to the mode FILE and rebuild the firewall in a mode nobody
+        # asked for. A silent wrong-mode rebuild is the worst failure this
+        # script has, so the joined form is refused instead of ignored. The
+        # value is not echoed back: it came from a caller's argv.
+        #
+        # printf and not log(), which is defined further down this file and is
+        # therefore not a command yet at this point in it.
+        --mode=*)
+            printf 'ERROR: --mode takes its value as a separate argument: --mode <deny|observe|open>\n' >&2
+            exit 2 ;;
     esac
     _prev="$_i"
 done
@@ -220,10 +236,6 @@ take_fw_lock() {
     flock -w "$secs" 9 || return 1
     return 0
 }
-
-# IFS is left alone deliberately: with IFS=$'\n\t', `log a b` would join its
-# arguments with a newline instead of a space.
-log() { printf '%s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Chain plumbing

@@ -32,22 +32,37 @@ to decide yes or no on each line without asking a question.
 
 ## Tests to run
 
-Exact commands, copy-pasteable, in the order they should run. If the task
-needs its own virtualenv or `node_modules`, have the agent build it under a
-guest-only path such as `~/.venvs/<repo>` rather than inside `/work` —
-`/work` is a shared mount, so an environment built there overwrites the
-host's copy at the same path with guest-native binaries. See "The friction,
-listed rather than debugged" in `docs/daily-use.md`.
+**The command CI runs, exactly as its workflow invokes it** — `mise run test`,
+`just check`, `make lint`, the npm script — not a hand-built equivalent. A task
+runner usually wraps setup, environment and flags around the raw tool, so
+`ruff check .` can pass while `mise run lint` fails, and a green result from the
+wrong command is worse than no result. The box says the same thing to the agent as
+convention 4; naming the command here is what makes it checkable.
+
+Copy-pasteable, in the order they should run. If the task needs its own virtualenv
+or `node_modules`, have the agent build it under a guest-only path such as
+`~/.venvs/<repo>` rather than inside `/work` — `/work` is a shared mount, so an
+environment built there overwrites the host's copy at the same path with
+guest-native binaries. See "The friction, listed rather than debugged" in
+`docs/daily-use.md`.
 
 ```
-npm test
+mise run test          # or whatever the workflow calls
 ```
+
+If the repository pins a tool to a version the box does not have, the box prints
+that above this brief with a `file:line` for each, and the project's pin wins:
+install it before trusting a result, and write that down as a learning.
 
 If the task needs the application running — only on a VM created with
 `--docker` — say so as commands rather than as an aspiration, and say how the
 agent knows the stack is up. "Start the app" is a guess; the four lines below
 are not. Bring it down at the end, whatever happened, so a failed run does not
-leave a stack holding the port and the disk.
+leave a stack holding the port and the disk. The box now also sweeps what a run
+left running — its own processes, ports, worktrees and tmux sessions — but the
+brief's own teardown still wins: it runs first, it knows what "down" means for
+this stack, and it can bring containers down, which the sweep deliberately does
+not.
 
 ```
 docker compose up -d
@@ -61,8 +76,10 @@ Three things worth naming in the brief itself:
 - Tests are **headless**. There is no display in the guest, so `--headed` and
   `--ui` do nothing useful. Traces, screenshots and videos are the evidence,
   and they must be written under `/work` to reach the host at all.
-- The first Playwright run in a fresh VM **downloads its browsers**, which
-  takes a minute or two. That is not a hang.
+- **Chromium is already in the box**, shared at `$PLAYWRIGHT_BROWSERS_PATH`, so
+  the first Playwright run downloads nothing. A repository pinning a different
+  Playwright version installs that version in its own environment and may then
+  need a browser download; say so here if it does.
 - Anything the app calls out to needs an allowlist entry; the app itself does
   not. If the brief expects a third-party sandbox to answer, name it here so
   whoever runs this knows to add it before starting.
@@ -89,10 +106,18 @@ When to stop and report rather than improvise.
 
 The box prepends its conventions to this brief: how to ask the operator a
 question instead of guessing (`/work/.agent-box/ask.md`, then `agentbox
-resume`), and how to write down what had to be fixed
-(`/work/.agent-box/learnings.md`). Start the run with `--heal N` to let the
-box retry a failure on its own; give `--heal-delay` a value longer than any
-cooldown the tests are subject to.
+resume`), how to write down what had to be fixed
+(`/work/.agent-box/learnings.md`), to run the project's own command rather than
+an equivalent, and how to hand finished work to the host with `abx handoff`.
+Start the run with `--heal N` to let the box retry a failure on its own; give
+`--heal-delay` a value longer than any cooldown the tests are subject to.
+
+A **headless run** receives no messages: `ask.md` is how it asks, and its result
+is the branch plus the scrubbed summary. `abx handoff` belongs to an interactive
+session in the box, where somebody is there to answer. If this brief is meant for
+such a session rather than for `agentbox run`, say so here and say what the
+handoff should contain — its three headings are `## Changed`, `## Verify` (the
+exact commands) and `## Unproven`.
 
 Nothing in this brief may name a customer, an internal system, or an internal
 hostname. The repository is generic and this file travels with it.

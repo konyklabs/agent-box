@@ -223,6 +223,16 @@ Run logs are excluded through `.git/info/exclude` rather than the work repo's
 `.gitignore`, because the work repo belongs to someone else and its tracked
 files should not acquire a line about this tool.
 
+**Amended.** The superseded claim is not the mechanism but who writes it: the
+exclude entry used to be written by `agent-run.sh` alone, so a box that had only
+ever held an interactive session had no entry at all. It is now
+`abx_exclude_state_dir` in `guest/lib.sh`, called unconditionally by both
+`agent-run.sh` and `claude-session.sh`, and it does nothing unless
+`git rev-parse --git-dir` answers, so a mount that is not a repository is left
+untouched. The channel's directory on the mount also carries its own `.gitignore`
+of `*`, written by whichever side creates it first, because either session may
+create it before a run has ever happened.
+
 ## Why `agentbox start` re-runs preflight
 
 A repository is scanned before it is mounted, but a repository changes between
@@ -374,6 +384,19 @@ before writing it. The boundary that actually holds is the VM plus the egress
 allowlist; this check is there because the cost of a leaked subscription
 credential on the host is high enough to be worth a cheap second look.
 
+**Amended: more than the summary crosses now.** The first bullet above said the
+scrubbed summary is the only thing written to `/work`. Since the channel, the box
+also writes messages into `<repo>/.agent-box/channel/to-host/`, which is the
+host's disk by the same argument. Three things keep that from weakening the
+paragraph. The messages are produced by the same guest-side scrubber as the
+summary, so the token check happens before the bytes cross rather than after. The
+run's leak check was extended to cover them: `check_stream_for_token "the channel
+outbox"` reads every file in that directory newer than the run's own
+`meta.json`, so a run that wrote a message containing a token fragment still
+exits 3. And a message a leak-flagged run wrote is refused by `agentbox handoff`
+with the same banner `logs` uses. The limitation is unchanged and is the same
+limitation: a determined agent that encodes the value defeats all three.
+
 ## What the guest can still see: names
 
 Lima's host resolver answers the guest's DNS queries using the host's own
@@ -450,7 +473,8 @@ threat model, the one that is easy to forget because nothing visibly breaks
 when it fails.
 
 So the names that may cross are written down — `CLAUDE.md`, `settings.json`,
-`governor.json`, `rules/*.md` — and everything else stays behind. Credential
+`supervisor.json`, `rules/*.md` (and `governor.json`, the pre-2.0 name, carried
+as a legacy alias) — and everything else stays behind. Credential
 and history-shaped names are not merely skipped, they are refused out loud:
 a silent skip and a successful copy look identical in a log, and the one case
 where the operator must not be left guessing is the one where a credential was
@@ -484,6 +508,45 @@ What it does keep is every precondition `agent-run` insists on, from the same
 outranking the subscription, the firewall active. Those live in one file rather
 than three copies precisely because three copies is how one of them ends up
 being the lenient one.
+
+**Amended: it is now the box's tracked standing session.** The superseded claim
+is "none of that, on purpose" read as *no bookkeeping at all*. An interactive
+`agentbox claude` — and `agentbox session`, which is the same launch in tmux —
+now takes the session name `claude`, gets a session directory under
+`~/.agent-box/sessions/`, has the channel hooks wired, and is the session
+`agentbox request` delivers to. What has **not** changed is the sentence that
+mattered: the terminal is still unscrubbable, and that is still said out loud
+once per launch.
+
+The two commands reach the same name by different routes, which is why the rule
+lives once in the guest script rather than twice in the CLI. `agentbox session`
+names it explicitly: it passes `--tmux claude`, which becomes
+`--session-name claude` in the process inside tmux. `agentbox claude` passes
+nothing and *converges* on the same name when three conditions hold, because
+taking it wrongly is worse than not taking it:
+
+- **The launch is genuinely interactive.** Stdin and stdout are both ttys, no
+  session name was given, and none of `-p`, `--print`, `--version`, `-v`,
+  `--help` or `-h` is being forwarded to the CLI. An invocation that prints and
+  exits holds no terminal and ends in seconds; a request delivered into one is a
+  request nobody reads.
+- **The name is free**, and freedom is decided by the recorded pid plus that
+  process's own command line — not by a status file, not by tmux. So a hard VM
+  stop, or a pid the kernel has since reused, reads as free rather than as a
+  session that is still working.
+- **Nobody else is taking it at the same moment.** The liveness check and the pid
+  write happen under one lock, so two launches racing for the name are serialised
+  rather than both believing they won.
+
+A launch that loses says so on stderr, naming `agentbox attach` as the way to
+reach the real one, and then continues exactly as it did before: untracked,
+receiving nothing. It is not refused, because a second interactive session is a
+reasonable thing to want; it simply is not the one the host talks to, and saying
+so is what stops somebody waiting for a request that is being delivered to
+another pane. The one case that *is* refused is a tmux launch whose name is held
+by a live non-tmux session — and it is refused in the process the operator is
+looking at, naming the pid, because a refusal inside a freshly created tmux pane
+vanishes with the pane.
 
 ## Why background self-update is off in the guest
 
@@ -1330,6 +1393,17 @@ alternative considered and rejected was forwarding on demand from a separate
 subcommand, which would have made "what is exposed right now" a question with a
 time-varying answer — the same thing the fixed-mounts rule exists to avoid.
 
+**Amended: the host side of a forward is now checked, and diagnosable.** The
+table above is about which *guest* socket a forward reaches. The other half of
+the silence was the host end: Lima cannot bind a host port something else holds,
+and says nothing useful when it fails, so a forward could be dead from the
+moment the box started. `create` and `start` now probe each recorded forward
+before they do anything else and refuse, naming the port and the process holding
+it; `agentbox ports` reads both ends and says which is quiet. That is a new
+behaviour, not a restatement. The rejection of forwarding on demand stands
+exactly as written above, for the reason written above — what was missing was
+never the mutation, it was the diagnosis.
+
 ## Why the allowlist resolves through two paths, and more than once
 
 The allowlist is names; the ipset is addresses. Something has to turn one into
@@ -1716,3 +1790,967 @@ box that is stopped, heal a newest run that is lost, only for boxes an
 operator marked, every five minutes, from launchd. It starts no new work. It
 is also the least proven part of the design, having been exercised only by
 hand at the time of writing.
+
+## Why the host runs only four git verbs in a mounted repository
+
+`/work` is the host's own directory, and everything in it is writable by the
+guest — including `.git/config`, `.git/hooks` and `.gitattributes`. Several
+ordinary git commands execute programs named in those files. `core.fsmonitor` is
+a command git runs on `status` and `diff`; a clean or textconv filter is a
+command git runs while reading a file; a pager is a command git runs when stdout
+is a terminal; `core.hooksPath` points at scripts git runs on its own.
+
+So a host-side `git status` in a mounted repository is the box choosing a program
+for the host to execute, outside the VM, as the operator. Nothing about that is
+exotic: it is the documented behaviour of configuration that lives in the
+repository the agent is working in.
+
+The rule is therefore mechanical rather than a matter of care. Every host git
+command that touches a mounted repository goes through one helper —
+
+```
+git -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager -C <repo> …
+```
+
+— and only as `rev-parse`, `rev-list`, `for-each-ref`, `symbolic-ref`, or as the
+source of a `clone` or `fetch`. Those five read refs and objects and run nothing.
+`--no-pager` is in the helper because a pager is the third program a config file
+can name, and it is the one that fires only when a human is watching. Any git
+command this tool *prints* for an operator to run inside a mounted repository
+carries the same three flags, for the same reason.
+
+What that costs is a real capability: the host cannot count the box's uncommitted
+files, so a handoff's dirty claim is the box's own word, shown behind the bar,
+and `triage`'s dirty count is computed inside the VM where running the
+repository's own config is already the deal. Two features were removed rather
+than guarded — a host-side dirty count in the bench output, and a "N uncommitted
+files" note in `triage` — because a guarded version of a number nobody needs is
+still a place for the next person to add a sixth verb.
+
+The obvious alternative, `GIT_CONFIG_NOSYSTEM` plus a scrubbed environment, was
+rejected because it protects against the wrong file. The dangerous configuration
+is the repository's own, which git reads by design, and no environment variable
+turns that off. Limiting the verbs does.
+
+`git status` appears exactly once in the whole CLI, with `-C` pointing at the
+bench — a directory whose config the host wrote — and a smoke assertion holds it
+there rather than an eye.
+
+## Why the two sessions talk through files on the mount, and nothing else
+
+The working shape for this tool is two Claude Code sessions: one inside the box
+doing the work, one on the host controlling it and preparing the pull request.
+They have to exchange work. Everything about how they do it follows from the fact
+that the mount is the only thing that crosses the VM boundary, and from the fact
+that the box's credential is a setup token.
+
+**Cross-session messaging is not available, and would be wrong here anyway.**
+Claude Code's own session-to-session messaging is a Unix socket per session,
+found through files under the user's home; a container or VM has its own
+filesystem, so a session inside one cannot reach a session on the host. Across
+machines it needs Remote Control, which needs a claude.ai sign-in as the
+session's active authentication — and this project already measured that Remote
+Control refuses a setup token, which is the only credential a box has. Even if it
+worked, it would be a path out of the VM that no scrubber sits on: the box's
+words would arrive in the host session having passed no boundary at all.
+
+**A forwarded socket was rejected as a second widening.** `--forward` is the one
+place this design gives something back, and its entry above spends a page on why
+that is acceptable only because it is opt-in, per port and fixed at create time. A
+socket the two sessions used constantly would be a standing hole with a
+general-purpose protocol on it.
+
+**Transport over `limactl shell` was rejected because it has no queue.** A
+message is most useful when the box is busy, and most needed when the box is
+stopped — a request written on the host while the box is off has to be waiting
+when it starts. A command that reaches into a running VM cannot hold anything for
+a stopped one.
+
+Files on the mount have none of those problems and one property the others lack:
+the box's words pass through the guest-side scrubber on the way out, so the
+scrub precedes the boundary rather than following it.
+
+That is why the channel is the stated exception to `guest/lib.sh`'s own rule that
+the guest writes nothing onto the host mount. The rule exists so that
+model-authored text does not land on the host's disk unchecked. Here it lands
+checked: written by the guest through the same redaction the run summary uses,
+capped, and read back by a host command that bars every line of it.
+
+MEASUREMENT OWED (a real in-box session acting on a host request, end to end,
+with `abx done` and both sides visible in `channel` and `status`): the smoke
+suite proves this to the hook boundary only — the settings wiring, the exported
+environment, and a guest poll seeing a request a host command wrote. The
+model-level proof needs a box that holds a real token and is a manual step.
+
+## Why each side believes only its own disk, and the sidecars are courtesy copies
+
+The mailbox is under `/work`, so the guest can write anything in it: a `.read`
+sidecar for a message nobody read, a `.done` for a request nobody answered, or
+the removal of either. If the host displayed what it found there, the box could
+tell the host that the host had read something.
+
+So each side keeps its own record on a disk the other cannot touch. The host's
+lives in `~/.config/agent-box/channel/<instance>/` — `read`, `done`, `sent`, and
+its own `host` file holding what it last saw and what task it declared — and it
+is that record, not the mount, that `channel` prints and `status --json` reports.
+The guest's lives in the guest home at `sessions/claude/channel.seen` and
+`runs-seen`, at mode 600, which is equally out of the host's reach.
+
+The copies on the mount are not removed, because each is genuinely useful to the
+*other* side's display: the box's card wants to know the host has read its
+handoff, and the host's listing wants the box's own word for whether a request
+was delivered. They are written second and read as decoration. The host's own
+line and the JSON `host` object read the private copy first and only that; a
+forged `host-status` on the mount changes nothing the host says about itself.
+
+The failure direction is deliberate. Lose the host's record and every message
+reads as unread again — the host re-announces things that were already dealt
+with, which is noisy and safe. The opposite arrangement, trusting the mount,
+fails toward silence: a box could make a handoff invisible by claiming it had
+been read.
+
+## Why guest receivers poll the mount
+
+The box's side of the channel does not watch for changes. It looks, on an event
+it already has.
+
+Measured on this Mac on 2026-09-19: a host process writing into a repository's
+`.agent-box/channel/to-box/` produced **no watcher events at all** inside the
+guest across a virtiofs mount, while a 100 ms `stat` loop in the guest saw every
+write immediately. That is the ordinary behaviour of a shared mount — inotify
+reports the guest kernel's own writes, and a host write is not one of them — and
+it disqualifies every design whose delivery depends on a filesystem watcher
+noticing a host write.
+
+There is a trap in testing this that is worth recording, because it produces a
+false pass: a test that writes the file *from inside the guest* to simulate the
+host will see the watcher fire, and will conclude the mechanism works. Every
+host-to-box assertion in the smoke suite therefore makes its write with an
+`agentbox` command **on the host** and guards that the file exists on the host
+before the guest is asked anything.
+
+What the box does instead is read the mailbox in hooks it is already being given:
+at the start of every context, after each tool call, at each prompt, and at the
+end of each turn. Those are cheap — a `find` over a directory of names and a read
+of the files that are new — and they are events the CLI hands over anyway, so the
+box pays nothing for a mailbox that stays empty.
+
+## Why a request is delivered by a hook, shown before it is recorded, and never typed into the pane
+
+Three ways to put a message in front of a session were considered. Two of them
+lose messages or lie about them.
+
+**`tmux send-keys` types at the agent.** The pane belongs to a model that is
+mid-turn as often as not, and a session's own attach is already read-only for a
+run for exactly this reason. Keystrokes are also unrecorded: nothing afterwards
+can say whether the text arrived, arrived twice, or landed in the middle of a
+tool call's output.
+
+**A watcher that claims a message before showing it** is the natural shape and
+the wrong one. If the record is written first and the injection then fails — the
+hook is killed, times out, or the frame cannot be built — the message is marked
+delivered and never shown. So the order is: build the text, emit it, and only
+then write the two records, the sidecar on the mount and the line in the guest's
+private seen-set. A hook that dies halfway shows the same message again, with the
+same id, which is the failure this ordering chooses.
+
+**A filesystem-watcher hook cannot do it at all**, for the reason in the entry
+above, and a `FileChanged` hook in particular has no way to put text in the
+model's context.
+
+What is left is `additionalContext` from the hooks the CLI already fires, plus
+one deliberate exception at the end of a turn: a `Stop` hook may return
+`{"decision":"block","reason":…}`, which the CLI documents as "the conversation
+continues so Claude can act on the feedback". That is the only blocking behaviour
+in the whole channel, and it is bounded twice — a message is shown at most once
+per session, so a `Stop` hook can block at most once per undelivered message, and
+a hook invoked with `stop_hook_active` already true never blocks again.
+
+**Every other channel hook exits 0, always.** This is not defensiveness; it is
+the one rule that had to be stated as an invariant. Claude Code reads exit status
+2 from a `UserPromptSubmit` hook as *block this prompt and erase it*. A channel
+that could not read its own state — no directory, an unreadable mount, an unknown
+event name, a hostile file in the mailbox — would then lock an operator out of
+their own session for a reason having nothing to do with their prompt. So the
+entry points of both hooks return 0 on every path, print nothing when they have
+nothing to say, and never reach a `die` or a usage error. The host-side hook adds
+a belt to that brace in the plugin wiring itself (`… || exit 0`), so a checkout
+where the verb does not exist yet is silent rather than obstructive.
+
+## Why there is no wake yet, and what a probe must show first
+
+The delivery floor above has one honest limitation: an idle session is not
+prompted by anything, so a request waits until somebody types. Claude Code does
+document a mechanism that would close this — an `asyncRewake` hook, which "runs
+in the background and wakes Claude on exit code 2" and "wakes Claude immediately
+even when the session is idle". It is not shipped here, and the reason is that
+nothing about it has been measured in this box.
+
+The probe that would settle it was planned and did not run: every guest and mount
+write it needed was refused by the permission classifier on the machine where it
+was attempted, so all five of its questions came back unanswered. What it has to
+show, before any of this becomes code:
+
+- whether a long-poll hook inside the guest can hold for a useful interval at
+  all, and what the largest honoured timeout is;
+- what happens at that timeout — silently ending is fine, a visible error in the
+  operator's session is not;
+- whether the wake survives the events that a real session goes through: a
+  `/clear`, a compaction, a resume, a fork;
+- whether the woken turn can be made to carry the message without the message
+  becoming a prompt the model treats as the operator's words;
+- and what it costs when the mailbox is empty, which is almost always.
+
+A dormant hook entry, shipped switched off, was rejected too. An untested entry
+in the static settings file is loaded into every session in every box, and the
+failure mode of a hook is not a missing feature: it is a session that behaves
+oddly for a reason nobody is looking for. Shipping nothing is the honest state,
+and the floor is not a bad state — a message is late, never lost, and every open
+request is re-shown to every new context.
+
+The documentation and the `request` command both say the consequence plainly,
+which is the part that matters most. An operator who knows a request arrives at
+the next prompt will type something. One who believes it arrives immediately will
+wait, and then distrust the tool.
+
+## Why the host is told that a handoff exists, and never what it says
+
+A host session learns about a message through a hook. That hook prints ids,
+states, counts, box names and paths — all of them either this machine's own words
+or values that passed a shape test — and it prints no part of any message's
+content, not even the subject.
+
+The reason is what the printed line is *for*. It appears in a host session's
+context automatically, and a line that appears automatically is the highest-value
+place in the whole system to put a sentence that reads as an instruction. Message
+bodies are written by a model working in an untrusted repository. Keeping them out
+of the automatic path means the only way box-authored prose reaches the host
+session is through a command the operator or the session deliberately ran, where
+it arrives barred and labelled.
+
+The same reasoning decides how the hook knows which box a session is about, and
+it is worth recording because the obvious implementation is unsafe. Asking git —
+`git rev-parse --git-common-dir` — looks like the natural way to map a working
+directory to a repository. Measured with git 2.55.0 on 2026-09-19: a `commondir`
+file planted in a guest-writable `.git` **redirects that answer**, and it does so
+even with `core.fsmonitor=false` and `core.hooksPath=/dev/null`. A box could
+therefore choose which box the host's hook thought it was looking at.
+
+So the hook calls git not at all. It resolves the working directory physically
+(`cd … && pwd -P`) and matches it by containment against each box's recorded
+repository, itself physically resolved, and against each box's bench directory.
+No match means no output and exit 0. One consequence of resolving paths rather
+than asking git: a box created before this version has no repository recorded, so
+it is invisible to the hook until its first `start`, `session`, `claude`,
+`request` or `channel` on the new checkout backfills the record. That is stated in
+the docs rather than papered over.
+
+## Why the host bars every box line itself, and checks a handoff's claims with two git commands only
+
+`## Why the formatter and the status script run in the guest` says the redaction
+belongs in the guest, because that is where the token's fragments are known. That
+is unchanged and is not what this entry is about.
+
+The bar is a different boundary. The guest's renderer is not a trust anchor: the
+guest user has passwordless sudo, and the smoke suite already demonstrates that a
+file under `/opt/agent-box` can be bind-mounted over from inside the box. So a
+host command that prints a handoff assumes the renderer may have been replaced,
+and redoes host-side everything it can without parsing: a byte cap first, a
+control-character strip, and then `  | ` in front of every line. The JSON path is
+clamped to printable ASCII — `json.dumps` emits nothing else — and the guest's
+object is nested under an `untrusted` key that comes **first**, so that every
+host key follows it and a duplicate key emitted by the guest loses to the host's
+own, both `jq` and Python taking the last of a repeated key.
+
+Marking the text is not security theatre; it is the only mitigation available
+against the actual threat, which is not exfiltration but prose read as
+instructions. The host cannot verify a claim like "the suite passes". What it
+*can* verify, it does: a handoff names a branch and a commit, and the host checks
+those with two read-only commands through the four-verb helper — does that branch
+still point at that commit, and how many commits has it gained since — and prints
+its own answer beside the box's. So the two kinds of statement in a handoff are
+visibly different kinds: one is checked and labelled, and one is barred.
+
+## Why no host write onto the mount is a redirect or a plain mv
+
+Every file the host writes into the mailbox is created with `noclobber` and moved
+into place with a rename that refuses to follow a link. Neither is a style
+preference. Measured on this Mac on 2026-09-19, with bash 3.2 and a planted
+symlink in the target directory:
+
+```
+--- mv -f onto a planted symlink-to-directory (plain) vs mv -fh
+plain:  outside/.tmp.1 created         <- the file left the mailbox
+-h:     the target is a regular file; outside/ is empty
+--- noclobber create through planted symlinks
+symlink->regular rc=1   victim content: PRECIOUS
+dangling symlink rc=1   outside/ holds only: victim
+free name rc=0          second create rc=1
+bare redirect rc=0      victim now: []              <- truncated through the link
+```
+
+Two distinct escapes, both from one line of ordinary shell. A bare `: > name`
+truncates whatever the name points at, so a planted symlink lets the box empty a
+file elsewhere on the host, in the host's own uid. A plain `mv -f` onto a name
+that has become a symlink to a directory moves the file *out* of the mailbox
+entirely, into a directory the box chose.
+
+So: `set -o noclobber` for every creation, a random-named temporary file in the
+same directory, a byte-count check after the write, and then `mv -fT` or `mv -fh`
+— feature-detected, with the weaker check-then-move fallback documented as
+weaker. Every failure path removes the temporary file and any still-empty
+reservation and publishes nothing, so a crash mid-send leaves something a reader
+skips, not a half-message.
+
+The same measurement is why ids are reserved before they are used. Twenty
+parallel noclobber reservations in a single UTC second produced twenty distinct
+ids and no duplicate, which is what makes a second-granular id safe without a
+lock across processes.
+
+`.agent-box/.gitignore` holding `*` is the last piece, and it is a `.gitignore`
+rather than a line in `.git/info/exclude` because the channel directory can now be
+created before any run has happened and by either side. The exclude entry is still
+written too; belt and braces, on a directory whose contents must never be
+committed to somebody else's repository by accident.
+
+## What a handoff can still do, and what the channel gives up
+
+Stated plainly, because each of these is a thing an operator will otherwise
+discover at the wrong moment.
+
+**There is no exactly-once.** A hook that is killed after emitting a message and
+before recording it shows that message again. The alternative loses messages
+instead, which is worse; see the delivery entry above.
+
+**Ids are UTC timestamps with a two-digit suffix**, so they order within one
+direction and nothing else. No arithmetic is ever done on them, and no age column
+exists anywhere in the channel, because an age would mean trusting either a
+guest-set mtime or the guest's clock.
+
+**Bodies cannot be read while the box is stopped.** The scrubber that knows the
+token's fragments is in the guest, and a host-side reader would be the host
+opening a guest-written file. Ids, states, counts, `--done` and `--wait` all work
+stopped; `handoff <id>` refuses and says to start the box.
+
+**A run receives nothing.** Delivery is to the standing interactive session only.
+Mid-run mail makes a result irreproducible — the brief is no longer the whole
+input — so `ask.md` and `agentbox resume` remain a run's way to ask a question,
+and `abx handoff` is how work leaves the box. A run's automatic handoff is a
+follow-up, not a feature of this version.
+
+**One subscriber per box.** A second interactive session is untracked, told so on
+stderr, and receives nothing. Two readers of one mailbox is a failure to detect,
+not a capability to build.
+
+**The retention sweep forgets things on purpose.** Once a UTC day, a message over
+30 days old by the date in its name is removed, as is one that has been answered
+and is over 7 days old. The `sent` line goes with the file, so a request the box
+deleted still reads as `lost` rather than silently becoming unknown.
+
+**The bench runs box-authored code on the host.** That is the subject of its own
+entry below, and it is the one place the VM boundary is deliberately stepped
+around. The skill and the documentation say to treat a handoff's `## Verify`
+commands as a stranger's pull request, which is a mitigation and not a boundary.
+
+## Why the toolchain is baseline and pinned, and what that supersedes
+
+`## Why the Docker profile is opt-in per instance` is **partly superseded** by
+this entry, and only partly. Its argument was that a profile costing a few
+hundred megabytes and a doubled disk should not be paid for by a box that may
+never need it. That still holds for Docker, which brings a daemon, a group that
+is root-equivalent on the guest, and a second firewall surface.
+
+It no longer holds for Node, Playwright and a browser. The cost was weighed
+against a box that might not need them, and in practice every box needed them:
+the flag was passed every time, and the boxes that were created without it were
+recreated. A flag that is always passed is not a choice, it is a step to forget.
+Per this file's convention the old entry is not edited — this one names it and
+says which half survives.
+
+So there is one baseline, installed by unconditional provisioning rather than by
+a flag. That is not only tidiness: a create-time parameter is frozen for the life
+of an instance, so a toolchain flag could never reach a box that already exists,
+while provisioning code reaches every box at its next start. Twelve steps, in a
+fixed order, each with its own marker under `/var/lib/agent-box/toolchain/`, so a
+tool that is already at its pin is not touched.
+
+Every version is pinned and every download is verified against a sha256 recorded
+per architecture in `guest/toolchain.pins`. The only writer of that file is
+`host/refresh-pins.sh`, which discovers each digest by downloading the asset and
+hashing it locally rather than by copying a number out of a release page, and
+writes nothing at all if any download failed — a half-updated pins file is a box
+that installs a mixture of two versions. The three Python tools are pinned
+through hash-locked, universal requirement files compiled by `uv`, so the whole
+transitive set is fixed, not just the top-level name.
+
+Two things in the baseline are nonetheless not pinned, one by choice and one by
+upstream's arrangement. That is the next entry, and `guest/toolchain.pins` and
+`host/refresh-pins.sh` both point a reader at it by name.
+
+## Why Claude Code is the one version the box does not pin
+
+One tool is deliberately unpinned: Claude Code. `CLAUDE_CODE_VERSION="latest"` is
+written in the pins file as an explicit statement rather than an omission, because
+the CLI's currency is a feature and not a hazard, background self-update is
+already off in the guest, and `agentbox update` is the deliberate move. Pinning it
+is a filed follow-up rather than a decision left implicit.
+
+The browser's own build number is not pinned either, and that one is upstream's
+fault rather than a choice: the revision is a function of the pinned Playwright
+version, and upstream publishes no per-architecture digest for the build. The
+Playwright version is pinned, the revision is read back from what was installed
+and recorded, so a drift is visible even though it cannot be prevented.
+
+## Why the toolchain installs after the firewall, not in the open window
+
+Provisioning has a window near the start where the network is open, because
+`apt` has to fetch the distribution's packages before the allowlist exists. The
+tempting place to install a dozen downloads is that window.
+
+It is the wrong place, for the same reason `## Why a probe that needs the internet
+cannot decide whether the box is safe` gives: something that succeeds in the open
+window proves nothing about the box the operator will actually use. Worse, it
+hides a real failure until the first time an agent needs the tool, which is
+mid-run, unattended.
+
+So the installer runs **after** the firewall is up, under the standing `deny`
+policy, and the create becomes the live test of the allowlist. That works without
+widening anything because of one measured fact: GitHub's release-asset hosts
+(`objects.githubusercontent.com`, `release-assets.githubusercontent.com`) resolve
+inside the address ranges `api.github.com/meta` publishes, which the allowlist
+already admits. Nothing was added to `guest/allowlist.base` for the toolchain, and
+nothing was added to the distribution package list either — so no existing box
+reopens its provisioning network window for this.
+
+Two consequences are accepted rather than fixed. Installing under `deny` is
+slower, and a CDN that rotates addresses between the firewall's rebuild and a
+download can refuse one; that tool is then retried at the next start rather than
+failing the boot. And a tool that needs to phone home before it will report its
+own version cannot do so — which is not hypothetical. Measured in a guest on
+2026-09-20, in cloud-init's own environment, which reads neither
+`/etc/profile.d` nor `/etc/environment`:
+
+```
+env -i PATH=… HOME=/root  semgrep --version                     -> rc=124, no output
+env -i PATH=… HOME=/root  SEMGREP_SEND_METRICS=off \
+        SEMGREP_ENABLE_VERSION_CHECK=0  semgrep --version       -> rc=0, "1.177.0"
+```
+
+The blackholed version check was killed by its own timeout, read as "not at its
+pin", and the tool was reinstalled on every single boot. The fix is to export both
+switches in the installer and to probe with a guaranteed `PATH`; the lesson worth
+keeping is that under default-deny a version probe is a network operation until
+proven otherwise.
+
+## Why a toolchain finding never blocks a run, and `toolcheck` still exits non-zero
+
+These two audiences want opposite things, and the resolution is that they get
+different channels rather than a compromise.
+
+**Provisioning and the launch paths warn.** The isolation this project exists for
+does not depend on a formatter. A box that will not open a shell because a
+download failed is a worse box than one that opens a shell and says `dprint is
+missing`. So the installer is fail-soft throughout: every tool failure is a
+warning and a counted return, no marker is written for a failed tool so the next
+start retries it, and the boot never fails. Below 4 GiB of free guest disk the
+installer does nothing at all and says to resize, because filling a nearly-full
+box is how a box that holds real work gets broken by an upgrade.
+
+**A script gating on readiness needs a status code**, so `toolcheck` has four:
+0 at baseline, 10 for a baseline tool missing or off its pin or unreadable, 11 for
+a box that is clean where this repository pins something differently, and 1 for a
+usage error or a sweep that could not read the box's pins file and therefore
+compared nothing. The distinction between 10 and 11 matters because they are
+addressed to different people: 10 is this tool's problem, 11 is the repository's.
+
+One place takes a harder line than the rest, and it is the one where "ready" is a
+claim rather than a status: `agentbox create` ends by running the check and exits
+with its status, printing `NOT READY: <tool>` lines. The box exists and is usable
+— nothing is rolled back — but a *new* box must not be reported ready with a tool
+missing, because the operator's next action is to hand it work. `agentbox start`
+on an existing box prints the same lines as a warning and exits 0, since the box
+was already there and refusing to start it helps nobody.
+
+A near-miss worth recording, because it shows how a lenient default hides a
+detector's bug rather than a tool's. On 2026-09-20 the readiness check reported
+`chromium is missing` on an arm64 box where the browser had in fact installed
+correctly: the check looked for `chrome-linux/chrome` and the build unpacks to
+`chrome-linux-arm64/chrome`. Before it was fixed, `toolcheck` would have exited
+10 for ever and every `create` on Apple silicon would have ended with a false
+`NOT READY`. The check now matches the executable by glob across layouts, and the
+case is in `test/no-vm.sh`, which the old function fails.
+
+## Why the project's pin wins, and why the box only reports it
+
+A box carries one baseline. A repository may want something else — its CI pins
+Node 20, or `ruff` 0.9, or a Playwright version whose browser build differs. Two
+things follow, and they point in opposite directions.
+
+The project's pin wins on the substance. A green result from the wrong version is
+worse than no result, and CI is the authority on what the project's own commands
+mean. So `toolcheck` reads the repository's own files — the mise TOML paths,
+`.tool-versions`, `.python-version`, `.nvmrc`, `.node-version`,
+`pyproject.toml`, `uv.lock`, `package.json`, `package-lock.json`, and the
+versions given to a short list of known setup actions in workflow files — and
+reports every mismatch with a `file:line` so the claim is checkable.
+
+And the box does not act on it. Installing the version a repository asks for
+would mean executing a version string chosen by whoever wrote that repository, as
+part of starting a box, from the one directory this whole design treats as
+untrusted input. The agent is the right actor: it can read the workflow, see what
+the command actually is, decide, install in its own environment, and write down
+what it did under the learnings convention. So the findings are printed above
+every brief and injected into an interactive session's first context, and
+convention 4 of `guest/conventions.md` tells the agent that the project wins.
+
+Nothing in `/work` is executed to produce that report. The detector reads files
+with anchored patterns and never runs a resolver, a package manager or a YAML
+parser — one more dependency in the guest for advisory output was not worth it —
+and every value it extracts is shape-tested before it is printed. A version
+string that fails the shape test is reported as unreadable rather than as a
+mismatch, so a repository cannot make itself exit 11 with a made-up token, and
+`lts/*`-style aliases land there too rather than being guessed at.
+
+Every bound is fixed: the number of files, the bytes per file, the number of
+findings, the length of each. A repository that wants to make this report
+enormous can only make it truncated.
+
+## Why a run owns a process group, not a process tree
+
+A run that starts a dev server and exits used to leave it running for ever. The
+obvious fix — at run end, walk the descendants of the run's process and kill them
+— does not work, and the way it fails is silent.
+
+By the time the sweep runs, the CLI is dead and everything it started has been
+reparented to pid 1. A descendant walk therefore finds nothing, kills nothing,
+and reports success. That is the worst available outcome: a cleanup that is
+believed and does not happen.
+
+`set -m` in `agent-run.sh` already gives the CLI its own process group, and the
+interrupt path already relies on that. So group membership is the primary
+ownership proof, and a second, independent proof sits beside it: the run's own
+events directory appears in a process's environment block, tested with
+`grep -qzxF` and never read into a variable, because that block may also hold the
+token. A deliberately `setsid`-escaped child satisfies the second proof and not
+the first, which is why the smoke suite plants one.
+
+Ownership is not enough on its own, because pid numbers are reused. Every
+candidate's start time is compared against the run's own baseline — taken from
+the box's uptime at the moment the run began, truncated to an integer before
+comparison — and a process that predates the baseline is not this run's, whatever
+group it is in. A process whose start time cannot be read at all is **neither
+killed nor hidden**: it is reported as a survivor whose ownership could not be
+verified. That is the only honest third answer, and having it is what lets the
+other two be strict.
+
+Three alternatives were rejected. A descendant walk, for the reason above.
+`pkill -f <pattern>`, which matches on a command line the agent chose and would
+happily match the operator's own processes on the same box. A cgroup or
+`systemd-run` scope per run, which needs privilege the run does not have and
+would be this project's second fight with systemd ordering — the first, over
+masking the stub resolver, is elsewhere in this file.
+
+MEASUREMENT OWED (a `pgrep -g` transcript from either side of a real sweep, with
+the guest's Claude Code version and the date): the mechanism is proven by the
+smoke suite's stand-in, which starts listeners in and out of the run's group. What
+is not yet measured is whether the real CLI's own Bash tool puts a backgrounded
+process in the run's group, carries the run's environment into it, or neither. If
+it turns out to be neither, the sweep's process class covers less than this entry
+claims, and the honest statement is that the port and tmux classes still hold.
+
+MEASUREMENT OWED (the `/proc/net/tcp` hex field layout, and a process whose
+`comm` in `/proc/PID/stat` contains a newline, read in a live guest): the port
+enumerator parses both by hand rather than adding a package, and both are read
+from documentation rather than from this box.
+
+## Why the sweep runs before the summary and not in `finish()`
+
+`finish()` looks like where cleanup belongs, and it is the wrong place for two
+reasons that are both already commented in the script.
+
+It is draining the console tee. Anything the sweep printed there would be lost or
+interleaved, and a sweep whose report nobody can read is a sweep nobody will
+trust the next time it says it killed something.
+
+And it runs on precondition failures. A run that dies because there is no token,
+or because the firewall unit is down, has started nothing — so a kill loop there
+is a new failure surface on a run that is already failing, for no benefit.
+
+So the sweep runs after the stop-requested check and before the summary is built,
+which is also the point where its one-line `hygiene` report can be kept in
+`summary.txt` and in the terminal output. The console output is passed through the
+token scrubber on the way, because a sweep names paths the model chose; the raw
+ledger stays in the guest home and is itself part of the run's leak check.
+
+## Why a standing session is never swept
+
+The threat is concrete and would be this tool's most embarrassing failure: the
+operator starts a dev server in their interactive session, a run ends an hour
+later, and the run's cleanup kills it.
+
+Two independent mechanisms make that impossible, and the entry names both because
+one would be a single point of failure. A standing session's processes are in no
+run's process group and carry no run's events directory in their environment, so
+they fail both ownership tests. And they predate any later run's baseline, so they
+fail the start-time test as well. Either one alone would suffice; neither is
+relied on alone.
+
+The cost is stated rather than hidden: a session's leftovers are shown and never
+cleaned. A long-lived box accumulates them, and the only cleaner is the operator.
+That is the right trade — a session is the operator's hands, and a tool that
+tidies up after somebody's hands is a tool that throws away their work — but it
+does mean `leftovers` on an old box lists things nothing will ever remove.
+
+For the same reason there is no session sweep and no per-session ledger. There is
+also no safe trigger for one: `tmux new-session -A` means a session outlives every
+attach, so "the session ended" is not an event anything observes. What a session
+does get is visibility — its tmux existence and age, its own status file, its last
+hook event, and its state in `status --json`.
+
+## Why run records stay in the guest and nothing is journalled on the mount
+
+An earlier design had a run append one line per ending to a journal on the mount,
+so that a host-side reader could see what had happened across runs. It is not
+built, and the reason is a rule rather than a difficulty: nothing host-side reads
+it.
+
+Every consumer that was going to — the host's notice about finished runs — is
+better served by the thing that already exists. The box's own session hook reads
+the run directories directly and keeps a private set of the run ids it has
+already mentioned, in the guest home, where the box's other private state lives.
+`status --json` exposes one number from that, `standing.runs_unseen`. A journal
+would have been a second copy of facts the run directories already hold, on the
+one filesystem both sides can write, for a reader that turned out not to exist.
+
+Removing it removed two problems with it. The first was the mount: a journal is
+model-adjacent text, and the fields that make it useful — what a run left running,
+a branch name, a reason — are values the agent chose. The resource ledger has
+exactly that problem, which is why `owned.jsonl` lives in the guest home at mode
+600 and is part of the run's leak check rather than on the mount. The second was
+the leak check's shape: checking the journal file after a run would make one
+poisoned line fail every later run for ever, and checking each line before
+appending it is a different mechanism that had to exist anyway.
+
+What does reach the host from all of this is deliberately small and entirely
+shape-validated: run ids matching the id pattern, a state word from a closed
+vocabulary, a branch name that passes a branch shape or a literal `-`, and
+counts. No model prose, so there is no scrub pass to get wrong. The collision
+note a run prints at its start follows the same rule — "1 worktree, 1 tmux
+session from run X; see `agentbox leftovers`" — counts and ids, never a path and
+never a detail, because a path in that note is an earlier run's chosen text
+appearing in this run's console.
+
+## Why `create` refuses a forward the host cannot bind
+
+Lima cannot bind a host port that something else already holds, and what it does
+instead is nothing: the forward simply does not answer. That reads as a guest
+problem. An operator spends the next twenty minutes inside the box, checking what
+it is listening on, and the answer was on the Mac all along.
+
+So each requested port is probed before anything else happens — before preflight,
+before `limactl` is called at all — and `create` refuses, naming the port and the
+process that holds it, or the other box whose forward it is. Recovery is cheap
+(free the port, run create again), create is a one-time operation that takes
+minutes anyway, and there is deliberately no `--force`: choosing a port that
+cannot work is not a thing to make easy at the moment it is being chosen.
+
+`start` runs the same probe, because a forward is a frozen create-time parameter
+and a host port can be taken while a box is stopped. Here there *is* an escape —
+`--ignore-port-conflict` — because refusing to start an existing box that holds
+real work, over one dead forward, is the wrong trade. It prints a warning naming
+the port and saying that forward will not answer.
+
+Three probes are used in order, and the order is about what each can see: `lsof`
+first, because it sees a socket bound to any local address, not only the loopback
+one a forward uses; then bash's own `/dev/tcp` pseudo-device, which needs no tool
+at all; then `nc`. Where none of them can answer, the refusal degrades to a note
+and the box is created — the same tradition as the Time Machine exclusion, where a
+missing local tool must not block a box.
+
+A box's own Lima process holding its own forward is not a conflict, which is the
+one case the check must not get wrong; it is identified by comparing the holding
+pid against each instance's recorded hostagent pid, and walking a small number of
+parents, because the process that binds the host end may be a child of the
+hostagent rather than the hostagent itself.
+
+MEASUREMENT OWED (`lsof -F pcn` for a real forward printed beside that instance's
+`ha.pid`, and `ps -o pid,ppid,comm` for the holder): the identity of the
+binding process is read from Lima's behaviour rather than measured here. Until it
+is, a stale `ha.pid` whose pid has been recycled could misname the holder in a
+message — it cannot cause a wrong action, because the refusal is the same either
+way.
+
+`agentbox ports` is the other half, and it is the part that was actually missing.
+It reads the recorded forwards, asks the host what holds each port, asks the guest
+what is listening on it, and renders both with its own verdict. The guest answers
+in a three-word vocabulary — `loopback`, `any`, `other` — rather than with an
+address, because the host has no business inventing an address it was not told;
+`other` is the real trap, a working listener bound to the guest's own interface
+address that no forward can reach. `reaches` is `false` with a reason for a
+stopped or silent box, and `null` only when the host had no probe at all, because
+"nobody looked" and "looked and no" are different answers.
+
+## Why the host verifies in a clone of its own
+
+The oldest friction in this project is one directory and two operating systems:
+`/work` is a shared mount, so a `.venv` or `node_modules` the agent builds inside
+the guest lands exactly where the Mac's own copy was, with Linux binaries in it.
+The host's `pytest` then fails with `bad interpreter`, which is a confusing way to
+be told that the mount worked.
+
+Verifying a handoff makes that worse, because verifying means building. So the
+host builds somewhere else: `agentbox bench` makes a clone of the repository under
+`~/.config/agent-box/bench/<instance>/`, checks the box's branch out there, and
+that is where the host's dependencies and test runs live. The box keeps building
+where its CI builds — item 3 of this whole design is that the box runs the
+project's own command, and a box whose environment sits somewhere CI does not is
+less faithful, not safer.
+
+**A clone, not a worktree**, and that is the part worth recording. `git worktree
+add` is the cheaper mechanism and it fails twice here. It refuses outright when
+the branch is already checked out somewhere: measured on 2026-09-19,
+`fatal: 'agent/example' is already used by worktree at …`. And it registers
+`.git/worktrees/<name>/gitdir` **inside the mounted repository**, which the guest
+can read to learn a host path and can prune or corrupt.
+
+A hardlinked local clone was rejected for the same class of reason and is the more
+interesting rejection, because it looks free. `git clone` without `--no-local`
+hardlinks the object store, so the bench's objects *are* the same inodes as files
+the guest can rewrite — which contradicts the one sentence the bench exists to
+make true. `--no-local` copies the objects instead and pays for the object store
+twice.
+
+MEASUREMENT OWED (`du -sh` of a bench's `.git` beside the repository's own, on a
+real repository): the cost of copying the object store is the price of this
+decision and it is not yet measured here.
+
+Disposability is the rule that makes the bench safe to delete, and two guards
+enforce it rather than trusting it. A refresh refuses if the bench has modified
+tracked files, and refuses if the bench holds a commit the repository does not —
+printing the exact line that moves those commits back rather than leaving the
+operator to re-type the fix or do surgery: a `git cherry-pick` of the bench's
+extra commits, oldest first, run **in the mounted repository** and carrying the
+same three protections every printed git command carries. That line is a
+convenience, not a guarantee, and the documentation is explicit about the half it
+cannot make safe: a cherry-pick applies onto whatever branch the repository is
+standing on when it is pasted, so the operator checks that branch first. The
+tool does not choose the branch for them — it knows which commits are stranded,
+not which branch they belong on. Untracked files are deliberately
+**not** counted: untracked files in a bench are the build, and counting them would
+refuse every refresh, which would defeat the purpose. The honest consequence is
+that something written by hand in the bench and never committed is not protected
+by `--remove`, and the documentation says so.
+
+The bench is excluded from Time Machine for the same reason `~/.lima` is: it fills
+with dependency trees that are rebuildable by definition, and it would otherwise
+double the backup of every one of them.
+
+And the thing this entry cannot make safe: the bench runs code the box wrote, on
+the host, outside the VM boundary. That is what verifying a branch *is*, it is the
+setup this whole tool is built for, and the mitigation is procedural — the host
+skill and the documentation say to read the diff first and to treat a handoff's
+`## Verify` commands as a stranger's pull request. It is a mitigation, not a
+boundary, and it is named here so that nobody has to rediscover it.
+
+## Why `triage` is its own command, and why the host does not judge the guest's numbers
+
+The question `triage` answers — may I stop this box, may I delete it, what would I
+lose — mixes two kinds of fact. Host facts: what the box costs on this disk, how
+much space is left, how many commits on its `agent/` branches are on no remote.
+Guest facts: how many run transcripts it holds, what is in the guest home, what
+its standing session is doing, whether its tree is dirty.
+
+The verdict needs both, and the host is not allowed to parse the guest's bytes.
+That rule is not new — it is the reason the formatter runs in the guest, and the
+reason nothing the guest writes reaches an arithmetic expression or a shell
+without passing a shape test first. So the verdict cannot be assembled inside
+`status`'s splice, where the host is stitching a guest object into a document
+without reading it.
+
+The shape that follows: the host passes its own facts **into** the guest call as
+arguments, the guest builds one finished object, and the host prints it. There is
+exactly one exception, and it is deliberately a rigid one — a stopped box has to
+be describable, which means the host must remember the box-only number from when
+the box was running. That number arrives on a second, separately shaped output
+line, is matched into host literals by `case`, is checked to be digits, is never
+executed and is never echoed if it fails. The same pattern the watchdog already
+uses to read a run id back out of the guest.
+
+There is no fleet total of guest numbers. Adding up integers a guest wrote is
+arithmetic on untrusted input for a figure that drives no decision: the
+actionable unit is the box, because the action — pause, remove — is taken per box.
+Per-box numbers are printed; a sum is not.
+
+The belief this command exists to correct is that unexported work on an `agent/`
+branch is trapped inside the box. It is not: the branch is in the mounted
+repository, on the host's own disk, and survives `destroy`. What genuinely only
+exists inside a box is the rest of it — run transcripts and event streams, the
+standing session's state, a repository the agent cloned into the guest home,
+Docker volumes and images — and that is the inventory `triage` prints, by
+category, beside the verdict.
+
+Two scarcity lines, each printed with the numbers it came from so the operator can
+disagree with the verdict: **disk**, when free space is less than the largest
+configured disk already in use, so another box of that size could not be created;
+and **compute**, when the running VMs' configured memory sums to at least the
+Mac's own. The second is about *commitment* and says so: whether the hypervisor
+takes that memory up front or grows into it is not measured here, and a line
+about measured residency would be a different and unearned claim. There is
+deliberately no tuned threshold table — this file's own rule is that numbers are
+measured, not estimated, and a threshold would be neither.
+
+`triage` writes while it reads: the box-only watermark goes into the host's
+instance record so a stopped box can still be described. That is not a new
+category of behaviour — `box-status.sh` already reconciles a run's state as part
+of answering a status query — but it is worth naming, because a read command that
+writes surprises people once.
+
+And there is no `--watch`, for the reason `status --watch` needs a named box: one
+pass over the fleet is cheap, a loop is a guest call per running box every few
+seconds aimed at boxes nobody named. There is also no `triage` key in
+`status --json`, which would have been the cheap hook for a UI: computing it
+host-side means parsing the guest's status object, and computing it guest-side
+means the guest deciding pause-versus-remove without the host numbers that make
+the question answerable. A UI calls `triage --json` on demand instead.
+
+## Why the run-state vocabulary is written down three times, and what keeps them in step
+
+There are three vocabularies for what a run is doing, in three files, and they
+legitimately differ.
+
+The **status file** holds what the run itself wrote: `running`, then
+`exit:<code>`, `exit:stopped`, `exit:waiting` or `exit:lost`. The **derived**
+state combines that with the marker files beside it, because a stop, a question
+and a leak are facts that no single word in the status file can carry — this is
+why `stopped` is a marker rather than a status, which has its own entry above. And
+the **host** keeps a third list, of the words it will accept from the guest at
+all, because a state word that reaches the host is guest-authored input.
+
+Nothing fails when those three drift, which is exactly the problem. A word the
+guest can write and the host does not accept is silently dropped, and the symptom
+is a run that looks `unknown` for no reason. That happened with `exit:lost`: the
+guest wrote it, the host's accept list predated it, and the run vanished from the
+host's view of its own state while looking perfectly healthy inside the box.
+
+The fix is not a shared constant — the three lists are in bash, in Python and in
+bash again, in files that do not import one another, and a fourth mechanism to
+keep them in sync is a fourth thing to drift. It is a comment in each of the three
+places naming the other two, plus the one missing word, plus a smoke assertion
+that reads the state **through the host path** rather than in the guest. The
+suite's old assertion read it guest-side and passed either way, which is how the
+drift survived: a check that cannot fail is worse than no check, because it is
+believed.
+
+## Why a brief is the caller's file and not the repository's
+
+`agentbox run <repo> tests.md` resolves `tests.md` against the directory the
+operator is standing in, and nowhere else. If it is not there, the command says so
+and names the path it looked for.
+
+The rejected alternative was a second search path: fall back to the repository
+root, so that a brief committed in the repository can be named without a prefix.
+It is a real convenience and it makes one bad thing possible — the same command
+line, typed in two directories, runs two different briefs. Worse, the failure is
+invisible: both files exist, the command succeeds, and the run is against the
+file the operator was not looking at.
+
+One search path plus a good error message gets most of the convenience with none
+of the ambiguity. The error names the repository candidate it did *not* search, so
+an operator who meant that file is told the path to type rather than left
+guessing.
+
+This is recorded because the original request asked for the fallback, and the
+shipped behaviour is deliberately different. The issue is closed with the
+behaviour it has; the decision lives here, and the regression check that was
+missing exists now.
+
+## Why a stopped box reports nothing rather than zero
+
+`status --json` has three ways to say "there is no value here", and they mean
+different things: `null` is *nobody could answer*, an empty array or a zero is
+*genuinely none*, and absence is reserved for exactly one key.
+
+Getting this wrong is not cosmetic. The fallback object the host prints when the
+guest did not answer used to claim `runs_total: 0` and `sessions: []` — that is, a
+stopped box asserted it had never run anything and had no sessions. Both are
+claims about the guest, and runs live in the guest, so a host that cannot reach
+the guest cannot have counted them. A reader with no way to distinguish those from
+a genuinely empty box will draw the wrong conclusion and, worse, will draw it
+confidently.
+
+So every guest-computed key in the fallback is `null`, including the new ones, and
+`null` is what a reader must handle for all of them. The one key that is *absent*
+rather than null is `firewall_detail`, which exists only when there is something
+to say: the mode is unknown, or the recorded mode and the live ruleset disagree.
+Making it null on a healthy box would read as a fourth kind of unknown; that
+asymmetry is deliberate and is stated in one place so it is not rediscovered as a
+bug.
+
+The host's own keys are not affected, because the host knows them whatever the
+box is doing — and since this version they are printed **after** the guest's
+object rather than before it, so that a guest answer carrying a duplicate
+`"state"` or `"name"` loses. Both `jq` and Python take the last of a repeated
+key. Before that change the box's own answer won, which is the opposite of what
+the splice was for.
+
+## Why the smoke suite can be stopped early, and why a truncated run is not evidence
+
+The suite builds three real VMs and takes an hour. That made it a thing people
+ran once and then reasoned about, which is how a suite stops being a check.
+
+Two environment knobs fix the loop without pretending to be a test runner.
+`SMOKE_STOP_AFTER=<label>` stops at a named step's end, which turns the host-only
+steps from an hour into a couple of minutes, and prints a `STOPPED AFTER` line so
+the output says what it is. `SMOKE_KEEP=1` leaves the instances behind for
+inspection. A real subset runner was rejected: genuinely running one step alone
+means wrapping thousands of lines of straight-line script into functions, or
+keeping a manifest of line ranges that goes stale at the first insertion.
+`SMOKE_STOP_AFTER` is what the existing `step()` can implement honestly.
+
+The rule that comes with them is the important half: **a truncated run is not
+evidence.** The contract this project works to says test output is pasted, not
+claimed, and a pasted `STOPPED AFTER 3h` proves the host-only steps and nothing
+about the three VMs. So the process contract says the pasted evidence comes from
+an unfiltered run, and the stop line exists so that a filtered one cannot be
+mistaken for one.
+
+Two more things were learned by the suite lying rather than failing. A missing
+`jq` on the host turned 26 contract assertions into confident FAILs about the
+product, so the prerequisites are now checked up front, by name, before any
+counter moves. And the suite's fixed test ports collided with whatever else was
+on the host that day, which presented as a firewall breach — ports are now
+derived from the suite's own process id, and the port-dependent steps re-probe
+immediately before they create anything, since `create` now refuses a port
+somebody else took in the meantime.
+
+## Why "the new version" is a commit, and not a tag
+
+There are no tags in this repository, no `CHANGELOG`, and no CI. That is not an
+oversight to be fixed in passing, and the version question has a real answer
+without any of them.
+
+The mechanism nobody had written down is the whole answer. The installed CLI is a
+symlink into a checkout, `bin/agentbox` resolves that symlink to find its own
+directory, and **the same checkout is mounted read-only at `/opt/agent-box` in
+every box**, where provisioning re-runs at every start. So there is exactly one
+version on a host — the checkout's current commit — and it is simultaneously the
+version of the CLI, of the guest scripts, of the provisioner and of the pins
+file. `agentbox version` prints that commit, its date, and whether the tree is
+clean, because a dirty tree means the boxes are running something that is not any
+commit at all.
+
+The consequence is the one to internalise, and it is why several decisions in
+this file are shaped as they are: the moment the checkout moves, every existing
+box runs the new provisioner at its next start. An upgrade is therefore not a
+thing that happens to new boxes; it is a thing that happens to boxes that hold
+real work. That is why the toolchain installer is fail-soft and idempotent, why
+it tolerates a create-time parameter that a frozen instance never received, and
+why the channel's hooks are inert unless a session is the tracked standing one.
+
+Tags are not added by hand here, because the rule this project works to is that
+semver tags come from release automation and never from a person. That automation
+needs a workflow, and adding CI to this repository is a change to the guard rails
+rather than a change to the tool — it needs the owner's own decision, and it is
+filed as one. Until then, "the new version" means: merged to the default branch,
+installed on this machine, and proven here. Which is a weaker claim than a tag,
+and is stated as the weaker claim rather than dressed up as one.

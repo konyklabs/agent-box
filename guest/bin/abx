@@ -1,0 +1,7 @@
+#!/bin/bash
+#
+# agent-box — `abx`, the box's side of the channel. The whole of it is
+# guest/channel.sh; this exists so that the name on the agent's PATH is three
+# letters. The path is resolved from this file rather than written as
+# /opt/agent-box, so the checkout answers wherever it is mounted or checked out.
+exec "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/channel.sh" "$@"

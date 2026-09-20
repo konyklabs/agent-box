@@ -1,0 +1,76 @@
+# agent-box — the toolchain pins. ONE file. Nothing here floats.
+#
+# Bump with host/refresh-pins.sh, which re-fetches every asset, records the
+# digest it actually saw, and refuses to write a line it could not verify.
+# Then `agentbox start <repo>` on each box. A box never moves on its own.
+#
+# Read one value with the same idiom test/smoke.sh uses:
+#   sed -n 's/^KEY="\(.*\)"$/\1/p' guest/toolchain.pins
+# URLs are written out in full rather than composed from the version above
+# them, so that read returns a usable value to a reader that is not a shell.
+#
+# fetched: 2026-09-19
+
+UV_VERSION="0.12.17"
+UV_URL_ARM64="https://github.com/astral-sh/uv/releases/download/0.12.17/uv-aarch64-unknown-linux-gnu.tar.gz"
+UV_SHA256_ARM64="d636d1b678e9e7f367ecb22b46bd1cabbed234d6bc3b4d96365d2b507f72f86c"
+UV_URL_AMD64="https://github.com/astral-sh/uv/releases/download/0.12.17/uv-x86_64-unknown-linux-gnu.tar.gz"
+UV_SHA256_AMD64="fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63"
+
+RUFF_VERSION="0.16.8"
+RUFF_URL_ARM64="https://github.com/astral-sh/ruff/releases/download/0.16.8/ruff-aarch64-unknown-linux-gnu.tar.gz"
+RUFF_SHA256_ARM64="8ff18ee07d6ed3cfbd05fdc9012646a79482c00045dbcbf32416ef8f14ab1f7e"
+RUFF_URL_AMD64="https://github.com/astral-sh/ruff/releases/download/0.16.8/ruff-x86_64-unknown-linux-gnu.tar.gz"
+RUFF_SHA256_AMD64="c4a8c7c152532bcb7e7ede4bd6ccd440dcacddffcdcdd79b90090ac6021f41c2"
+
+NODE_VERSION="24.21.0"
+# What that tarball bundles. Read out of its own npm/package.json,
+# asserted by toolcheck, never installed separately.
+NODE_NPM_VERSION="11.19.0"
+NODE_URL_ARM64="https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-arm64.tar.xz"
+NODE_SHA256_ARM64="6ad1325edbdb5649c379b75a237147a666c95d4f9ae8d340fef2d1575d289ad2"
+NODE_URL_AMD64="https://nodejs.org/dist/v24.21.0/node-v24.21.0-linux-x64.tar.xz"
+NODE_SHA256_AMD64="fd8e59d5a511510f6a298afb548f18c7d2b1be404d8b4a27d94fbe49f56cb2d6"
+
+MISE_VERSION="2026.9.11"
+MISE_URL_ARM64="https://github.com/jdx/mise/releases/download/v2026.9.11/mise-v2026.9.11-linux-arm64"
+MISE_SHA256_ARM64="80ad6e9589d3c4483fd67a4a97f07e28330964dde64ca8cad15d5cb56134a54d"
+MISE_URL_AMD64="https://github.com/jdx/mise/releases/download/v2026.9.11/mise-v2026.9.11-linux-x64"
+MISE_SHA256_AMD64="6e39ee1ffa926a1f64814efbf1d26c3f617255e2a6ba6152e3c8a5135fa5a35f"
+
+TRUFFLEHOG_VERSION="3.97.5"
+TRUFFLEHOG_URL_ARM64="https://github.com/trufflesecurity/trufflehog/releases/download/v3.97.5/trufflehog_3.97.5_linux_arm64.tar.gz"
+TRUFFLEHOG_SHA256_ARM64="e5c8b2418b0a7c78cf4c47ac783c52c63f989e4e536cfe328b5271e819b6d52d"
+TRUFFLEHOG_URL_AMD64="https://github.com/trufflesecurity/trufflehog/releases/download/v3.97.5/trufflehog_3.97.5_linux_amd64.tar.gz"
+TRUFFLEHOG_SHA256_AMD64="e3d97199c565c37ca6152750197f667e08ae6a1edf5911fbdec168622b28620c"
+
+ACTIONLINT_VERSION="1.7.12"
+ACTIONLINT_URL_ARM64="https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_arm64.tar.gz"
+ACTIONLINT_SHA256_ARM64="325e971b6ba9bfa504672e29be93c24981eeb1c07576d730e9f7c8805afff0c6"
+ACTIONLINT_URL_AMD64="https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz"
+ACTIONLINT_SHA256_AMD64="8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
+
+DPRINT_VERSION="0.57.4"
+DPRINT_URL_ARM64="https://github.com/dprint/dprint/releases/download/0.57.4/dprint-aarch64-unknown-linux-gnu.zip"
+DPRINT_SHA256_ARM64="ff961314e7c1ca6a02eaada0e37920a37c668fbc09fd85838c2aced41a4bc0e4"
+DPRINT_URL_AMD64="https://github.com/dprint/dprint/releases/download/0.57.4/dprint-x86_64-unknown-linux-gnu.zip"
+DPRINT_SHA256_AMD64="1d26357d8bc66898d4ecc7dafca3d2971cfe222ba487228bd2ce5c3b3a309c33"
+
+# The Python tools carry no URL or digest here: each is installed from
+# guest/toolchain/<tool>.requirements.txt with `uv pip install
+# --require-hashes`, which refuses any wheel — transitive ones included — whose
+# sha256 is not in that file. The files are compiled by host/refresh-pins.sh
+# with `uv pip compile --generate-hashes --universal --python-version 3.12`.
+BASEDPYRIGHT_VERSION="1.40.1"
+SEMGREP_VERSION="1.177.0"
+PLAYWRIGHT_VERSION="1.63.0"
+# The browser build the pinned Playwright asks for. Read back from
+# playwright-core's browsers.json, never chosen: it is a function of the
+# Playwright version, and recording it is what makes a drift visible.
+PLAYWRIGHT_CHROMIUM_REVISION="1243"
+
+# Claude Code. See docs/decisions.md, "Why Claude Code is the one version the
+# box does not pin". `latest` here is a statement, not an omission:
+# DISABLE_AUTOUPDATER=1 means the box never moves on its own, and
+# `agentbox update <repo>` is the deliberate move.
+CLAUDE_CODE_VERSION="latest"
