@@ -2242,8 +2242,20 @@ channel_mv_onto() {
 # ascending. Nothing here opens a file. A name that does not read as `<id>.md`
 # is counted in CH_SKIPPED and never printed — the name is the hostile part, so
 # the count is the whole report. `-size +0c` skips a reservation a crash left
-# behind, `-type f` skips a planted symlink or FIFO, and a name holding a newline
-# arrives as two lines that both fail the shape.
+# behind, and `-type f` skips a planted symlink or FIFO.
+#
+# The shape alone is NOT enough, and an earlier comment here claimed it was. A
+# name holding a newline arrives as TWO lines and each half can be shaped exactly
+# like a message name: `9x<LF>99999999-999999-99.md` yields `9x` and
+# `99999999-999999-99`, the second of which passes `valid_msgid` while naming no
+# file. Measured with this loop lifted verbatim: one such file beside one real
+# message produced a phantom id. It counted as unread, it was printed into the
+# host session by the hook notice, and because `handoff` with no id takes the
+# highest id first, the phantom was selected and the command died before the real
+# handoff was ever shown -- one file the box can write, and the host half of the
+# channel stops working. So the line has to BE the path the id reconstructs, and
+# that path has to still be a message file. The guest's `channel_ids`
+# (guest/channel.sh) carries the same two guards for the same reason.
 #
 # `sort` comes BEFORE the 1000-name bound, which is the whole point of the bound
 # being there: `find` lists a directory in its own order, so truncating first
@@ -2262,9 +2274,11 @@ channel_ids() {
     [ -n "$dir" ] && [ -d "$dir" ] || return 0
     while IFS= read -r name; do
         [ -n "$name" ] || continue
-        name=${name##*/}
-        stem=${name%.md}
-        if [ "$stem" != "$name" ] && valid_msgid "$stem"; then
+        stem=${name##*/}
+        stem=${stem%.md}
+        if [ "${name##*/}" != "$stem" ] && valid_msgid "$stem" \
+           && [ "$name" = "${dir%/}/${stem}.md" ] \
+           && [ -f "${dir%/}/${stem}.md" ] && [ ! -L "${dir%/}/${stem}.md" ]; then
             CH_IDS+=("$stem")
         else
             CH_SKIPPED=$((CH_SKIPPED + 1))

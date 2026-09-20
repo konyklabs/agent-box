@@ -2164,7 +2164,12 @@ done
 
 printf -- '\n--- and each one is on PATH in a NON-login shell, which limactl shell is ---\n'
 TC_PATH="${TMP_ROOT}/toolchain-path.out"
-guest sh -c 'command -v uv uvx ruff node npm npx mise trufflehog actionlint dprint basedpyright semgrep playwright' \
+# One `command -v` PER TOOL. The guest's /bin/sh is dash, whose `command -v`
+# reports only its FIRST operand: the multi-operand form printed one line for
+# thirteen tools, so twelve of them read as "not on PATH" while every one of them
+# was in fact at /usr/local/bin. Measured in a real guest.
+# shellcheck disable=SC2016  # "$t" must expand in the guest's shell, not here
+guest sh -c 'for t in uv uvx ruff node npm npx mise trufflehog actionlint dprint basedpyright semgrep playwright; do command -v "$t" || echo "MISSING $t"; done' \
     > "$TC_PATH" 2>&1 || true
 cat "$TC_PATH"
 for tc_tool in uv ruff node npm mise trufflehog actionlint dprint basedpyright semgrep playwright; do

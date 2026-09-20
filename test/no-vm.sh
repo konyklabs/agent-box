@@ -1074,6 +1074,31 @@ check_version() {
     else bad "version accepted --json, which it does not implement: '${out}'"; fi
 }
 
+# The host's channel_ids must not accept a fabricated id. A name holding a
+# newline arrives from `find` as two lines and each half can be shaped like a
+# message name, so the shape alone is not enough: the line has to BE the path the
+# id reconstructs, and that path has to still be a regular file. The lens round
+# reproduced the phantom before this guard existed.
+check_host_channel_ids() {
+    section "host channel_ids: a name is only an id if it names a message file"
+    local d fn out
+    d="${WORK}/chanids/to-host"; mkdir -p "$d"
+    printf 'x\n' > "${d}/20260101-120000-00.md"
+    printf 'x\n' > "${d}/$(printf '9x\n99999999-999999-99')".md 2>/dev/null || true
+    ln -s /etc/passwd "${d}/20260101-120000-01.md" 2>/dev/null
+    mkfifo "${d}/20260101-120000-02.md" 2>/dev/null
+    fn=$(sed -n '/^valid_msgid()/,/^}/p;/^CH_IDS=()/,/^}/p' "${AGENTBOX}")
+    if [ -z "$fn" ]; then bad "could not extract valid_msgid and channel_ids"; return; fi
+    out=$(bash -c "${fn}"$'\nchannel_ids "'"${d}"$'"\nprintf "%s\\n" "${CH_IDS[@]}"' 2>/dev/null)
+    if printf '%s\n' "$out" | grep -qx "20260101-120000-00"; then ok "the real message is listed"
+    else bad "the real message is missing from CH_IDS"; fi
+    for ghost in 99999999-999999-99 20260101-120000-01 20260101-120000-02; do
+        if printf '%s\n' "$out" | grep -qx "$ghost"; then bad "channel_ids accepted ${ghost}"
+        else ok "channel_ids refused ${ghost}"; fi
+    done
+    rm -rf "${WORK}/chanids"
+}
+
 check_repo_git
 check_host_clip
 check_meta_race
@@ -1083,6 +1108,7 @@ check_slot_list
 check_proc_starttime
 check_channel_read
 check_chromium_found
+check_host_channel_ids
 check_status_text_clamp
 check_toolchain_snapshot_keep
 check_box_json_hostile_values

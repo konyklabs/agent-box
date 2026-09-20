@@ -796,7 +796,17 @@ cmd_handoff() {
     grep -q '^## Unproven' "$CH_BODY_FILE" \
         || die "refusing: the body has no \"## Unproven\" section. Say what was not proven; \"nothing\" is an answer"
 
-    [ -n "$subject" ] || subject=$(channel_default_subject "$CH_BODY_FILE")
+    if [ -n "$subject" ]; then
+        # An operator-supplied subject is the one `subject:` that does not come
+        # from the already-scrubbed body, so it is scrubbed here. Without this
+        # the sanctioned path is the one that writes a credential to the host's
+        # filesystem -- exactly what this file's header says the write-time scrub
+        # prevents, and `--subject` is the form conventions.md teaches an agent.
+        subject=$(printf '%s' "$subject" | channel_scrub) || \
+            die "refusing: the subject could not be redacted; nothing was published"
+    else
+        subject=$(channel_default_subject "$CH_BODY_FILE")
+    fi
     subject="${subject:0:$CH_SUBJECT_LIMIT}"
     channel_valid_oneline "$subject" || subject="handoff on ${branch}"
 
