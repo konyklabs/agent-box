@@ -1129,6 +1129,18 @@ CH_HOOK_MIN_BODY=200
 # What the frame around a body costs at most: the two header lines, the two bars
 # and the two closing lines of channel_request_frame.
 CH_HOOK_FRAME_COST=500
+# Held back from the budget while the card's content is added, and released only
+# for the lines that say what was left out. The reservation is the whole point:
+# those lines are added last, against the cap the bodies have just filled, so
+# without it they are the FIRST thing a full card drops — and a card that omitted
+# a request's text while saying nothing about it reads as complete. Measured on
+# this shape: four 1500-byte requests fill the card to 7848 bytes, and the
+# 153-byte line naming the other three then needs 8002.
+CH_HOOK_TAIL=900
+# How many ids one of those lines names before it says how many more there are.
+# The line has to fit inside the tail whatever the mailbox holds: `abx inbox` is
+# what prints two hundred queued requests, not a hook.
+CH_HOOK_NOTE_IDS=8
 
 CH_NL='
 '
@@ -1140,6 +1152,9 @@ CH_NL='
 # one thing this mechanism must not lose.
 CH_HOOK_TEXT=""
 CH_HOOK_USED=0
+# The cap channel_hook_add enforces right now: the budget minus the tail while the
+# card's content is added, the whole budget for the notes at the end.
+CH_HOOK_CAP=$((CH_HOOK_BUDGET - CH_HOOK_TAIL))
 CH_HOOK_SHOWN=""
 CH_HOOK_DROPPED=""
 CH_HOOK_UNREADABLE=""
@@ -1285,10 +1300,40 @@ channel_hook_add() {
     local part="${1-}" n
     [ -n "$part" ] || return 0
     n=$(channel_hook_bytes "$part") || return 1
-    [ $((CH_HOOK_USED + n + 1)) -le "$CH_HOOK_BUDGET" ] || return 1
+    [ $((CH_HOOK_USED + n + 1)) -le "$CH_HOOK_CAP" ] || return 1
     CH_HOOK_TEXT="${CH_HOOK_TEXT}${part}${CH_NL}"
     CH_HOOK_USED=$((CH_HOOK_USED + n + 1))
     return 0
+}
+
+# A part added against the WHOLE budget rather than the working cap. Only the
+# lines that say what was left out go through here: the tail exists for them, and
+# the last two hundred bytes of a request body are worth less than the sentence
+# that tells the session another request is waiting and unread.
+channel_hook_note() {
+    local saved="$CH_HOOK_CAP" rc
+    CH_HOOK_CAP="$CH_HOOK_BUDGET"
+    channel_hook_add "${1-}"
+    rc=$?
+    CH_HOOK_CAP="$saved"
+    return "$rc"
+}
+
+# The first few ids of a set, then how many more there are and the command that
+# prints all of them. Bounded on purpose: the line this builds has to fit the tail
+# whether the mailbox holds three requests or three hundred.
+channel_hook_id_list() {
+    local id list="" n=0
+    for id in ${1-}; do
+        n=$((n + 1))
+        [ "$n" -le "$CH_HOOK_NOTE_IDS" ] || continue
+        list="${list}${list:+ }${id}"
+    done
+    printf '%s' "$list"
+    if [ "$n" -gt "$CH_HOOK_NOTE_IDS" ]; then
+        printf ' ... and %s more, all of them listed by: abx inbox' "$((n - CH_HOOK_NOTE_IDS))"
+    fi
+    printf '\n'
 }
 
 # The fixed half of the card: what this session is, what the session on the host
@@ -1353,11 +1398,13 @@ channel_hook_open_index() {
 # emitted without bodies rather than showing the same request twice.
 #
 # Sets CH_HOOK_SHOWN (recorded as delivered once the output is emitted) and
-# CH_HOOK_DROPPED (named in the card, never recorded).
+# CH_HOOK_DROPPED (named in the card, never recorded). EVENT is here only so that
+# the unreadable list below can be the card's alone; the bodies themselves do not
+# care which event asked for them.
 channel_hook_bodies() {
-    local ids="$1" allow="$2" id frame budget
+    local ids="$1" allow="$2" event="${3-}" id frame budget list
     for id in $ids; do
-        budget=$((CH_HOOK_BUDGET - CH_HOOK_USED - CH_HOOK_FRAME_COST))
+        budget=$((CH_HOOK_CAP - CH_HOOK_USED - CH_HOOK_FRAME_COST))
         [ "$budget" -le "$CH_BODY_LIMIT" ] || budget="$CH_BODY_LIMIT"
         if [ "$allow" = no ] || [ "$budget" -lt "$CH_HOOK_MIN_BODY" ]; then
             CH_HOOK_DROPPED="${CH_HOOK_DROPPED}${id} "
@@ -1379,11 +1426,20 @@ channel_hook_bodies() {
         fi
     done
     if [ -n "$CH_HOOK_DROPPED" ]; then
-        channel_hook_add "[agent-box] open requests whose text did not fit here: ${CH_HOOK_DROPPED% }
+        list=$(channel_hook_id_list "$CH_HOOK_DROPPED")
+        channel_hook_note "[agent-box] open requests whose text did not fit here: ${list}
 Read each one in full with: abx read <id>" || CH_HOOK_SQUEEZED=yes
     fi
-    if [ -n "$CH_HOOK_UNREADABLE" ]; then
-        channel_hook_add "[agent-box] open requests this box could not read as messages: ${CH_HOOK_UNREADABLE% }
+    # The card only. A file this box cannot frame is never recorded as delivered —
+    # writing `.delivered` for text the model never saw is the one lie
+    # channel_request_frame refuses to tell — so its id stays in UNSEEN until the
+    # host answers it. Naming it on every PostToolUse and blocking every Stop for
+    # it would therefore go on for the life of the session, which is the loop A9
+    # forbids; and it is not news a session can act on twice. SessionStart, which
+    # also lists it in the open index, says it once per context.
+    if [ -n "$CH_HOOK_UNREADABLE" ] && [ "$event" = SessionStart ]; then
+        list=$(channel_hook_id_list "$CH_HOOK_UNREADABLE")
+        channel_hook_note "[agent-box] open requests this box could not read as messages: ${list}
 Nothing of them is shown. 'abx inbox' lists them; the host still counts them as queued." \
             || CH_HOOK_SQUEEZED=yes
     fi
@@ -1458,6 +1514,7 @@ channel_hook_build() {
     local event="$1" ids="$2" allow="$3" part
     CH_HOOK_TEXT=""
     CH_HOOK_USED=0
+    CH_HOOK_CAP=$((CH_HOOK_BUDGET - CH_HOOK_TAIL))
     CH_HOOK_SHOWN=""
     CH_HOOK_DROPPED=""
     CH_HOOK_UNREADABLE=""
@@ -1468,22 +1525,22 @@ channel_hook_build() {
             part=$(channel_hook_host_line) && channel_hook_add "$part"
             if [ -n "$ids" ]; then
                 part=$(channel_hook_open_index "$ids") && channel_hook_add "$part"
-                channel_hook_bodies "$ids" "$allow"
+                channel_hook_bodies "$ids" "$allow" "$event"
             fi
             channel_hook_runs
             channel_hook_conventions
             channel_hook_toolchain
             if [ "$CH_HOOK_SQUEEZED" = yes ]; then
-                channel_hook_add "[agent-box] (some of this card did not fit: the conventions are in /opt/agent-box/guest/conventions.md, and 'toolcheck' prints the toolchain findings.)" || true
+                channel_hook_note "[agent-box] (some of this card did not fit: the conventions are in /opt/agent-box/guest/conventions.md, and 'toolcheck' prints the toolchain findings.)" || true
             fi
             ;;
         UserPromptSubmit)
-            channel_hook_bodies "$ids" "$allow"
+            channel_hook_bodies "$ids" "$allow" "$event"
             channel_hook_runs
             part=$(channel_hook_reminder) && channel_hook_add "$part"
             ;;
         PostToolUse|Stop)
-            channel_hook_bodies "$ids" "$allow"
+            channel_hook_bodies "$ids" "$allow" "$event"
             ;;
     esac
     return 0

@@ -5024,7 +5024,16 @@ fi
 printf -- '\n--- (c) the real CLI: the settings wiring and the exported environment ---\n'
 # The stand-in has to go first: the name belongs to one process, and that is the
 # refusal this slice adds. The real session takes it from here.
-guest bash -lc "kill ${CH8L_PID:-0} 2>/dev/null; rm -f \$HOME/.agent-box/sessions/claude/pid; true"
+#
+# The pid is guarded the way every other pid kill in this file is guarded. A
+# `${CH8L_PID:-0}` default is not a no-op: `kill 0` signals the whole process
+# group, which is this shell, so the `rm -f` after it would never run and the
+# real session below would then refuse to start on a stale pid file — a delivery
+# failure with nothing to do with delivery. The pid is empty whenever the setup
+# heredoc above did not print FAKE_PID.
+CH8L_KILL=""
+case "${CH8L_PID:-}" in ''|*[!0-9]*) ;; *) CH8L_KILL="kill ${CH8L_PID} 2>/dev/null;" ;; esac
+guest bash -lc "${CH8L_KILL} rm -f \$HOME/.agent-box/sessions/claude/pid; true"
 CH8L_R4="${TMP_ROOT}/ch8l-req4.out"
 run_bounded 60 "$CH8L_R4" "$AGENTBOX" request "$CLEAN_REPO" \
     --subject 'through the real CLI' --text 'the real hooks deliver this: SMOKE-8L-BODY-4'
@@ -5188,7 +5197,10 @@ then
 else
     bad "the host keys are not last in the box object"
 fi
-guest bash -lc "kill ${CH8L_PID2:-0} 2>/dev/null; rm -f \$HOME/.agent-box/sessions/claude/pid; true"
+# Guarded for the reason given at the first of these two kills.
+CH8L_KILL2=""
+case "${CH8L_PID2:-}" in ''|*[!0-9]*) ;; *) CH8L_KILL2="kill ${CH8L_PID2} 2>/dev/null;" ;; esac
+guest bash -lc "${CH8L_KILL2} rm -f \$HOME/.agent-box/sessions/claude/pid; true"
 
 # Everything this step planted, gone: the queued requests are answered (a
 # leftover would be counted by 9-ch), the session's own records are removed, and
