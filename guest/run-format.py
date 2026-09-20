@@ -1305,6 +1305,7 @@ def _box_only_object(facts, as_of):
         "docker_images": _count(facts.get("docker_images")),
         "docker_volumes": _count(facts.get("docker_volumes")),
         "guest_repos": _count(facts.get("guest_repos")),
+        "home_files": _count(facts.get("home_files")),
     }
 
 
@@ -1314,11 +1315,17 @@ def _box_only_categories(box_only):
     Naming them is the point. "Box-only" as one number is the answer that made
     an operator destroy a box with a named volume in it; "2 docker volumes"
     is the answer that does not.
+
+    Ordered by how irreplaceable the thing is, which is not how large it is: a
+    repository and a named volume first, then the loose files an agent wrote into
+    the home instead of the mount (a patch, a note -- nothing reproduces those),
+    then docker images and transcripts, which a rebuild and a re-run can replace.
     """
     named = []
     for key, one, many in (
         ("guest_repos", "git repository", "git repositories"),
         ("docker_volumes", "docker volume", "docker volumes"),
+        ("home_files", "file in the box's home", "files in the box's home"),
         ("docker_images", "docker image", "docker images"),
         ("transcripts", "run transcript", "run transcripts"),
     ):
@@ -1461,6 +1468,7 @@ def _triage_stand_in(text_mode):
             "docker_images": None,
             "docker_volumes": None,
             "guest_repos": None,
+            "home_files": None,
         },
         "dirty_files": None,
     }
@@ -1519,8 +1527,11 @@ def cmd_box_triage(args):
         print(json.dumps(scrub_obj(obj), separators=(",", ":")))
 
     # The watermark. `yes` is by CATEGORY, not by byte count: ~/.agent-box and
-    # ~/.claude exist in every box and a box with neither a transcript, a
-    # repository nor a docker volume in it holds no work, whatever it weighs.
+    # ~/.claude exist in every box and a box with no transcript, no repository, no
+    # loose file in its home and no docker volume holds no work, whatever it
+    # weighs. The byte count is the two state directories only, so a box whose one
+    # box-only thing is a loose file reads `yes` with a small number beside it --
+    # the categories are the claim, the bytes are only the size of the state dirs.
     print("boxonly=%s bytes=%d" % ("yes" if categories else "no", bytes_total))
     return 0
 

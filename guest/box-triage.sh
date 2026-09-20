@@ -33,29 +33,39 @@ HANDOFFS=""
 REQUESTS=""
 TEXT_MODE=false
 
+# A flag that takes a value must HAVE one before `shift 2`. `set -uo pipefail`
+# above carries no `-e`, so a `shift 2` with a single argument left FAILS without
+# shifting, and the loop below then re-reads the same `$1` for ever: a bash spin
+# at 100% CPU inside the box, and — since `guest_shell` puts no timeout on the
+# call — a host `agentbox triage` that never returns and never says why.
+need_value() { [ $# -ge 2 ] || die "$1 needs a value"; }
+
 while [ $# -gt 0 ]; do
     case "$1" in
         --scarce)
+            need_value "$@"
             case "${2:-}" in
                 none|disk|compute|both) SCARCE="$2" ;;
                 *) die "--scarce takes none, disk, compute or both" ;;
             esac
             shift 2 ;;
         --repo)
+            need_value "$@"
             case "${2:-}" in
                 ok|missing|not-git) REPO_STATE="$2" ;;
                 *) die "--repo takes ok, missing or not-git" ;;
             esac
             shift 2 ;;
         --bench)
+            need_value "$@"
             case "${2:-}" in
                 yes|no|stale) BENCH="$2" ;;
                 *) die "--bench takes yes, no or stale" ;;
             esac
             shift 2 ;;
-        --unexported-commits) UNEXPORTED="${2:-}"; shift 2 ;;
-        --handoffs-unread)    HANDOFFS="${2:-}";   shift 2 ;;
-        --requests-queued)    REQUESTS="${2:-}";   shift 2 ;;
+        --unexported-commits) need_value "$@"; UNEXPORTED="$2"; shift 2 ;;
+        --handoffs-unread)    need_value "$@"; HANDOFFS="$2";   shift 2 ;;
+        --requests-queued)    need_value "$@"; REQUESTS="$2";   shift 2 ;;
         --text) TEXT_MODE=true; shift ;;
         *) die "usage: box-triage.sh --scarce W [--repo W] [--bench W] [--unexported-commits N] [--handoffs-unread N] [--requests-queued N] [--text]" ;;
     esac
@@ -116,7 +126,8 @@ fi
 # The precise list, not the loose one. Commits on `agent/*` branches and the
 # working tree are NOT here: /work is the host's own directory. What is here is
 # what exists on no host disk at all — run transcripts, Claude Code's state,
-# repositories somebody cloned into the box's home, and docker volumes.
+# repositories somebody cloned into the box's home, loose files an agent wrote in
+# the home instead of into the mount, and docker volumes.
 STATE_BYTES=$(dir_bytes "$ABX_STATE_DIR")
 CLAUDE_BYTES=$(dir_bytes "$ABX_CLAUDE_CONFIG_DIR")
 
@@ -133,14 +144,45 @@ fi
 GUEST_REPOS=$(find "$HOME" -maxdepth 3 -name .git -not -path "${ABX_WORK_DIR}/*" 2>/dev/null \
     | wc -l | tr -d ' ')
 
-# Docker, and only when the daemon actually answers: `command -v docker` is true
-# in a box where the socket is not there, and a hang here would hold up the
-# whole fleet report.
+# Loose work in the home: a file somebody wrote outside the mount and outside the
+# four reproducible places above. Nothing the provisioner creates in this home is
+# counted — every path it makes is dot-prefixed (`provision.sh:746-750`, `.claude`,
+# `.local`, `.config`) and hidden entries are pruned — so a non-hidden file here
+# is somebody's work, on no host disk at all. A directory that is a git work tree
+# is pruned too: it is already reported as a guest repository, and counting its
+# files again would name the same thing twice. Same depth bound, same reason.
+HOME_FILES=$(find "$HOME" -maxdepth 3 \
+    -name '.*' -prune -o \
+    -path "$ABX_WORK_DIR" -prune -o \
+    -type d -exec test -e '{}/.git' ';' -prune -o \
+    -type f -print 2>/dev/null | wc -l | tr -d ' ')
+
+# Docker, and only when the daemon actually answers, BOUNDED: `command -v docker`
+# is true in a box where the socket is not there, and a daemon that is wedged
+# (a container in D-state, a full overlay filesystem) does not fail — it blocks.
+# `guest_shell` puts no timeout on the call and the host's fleet loop is serial,
+# so an unbounded probe here holds up the whole report and never says which box
+# did it. Five seconds, the same bound and the same reason as `docker info` in
+# guest/init-firewall.sh. No `timeout` in this guest means no bound available, and
+# then the counts stay unknown rather than being gathered without one.
+DOCKER_TIMEOUT=5
 DOCKER_IMAGES=""
 DOCKER_VOLUMES=""
-if command -v docker >/dev/null 2>&1 && docker version >/dev/null 2>&1; then
-    DOCKER_IMAGES=$(docker image ls -q 2>/dev/null | wc -l | tr -d ' ')
-    DOCKER_VOLUMES=$(docker volume ls -q 2>/dev/null | wc -l | tr -d ' ')
+
+# One bounded docker query, counted. A query that timed out or failed prints
+# nothing and returns non-zero, so its count stays empty and reads `null`: "the
+# daemon did not answer" and "there are none" are different answers, and an
+# operator acts differently on them.
+docker_count() {
+    local out
+    out=$(timeout "$DOCKER_TIMEOUT" docker "$1" ls -q 2>/dev/null) || return 1
+    printf '%s' "$out" | awk 'NF{n++} END{print n+0}'
+}
+
+if command -v timeout >/dev/null 2>&1 && command -v docker >/dev/null 2>&1 \
+   && timeout "$DOCKER_TIMEOUT" docker version >/dev/null 2>&1; then
+    DOCKER_IMAGES=$(docker_count image)
+    DOCKER_VOLUMES=$(docker_count volume)
 fi
 
 # --- the firewall ----------------------------------------------------------
@@ -191,6 +233,7 @@ FACTS=$(jq -n \
     --argjson claude_state_bytes "$(jnum "$CLAUDE_BYTES")" \
     --argjson transcripts "$(jnum "$TRANSCRIPTS")" \
     --argjson guest_repos "$(jnum "$GUEST_REPOS")" \
+    --argjson home_files "$(jnum "$HOME_FILES")" \
     --argjson docker_images "$(jnum "$DOCKER_IMAGES")" \
     --argjson docker_volumes "$(jnum "$DOCKER_VOLUMES")" \
     --argjson leftovers "$LEFTOVERS" \
@@ -199,7 +242,7 @@ FACTS=$(jq -n \
       unexported_commits:$unexported_commits, handoffs_unread:$handoffs_unread,
       requests_queued:$requests_queued, dirty_files:$dirty_files,
       state_bytes:$state_bytes, claude_state_bytes:$claude_state_bytes,
-      transcripts:$transcripts, guest_repos:$guest_repos,
+      transcripts:$transcripts, guest_repos:$guest_repos, home_files:$home_files,
       docker_images:$docker_images, docker_volumes:$docker_volumes,
       leftovers:$leftovers}' 2>/dev/null)
 

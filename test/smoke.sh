@@ -3718,10 +3718,13 @@ printf -- '\n--- agentbox triage --json across every box ---\n'
 # Two boxes of this run's own would have been the stronger form; the slot's
 # position is fixed and the destroy above is not this slice's line to move.
 #
-# The POSITIVE box-only answer is planted first: a git repository in the guest's
-# home, outside the mount, is the real work-loss risk a destroy takes, and it has
-# to be reported BY CATEGORY rather than as a byte count. The paired control is
-# at the end of the slot — the plant is removed and the category goes away.
+# The POSITIVE box-only answers are planted first, both kinds a non-docker box can
+# hold: a git repository in the guest's home, and plain files an agent wrote into
+# the home instead of into the mount. Both are outside /work, so both are work a
+# destroy takes and no host disk has, and both have to be reported BY CATEGORY
+# rather than as a byte count — "nothing is only inside this box" is a claim, and
+# a box holding an unexported patch must never make it. The paired control is at
+# the end of the slot: the plants are removed and both categories go away.
 PLANT_OUT="${TMP_ROOT}/triage-plant.out"
 # shellcheck disable=SC2016  # $HOME is the guest's, expanded in there.
 guest bash -lc '
@@ -3731,10 +3734,13 @@ git init -q . || exit 1
 printf "work that exists on no host disk\n" > note.txt
 git add note.txt || exit 1
 git -c user.email=smoke@example.invalid -c user.name=smoke commit -q -m "box-only work" || exit 1
+printf "a patch nobody exported\n" > "$HOME/keepme-fix.diff" || exit 1
+mkdir -p "$HOME/keepme-scratch" || exit 1
+printf "notes an agent left behind\n" > "$HOME/keepme-scratch/notes.md" || exit 1
 echo PLANTED_OK' > "$PLANT_OUT" 2>&1
 cat "$PLANT_OUT"
 if grep -qx 'PLANTED_OK' "$PLANT_OUT"; then
-    ok "a git repository was planted in the box's home, outside the mount"
+    ok "a git repository and two loose files were planted in the box's home, outside the mount"
 else
     bad "the box-only plant failed; the positive assertions below would prove nothing"
 fi
@@ -3769,11 +3775,17 @@ for b in tri["boxes"]:
     fp, cfg = r["disk_footprint_bytes"], r["disk_configured_bytes"]
     measured = (isinstance(fp, int) and fp > 0
                 and isinstance(cfg, int) and fp < cfg)
-    print("OURS verdict=%s action=%s known=%s repos=%r transcripts=%r codes=%s "
+    print("OURS verdict=%s action=%s known=%s repos=%r files=%r transcripts=%r codes=%s "
           "footprint=%s fp=%r cfg=%r" % (
-        b["verdict"], b["action"], bo["known"], bo["guest_repos"], bo["transcripts"],
+        b["verdict"], b["action"], bo["known"], bo["guest_repos"], bo["home_files"],
+        bo["transcripts"],
         "+".join(x["code"] for x in b["reasons"]) or "-",
         "measured" if measured else "not-measured", fp, cfg))
+    # The categories text is the claim an operator acts on, so it is asserted as
+    # text and not only as counts.
+    for x in b["reasons"]:
+        if x["code"] == "box-only-state":
+            print("CATS=" + x["text"])
 ' "$TRIAGEJ" "$TRIAGE_STATUSJ" "$INSTANCE" > "${TMP_ROOT}/triage-filter.txt" 2>&1 || true
 cat "${TMP_ROOT}/triage-filter.txt"
 
@@ -3807,6 +3819,23 @@ if grep -qE '^OURS .* repos=[1-9][0-9]* .*codes=.*guest-repo' "${TMP_ROOT}/triag
 else
     bad "the planted box-only work was not reported by category: $(grep '^OURS' "${TMP_ROOT}/triage-filter.txt")"
 fi
+# A4's other positive: plain files in the home. A box holding an unexported patch
+# must not be described as holding nothing — that description is what gets a box
+# destroyed under `remove`. A FILTER, not a count: this box may hold loose files
+# this suite did not plant, so the assertion here is "at least the two", and the
+# paired control below asserts the DELTA is exactly two, which is what proves the
+# repository's own committed file is pruned rather than counted a second time.
+if grep -qE '^OURS .* files=[2-9][0-9]* ' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "and the loose files in the home are counted as their own category"
+else
+    bad "the planted loose files were not counted: $(grep '^OURS' "${TMP_ROOT}/triage-filter.txt")"
+fi
+if grep -q "^CATS=only inside this box:.*file" "${TMP_ROOT}/triage-filter.txt" \
+   && grep -q '^CATS=only inside this box:.*git repositor' "${TMP_ROOT}/triage-filter.txt"; then
+    ok "and the box-only-state text names both categories, so the operator reads what a destroy takes"
+else
+    bad "the box-only-state text does not name the planted categories: $(grep '^CATS=' "${TMP_ROOT}/triage-filter.txt" || echo 'no box-only-state reason at all')"
+fi
 if grep -qE '^SCARCE=(none|disk|compute|both) free=[0-9]+ largest=[0-9]+ committed=[0-9]+ memory=[0-9]+$' "${TMP_ROOT}/triage-filter.txt"; then
     ok "triage named the scarce resource with both numbers it used"
 else
@@ -3832,11 +3861,12 @@ else
     bad "the text footer is missing"
 fi
 
-# The paired control: with the plant gone, the category goes away. Its vacuity
-# guard is the `repos=` assertion above, which has already passed.
-printf -- '\n--- and with the planted repository removed, the category is gone ---\n'
+# The paired control: with the plants gone, both categories go away. Its vacuity
+# guard is the `repos=`/`files=` pair above, which has already passed.
+printf -- '\n--- and with the planted repository and files removed, the categories are gone ---\n'
 # shellcheck disable=SC2016  # $HOME is the guest's.
-guest bash -lc 'rm -rf "$HOME/keepme-example" && echo REMOVED_OK' \
+guest bash -lc 'rm -rf "$HOME/keepme-example" "$HOME/keepme-scratch" "$HOME/keepme-fix.diff" \
+    && echo REMOVED_OK' \
     > "${TMP_ROOT}/triage-unplant.out" 2>&1
 cat "${TMP_ROOT}/triage-unplant.out"
 "$AGENTBOX" triage --json > "${TMP_ROOT}/triage2.json" 2>/dev/null || true
@@ -3845,8 +3875,8 @@ import json, sys
 doc = json.load(open(sys.argv[1]))
 for b in doc["boxes"]:
     if b["instance"] == sys.argv[2]:
-        print("AFTER repos=%r codes=%s" % (
-            b["box_only"]["guest_repos"],
+        print("AFTER repos=%r files=%r codes=%s" % (
+            b["box_only"]["guest_repos"], b["box_only"]["home_files"],
             "+".join(x["code"] for x in b["reasons"]) or "-"))
 ' "${TMP_ROOT}/triage2.json" "$INSTANCE" > "${TMP_ROOT}/triage-after.txt" 2>&1 || true
 cat "${TMP_ROOT}/triage-after.txt"
@@ -3854,7 +3884,20 @@ if grep -q '^AFTER repos=0 ' "${TMP_ROOT}/triage-after.txt" \
    && ! grep -q 'guest-repo' "${TMP_ROOT}/triage-after.txt"; then
     ok "the box-only answer follows what is actually in the box, in both directions"
 else
-    bad "the removed repository is still reported: $(cat "${TMP_ROOT}/triage-after.txt")"
+    bad "the removed plants are still reported: $(cat "${TMP_ROOT}/triage-after.txt")"
+fi
+# The delta is the part that cannot be faked by a box that already had loose
+# files: the two plants went in, the two plants came out, and the repository's own
+# committed file was never in the count — a pruning regression makes this 3.
+FILES_WITH=$(sed -n 's/^OURS .* files=\([0-9]*\) .*/\1/p' "${TMP_ROOT}/triage-filter.txt")
+FILES_AFTER=$(sed -n 's/^AFTER repos=[0-9]* files=\([0-9]*\) .*/\1/p' "${TMP_ROOT}/triage-after.txt")
+printf 'loose files with the plants: %s; without them: %s\n' \
+    "${FILES_WITH:-?}" "${FILES_AFTER:-?}"
+if [ -n "$FILES_WITH" ] && [ -n "$FILES_AFTER" ] \
+   && [ "$((FILES_WITH - FILES_AFTER))" -eq 2 ]; then
+    ok "the two planted files account for exactly two, so the repository's file is not counted twice"
+else
+    bad "the loose-file count did not follow the plants exactly: with=${FILES_WITH:-?} without=${FILES_AFTER:-?}"
 fi
 # ---- end slot:9f-triage ----
 

@@ -2553,7 +2553,7 @@ EOF
                     \{*\}) ;;
                     *) obj="" ;;
                 esac
-                [ -n "$obj" ] || obj='{"verdict":"unknown","action":"ask","reasons":[{"code":"box-silent","text":"the box did not answer the triage call"}],"box_only":{"known":false,"as_of":null,"state_bytes":null,"claude_state_bytes":null,"transcripts":null,"docker_images":null,"docker_volumes":null,"guest_repos":null},"dirty_files":null}'
+                [ -n "$obj" ] || obj='{"verdict":"unknown","action":"ask","reasons":[{"code":"box-silent","text":"the box did not answer the triage call"}],"box_only":{"known":false,"as_of":null,"state_bytes":null,"claude_state_bytes":null,"transcripts":null,"docker_images":null,"docker_volumes":null,"guest_repos":null,"home_files":null},"dirty_files":null}'
             else
                 fragment="$obj"
                 [ -n "$fragment" ] || fragment=$(printf '%-10s %-7s %-9s %s' \
@@ -2628,7 +2628,7 @@ EOF
             fi
             as_of_json=$(json_str "$wm_at")
             [ -n "$wm_at" ] || as_of_json="null"
-            obj="{\"verdict\":\"${verdict}\",\"action\":\"${action}\",\"reasons\":[${reasons}],\"box_only\":{\"known\":false,\"as_of\":${as_of_json},\"state_bytes\":null,\"claude_state_bytes\":null,\"transcripts\":null,\"docker_images\":null,\"docker_volumes\":null,\"guest_repos\":null},\"dirty_files\":null}"
+            obj="{\"verdict\":\"${verdict}\",\"action\":\"${action}\",\"reasons\":[${reasons}],\"box_only\":{\"known\":false,\"as_of\":${as_of_json},\"state_bytes\":null,\"claude_state_bytes\":null,\"transcripts\":null,\"docker_images\":null,\"docker_volumes\":null,\"guest_repos\":null,\"home_files\":null},\"dirty_files\":null}"
             fragment=$(printf '%-10s %-7s %-9s %s' "$verdict" "$action" "$boxonly_col" "$why")
         fi
 
