@@ -157,11 +157,11 @@ answer.
 
 toolcheck says whether a box is at the baseline: exit 0 when every tool is
 present at its pin, 10 when one is missing or off its pin, 11 when the box is
-clean but this repository pins a tool differently, and 1 for a usage error like
-everywhere else. create ends with the same check and exits with its status, so a
-new box that is not at baseline says which tool by name rather than reporting
-itself ready; start of an existing box prints the same lines as a warning and
-exits 0.
+clean but this repository pins a tool differently, and 1 for a usage error or a
+sweep that could not read the box's pins file and so compared nothing. create
+ends with the same check and exits with its status, so a new box that is not at
+baseline says which tool by name rather than reporting itself ready; start of an
+existing box prints the same lines as a warning and exits 0.
 
 Every subcommand stops reading options at a literal --, so a caller building a
 command line can always say where its operands begin:
@@ -864,8 +864,17 @@ report_toolchain_readiness() {
     out=$(guest_shell "$inst" "${GUEST_BIN}/toolcheck.sh" --box-only --findings-only 2>/dev/null) || rc=$?
     case "$rc" in
         0)
-            info "every baseline tool is at its pin"
-            return 0 ;;
+            # `--findings-only` prints nothing at all when there is nothing to
+            # say, so status 0 with a non-empty body is a contradiction: the
+            # guest named something and did not raise its status for it. Believe
+            # the body. Printing `every baseline tool is at its pin` over lines
+            # that say otherwise is the exact failure amendment A3 exists to
+            # prevent, and it is worse than having no check, because the signal
+            # A3 added then says the opposite of the truth. The guest side no
+            # longer does this; the guard stays because the guest half of an
+            # older checkout might.
+            [ -n "$out" ] || { info "every baseline tool is at its pin"; return 0; }
+            ;;
         10) ;;
         *)
             info "NOTE: the toolchain could not be checked in ${inst} (toolcheck exited ${rc}); run '${PROG} toolcheck <repo>'"

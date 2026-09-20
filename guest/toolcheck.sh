@@ -20,7 +20,9 @@
 #   0   every baseline tool is at its pin, and nothing in this repository differs
 #   10  a baseline tool is missing or off its pin — this box is not at baseline
 #   11  the box is clean, and this repository pins something differently
-#   1   usage, or something this script could not do at all (the house rule)
+#   1   usage, or something this script could not do at all (the house rule) —
+#       including a live sweep whose pins file could not be read, which checked
+#       no tool against a pin and so cannot answer 0
 #
 # 10 and 11 are deliberately far apart from 1: a script that gates on "the box
 # is broken" must not read a typo'd flag as the same event.
@@ -192,6 +194,12 @@ valid_path() {
 # four counters. `-` stands for "no value", which no validated token can be.
 BOX_ROWS=""
 BOX_STATE="ok"
+# 0 when a LIVE sweep could not read the pins file. Kept apart from BOX_STATE
+# because the two facts are independent: `command -v` answers "is this tool
+# here" whether or not a pin was readable, and only the comparison against a pin
+# is lost. Conflating them is how a box with a tool missing reported itself
+# clean.
+PINS_READABLE=1
 N_OK=0
 N_MISSING=0
 N_OFFPIN=0
@@ -199,7 +207,7 @@ N_UNREADABLE=0
 
 sweep_box() {
     local name key pin found path state
-    [ -r "$PINS_FILE" ] || BOX_STATE="unknown"
+    [ -r "$PINS_FILE" ] || PINS_READABLE=0
     while read -r name key; do
         [ -n "$name" ] || continue
         pin=""
@@ -251,9 +259,19 @@ sweep_box() {
     done <<EOF
 $(tool_table)
 EOF
-    [ "$BOX_STATE" = "unknown" ] && return 0
+    # The roll-up runs even when the pins file could not be read. A tool that is
+    # not on PATH is missing on `command -v`'s authority alone, and that is a
+    # finding a caller must see: an unreadable pins file used to return before
+    # this point, which made `--box-only --findings-only` print `ruff is missing`
+    # and exit 0 — and `agentbox create` then reported a box with no formatter as
+    # ready, the exact case amendment A3 exists to prevent.
+    #
+    # `unknown` is left for the case where nothing is wrong by name and nothing
+    # could be compared to a pin either: not `ok`, because no pin was checked.
     if [ $((N_MISSING + N_OFFPIN + N_UNREADABLE)) -gt 0 ]; then
         BOX_STATE="findings"
+    elif [ "$PINS_READABLE" -eq 0 ]; then
+        BOX_STATE="unknown"
     else
         BOX_STATE="ok"
     fi
@@ -419,6 +437,13 @@ EOF
 
 print_box_findings() {
     local name pin found state path
+    # A live sweep that could not read its own pins compared nothing to a pin,
+    # and that is a finding about the box, so it goes where the findings go:
+    # `create` prefixes it NOT READY, `start` prefixes it WARNING, and neither
+    # can print "every baseline tool is at its pin" over it. The snapshot path
+    # (`--project-only`) never reads the pins file, so it never says this.
+    [ "$PROJECT_ONLY" -eq 1 ] || [ "$PINS_READABLE" -eq 1 ] \
+        || printf 'the toolchain pin file could not be read, so no tool could be checked against a pin\n'
     while IFS='|' read -r name pin found state path; do
         [ -n "$name" ] || continue
         case "$state" in missing|off_pin|unreadable) ;; *) continue ;; esac
@@ -446,6 +471,11 @@ summary_line() {
             box_part="${N_MISSING} missing, ${N_OFFPIN} off-pin"
             [ "$N_UNREADABLE" -eq 0 ] || box_part="${box_part}, ${N_UNREADABLE} unreadable"
             [ "$PROJECT_ONLY" -eq 0 ] || box_part="${box_part} (from the snapshot${SNAPSHOT_AT:+ recorded ${SNAPSHOT_AT}})"
+            # The table's PINNED column reads `(unpinned)` for every row when the
+            # pins file could not be read, which on its own looks like a box that
+            # pins nothing. Say which it is.
+            [ "$PINS_READABLE" -eq 1 ] \
+                || box_part="${box_part}; the pins file could not be read, so no version was compared to a pin"
             ;;
     esac
     if [ "$BOX_ONLY" -eq 1 ]; then
@@ -491,6 +521,14 @@ report() {
         # either — the caller's section owns that (agent-run.sh writes the
         # `## Toolchain` heading, claude-session.sh prints it under its own).
         [ -z "$PROJECT_TEXT" ] || printf '%s\n' "$PROJECT_TEXT"
+        # One exception to "nothing when there is nothing to say": when the box
+        # half is not known, the project's pins were not compared to anything,
+        # and silence here is a false answer rather than no answer. Convention 4
+        # has already told the agent that any difference is printed above its
+        # brief, so a repository pinning node 22 against a box at node 24 would
+        # read as agreement. This is a finding about the REPORT, which is why it
+        # belongs in the brief; summary_line already composes the sentence.
+        [ "$BOX_STATE" != "unknown" ] || [ "$P_UNKNOWN" -eq 0 ] || summary_line
         report_status
         return
     fi
@@ -521,6 +559,20 @@ report_state() {
 
 report_status() {
     [ "$BOX_STATE" = "findings" ] && return 10
+    # A LIVE sweep that could not read its own pins verified nothing, so 0 —
+    # which every caller reads as "at baseline" — is the one answer it must not
+    # give. 1 is this script's own word for "something it could not do at all"
+    # (see the header), and the launch paths turn it into a NOTE rather than a
+    # readiness claim, which is the honest shape: the box may be fine, and
+    # nobody checked. Before the mismatch test on purpose: 11 says the box is
+    # clean and the repository differs, and the box is not known clean here.
+    #
+    # The snapshot path keeps 0. An absent snapshot is the ordinary fail-soft
+    # case for `--project-only`, which runs in front of every brief, and the
+    # findings-only arm above now says so in words instead.
+    if [ "$BOX_STATE" = "unknown" ] && [ "$PROJECT_ONLY" -eq 0 ]; then
+        return 1
+    fi
     if [ "$BOX_ONLY" -eq 0 ] && [ "$P_MISMATCH" -gt 0 ]; then
         return 11
     fi
