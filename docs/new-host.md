@@ -180,9 +180,10 @@ in the repository, and it is right to.
 
 **`~/.config/agent-box/guest/claude/CLAUDE.md` — agent, from the person's
 existing one.** Copy only the standing instructions you want inside the box.
-Only `CLAUDE.md`, `settings.json`, `governor.json` and `rules/*.md` cross;
-anything else in that directory is refused at launch. Do not put a
-`settings.json` here on the first pass; add it later if a setting is missed.
+Only `CLAUDE.md`, `settings.json`, `supervisor.json` (and the pre-2.0
+`governor.json`) and `rules/*.md` cross; anything else in that directory is
+refused at launch. Do not put a `settings.json` here on the first pass; add it
+later if a setting is missed.
 
 **`~/.config/agent-box/guest/ca.pem` — only if phase 2 found a TLS proxy.**
 

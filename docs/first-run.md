@@ -89,7 +89,7 @@ and plugins to install inside the VM, one directive per line, `#` for comments.
 
 ```
 marketplace konyklabs/claude-plugins
-install governor@konyklabs-plugins
+install supervisor@konyklabs-plugins
 ```
 
 The marketplace **name** comes from the marketplace's own manifest and is not
@@ -105,10 +105,11 @@ only, straight from the read-only mount.
 
 **`~/.config/agent-box/guest/claude/`** — optional. The pieces of your own
 Claude Code setup you want in the VM: `CLAUDE.md`, `settings.json`,
-`governor.json` and `rules/*.md`. Those names and nothing else — the copy is an
-allowlist, and a `.credentials.json` or a `*.token` left in there is refused
-with a message rather than skipped in silence. What crosses and what does not
-is listed in [daily-use.md](daily-use.md).
+`supervisor.json` (and the pre-2.0 `governor.json`) and `rules/*.md`. Those
+names and nothing else — the copy is an allowlist, and a `.credentials.json`
+or a `*.token` left in there is refused with a message rather than skipped in
+silence. What crosses and what does not is listed in
+[daily-use.md](daily-use.md).
 
 **`~/.config/agent-box/guest/ca.pem`** — only if your network intercepts TLS. If
 `curl https://api.anthropic.com` on the host fails with a certificate error,

@@ -3283,6 +3283,63 @@ else
 fi
 
 # ---- slot:8d2 (owner M1) ----
+# agent-box#5: `abs_file` resolves a brief against the caller's cwd, one search
+# path, deliberately (docs/decisions.md). The issue's own definition of done —
+# "from anywhere" — was never going to be met by that, but the actual failure
+# it was filed for (a brief that sits in the repository while the caller
+# stands somewhere else) gets a named hint instead of a bare "not a file".
+printf -- '\n--- a brief named relatively, from a directory that is not the repo (agent-box#5) ---\n'
+REL_OUT="${TMP_ROOT}/relative-brief.out"
+(cd "$TMP_ROOT" && run_bounded 90 "$REL_OUT" "$AGENTBOX" run "$CLEAN_REPO" noop-brief.md)
+cat "$REL_OUT"
+if grep -qE 'run [0-9]{8}-[0-9]{6} started' "$REL_OUT"; then
+    ok "a brief named relative to the caller's cwd starts a run"
+else
+    bad "a relative brief did not start a run: $(tail -1 "$REL_OUT")"
+fi
+# `agentbox run` without --wait returns as soon as the tmux session is up, so
+# this real, fire-and-forget run is followed to its end here before leaving
+# 8d: left alive, its real runid (today's date) would sort after every
+# 20260101-* fixture 8f plants below and get picked by 8f's "newest running
+# run" checks instead of them. FAKE_TOKEN is still in effect, so the run
+# fails authentication in seconds and this costs no model call.
+REL_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$REL_OUT" | head -1)
+if [ -n "$REL_RUNID" ]; then
+    run_bounded 300 "${TMP_ROOT}/relative-follow.out" "$AGENTBOX" logs "$CLEAN_REPO" "$REL_RUNID" -f
+    rel_follow_rc=$BOUNDED_RC
+    cat "${TMP_ROOT}/relative-follow.out"
+    # Asserted, not just attempted: a follow that the bound has to kill
+    # (BOUNDED_RC=124) or that fails at once leaves the run possibly still
+    # alive, and 8f's fixed-date "newest running run" checks below would then
+    # misattribute the failure to stop-run instead of to this silent miss.
+    if [ "$rel_follow_rc" -eq 0 ]; then
+        ok "the relative-brief run ${REL_RUNID} was followed to its end"
+    else
+        bad "the relative-brief run ${REL_RUNID} was not followed to its end (logs -f exited ${rel_follow_rc}); 8f's newest-running checks below are not trustworthy"
+    fi
+fi
+
+printf -- '\n--- and the hint when the brief is in the repo but the cwd is not ---\n'
+printf 'Do nothing.\n' > "${CLEAN_REPO}/in-repo-brief.md"
+HINT_OUT="${TMP_ROOT}/brief-hint.out"
+(cd "$TMP_ROOT" && "$AGENTBOX" run "$CLEAN_REPO" in-repo-brief.md > "$HINT_OUT" 2>&1) || true
+cat "$HINT_OUT"
+# agentbox resolves the repo with `pwd -P` before this message is ever built
+# (abs_repo, called before require_brief), so the hint always names the
+# PHYSICAL path. $CLEAN_REPO itself is the LOGICAL path `mktemp -d -t` gave
+# us, and on macOS that sits under /var/folders/..., a symlink to
+# /private/var/folders/... -- comparing the hint against $CLEAN_REPO directly
+# fails this check on a correct build, every time, on this OS. Resolve the
+# same way the CLI does and assert on that; the trailing `;` (immediately
+# after the path in the real message) keeps this from matching a refusal
+# that named some other, unrelated path.
+CLEAN_REPO_PHYS=$(cd "$CLEAN_REPO" && pwd -P)
+if grep -qF "there is a in-repo-brief.md in ${CLEAN_REPO_PHYS};" "$HINT_OUT"; then
+    ok "the refusal names the brief that is sitting in the repository"
+else
+    bad "the refusal does not say where the brief actually is"
+fi
+rm -f "${CLEAN_REPO}/in-repo-brief.md"
 # ---- end slot:8d2 ----
 
 # ---- slot:8d3 (owner TB) ----
@@ -3744,6 +3801,89 @@ else
 fi
 
 # ---- slot:8f-lost (owner M1) ----
+printf -- '\n--- the HOST agrees a lost run is lost, so the watchdog can heal it ---\n'
+#
+# agent-box#24: valid_run_state (bin/agentbox) once rejected `exit:lost`, so
+# read_run_state turned every lost run into `unknown` and watchdog_run's
+# `[ "$state" = "exit:lost" ] || continue` was dead code — `keepalive on`
+# promised a heal that could not happen. The orphan check above reads the
+# state with run-ctl.sh INSIDE the guest and passes either way; this one goes
+# through the host, which is where the bug lived.
+#
+# The runid sorts after every real run on purpose: watchdog_run acts on
+# `run-ctl.sh latest` only, and cmd_latest keeps the last directory in glob
+# order.
+LOSTID=29991231-235959
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${LOSTID}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'running\n' > "\$d/status"
+printf '999999\n' > "\$d/pid"
+printf '{"runid":"${LOSTID}","model":"sonnet","branch":null,"brief":"lost-host-path","started_at":"2999-12-31T23:59:59Z","tmux":"run-${LOSTID}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+SH
+
+# Vacuity guard 1: the fixture really is what `latest` will pick.
+LOST_LATEST=$(guest /opt/agent-box/guest/run-ctl.sh latest 2>/dev/null | tr -d '\r\n')
+printf 'latest run in the box: %s\n' "$LOST_LATEST"
+if [ "$LOST_LATEST" = "$LOSTID" ]; then
+    ok "the fabricated lost run is the newest run, so the watchdog will look at it"
+else
+    bad "the watchdog would look at '${LOST_LATEST}', not the fixture; the checks below would be vacuous"
+fi
+
+# keepalive records the repo the watchdog needs. The config dir is hermetic
+# ($AGENT_BOX_CONFIG_DIR), so this run of the watchdog can only see this box.
+"$AGENTBOX" keepalive "$CLEAN_REPO" on > "${TMP_ROOT}/keepalive-on.out" 2>&1
+cat "${TMP_ROOT}/keepalive-on.out"
+WD_OUT="${TMP_ROOT}/watchdog-lost.out"
+run_bounded 120 "$WD_OUT" "$AGENTBOX" watchdog --run
+WD_RC=$BOUNDED_RC
+cat "$WD_OUT"
+printf 'watchdog exit: %s\n' "$WD_RC"
+"$AGENTBOX" keepalive "$CLEAN_REPO" off > /dev/null 2>&1 || true
+
+# Vacuity guard 2: the watchdog looked at THIS instance at all.
+if grep -qF "$INSTANCE" "$WD_OUT"; then
+    ok "the watchdog considered the box under test"
+else
+    bad "the watchdog never named ${INSTANCE}; the checks below would be vacuous"
+fi
+# Vacuity guard 3: the watchdog's own `reconcile` call (errors swallowed by
+# design, bin/agentbox) is what turns this fixture's planted `running` into
+# `exit:lost` before the host ever reads it. If reconcile did not mark it —
+# a stale tmux session, pid 999999 genuinely alive, a permissions problem —
+# the branch below is skipped for a reason that has nothing to do with #24,
+# and the next assertion must not be read as "exit:lost is rejected again".
+LOST_GUEST=$(guest /opt/agent-box/guest/run-ctl.sh state "$LOSTID" 2>/dev/null | tr -d '\r\n')
+printf 'the guest calls the fixture: %s\n' "$LOST_GUEST"
+if [ "$LOST_GUEST" = "exit:lost" ]; then
+    ok "the guest itself calls the fixture exit:lost, so the host-path check below proves something"
+else
+    bad "reconcile never marked the fixture lost; the host-path check below proves nothing"
+fi
+# The verdict. `was lost` is printed only from inside the branch guarded by
+# read_run_state returning exit:lost, so this line IS the host-side reading.
+if grep -qE "run ${LOSTID} was lost" "$WD_OUT"; then
+    ok "the host read the run as lost and entered the watchdog's heal branch"
+else
+    bad "the watchdog did not see run ${LOSTID} as lost; the heal branch is still unreachable"
+fi
+# The run has no heal budget on record, so heal refuses with exit 2 and starts
+# nothing. That refusal is the proof the branch ran to its end.
+if grep -q 'no heal budget left' "$WD_OUT"; then
+    ok "and the heal was refused for want of budget rather than silently skipped"
+else
+    bad "the heal branch did not report why it started nothing"
+fi
+# The spurious warning is the other half of the defect: an ordinary state was
+# being reported as a possible attack.
+if grep -q 'not a run state' "$WD_OUT"; then
+    bad "the host still calls exit:lost 'not a run state'"
+else
+    ok "and exit:lost no longer trips the hostile-state warning"
+fi
+guest sh -c "rm -rf \$HOME/.agent-box/runs/${LOSTID}" || true
 # ---- end slot:8f-lost ----
 
 printf -- '\n--- procps is installed, which is what makes the signal find claude ---\n'
@@ -3754,7 +3894,7 @@ else
 fi
 
 guest sh -c 'rm -f /tmp/abx-standin.sh /tmp/abx-old.sh /tmp/abx-standin-interrupted /tmp/abx-old-interrupted' || true
-guest sh -c "rm -rf \$HOME/.agent-box/runs/${STANDIN} \$HOME/.agent-box/runs/${FINISHED} \$HOME/.agent-box/runs/${OLD_RUNNING} \$HOME/.agent-box/runs/${NEWEST_FINISHED} \$HOME/.agent-box/runs/${ORPHAN}" || true
+guest sh -c "rm -rf \$HOME/.agent-box/runs/${STANDIN} \$HOME/.agent-box/runs/${FINISHED} \$HOME/.agent-box/runs/${OLD_RUNNING} \$HOME/.agent-box/runs/${NEWEST_FINISHED} \$HOME/.agent-box/runs/${ORPHAN} \$HOME/.agent-box/runs/${LOSTID}" || true
 
 # ===========================================================================
 step "8g. tmux sessions are listed, and a detached one can be attached to"

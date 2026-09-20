@@ -450,7 +450,8 @@ threat model, the one that is easy to forget because nothing visibly breaks
 when it fails.
 
 So the names that may cross are written down — `CLAUDE.md`, `settings.json`,
-`governor.json`, `rules/*.md` — and everything else stays behind. Credential
+`supervisor.json`, `rules/*.md` (and `governor.json`, the pre-2.0 name, carried
+as a legacy alias) — and everything else stays behind. Credential
 and history-shaped names are not merely skipped, they are refused out loud:
 a silent skip and a successful copy look identical in a log, and the one case
 where the operator must not be left guessing is the one where a credential was
