@@ -540,7 +540,12 @@ BROKEN
     if [ -f "$SMOKE" ]; then
         out=$("$PY" "${sl}/check_slots.py" "$SMOKE" 2>&1); rc=$?
         if [ "$rc" -eq 0 ] && case "$out" in *"OK "*) true ;; *) false ;; esac; then
-            ok "test/smoke.sh: every listed slot is planted once, with its owner, and nothing else is"
+            # The checker's own verdict line, not a sentence of our own: the two
+            # shapes it accepts say different things, and since FIN deleted the
+            # markers this one is the second (0 listed, 0 planted). A hardcoded
+            # "every listed slot is planted once" would read as a stronger claim
+            # than the run made.
+            ok "test/smoke.sh: $(printf '%s' "$out" | grep '^OK ' | tail -1)"
         else
             bad "test/smoke.sh's own slot registry has a problem: ${out}"
         fi

@@ -600,6 +600,8 @@ write_instance_meta() {
     f=$(instance_meta_file "$inst")
     tmp="${f}.tmp.$$"
     meta_lock "$f"
+    # C on a true A is the point: whichever half failed, the temp file goes.
+    # shellcheck disable=SC2015
     { { [ -r "$f" ] && grep -v "^${key}=" "$f"; } || true; printf '%s=%s\n' "$key" "$value"; } > "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; true; }
     meta_unlock "$f"
@@ -4589,7 +4591,7 @@ watchdog_log() {
 }
 
 watchdog_run() {
-    local f inst keep repo status runid state heal_left out
+    local f inst keep repo status runid state out
     [ -d "$INSTANCE_META_DIR" ] || return 0
     for f in "$INSTANCE_META_DIR"/*; do
         [ -f "$f" ] || continue
@@ -6005,7 +6007,49 @@ cmd_toolcheck() {
 # /opt/agent-box in every guest is this checkout, mounted read-only, and
 # provisioning re-runs at every start — so "which version is this box running"
 # is a question about the host's working tree, and nothing else says it.
-cmd_version() { die "version: not built in this checkout"; }
+#
+# There is no version string to print: no tag, no CI, no artefact. The commit is
+# the version, so the commit is what this prints — and the working tree's state
+# with it, because a dirty checkout is a version nothing can reconstruct.
+#
+# `log` and `diff` are the two verbs repo_git forbids, and this is the one place
+# they are right: repo_git guards a repository MOUNTED INTO A BOX, whose
+# `.git/config` the agent can write. This checkout is mounted read-only, so no
+# box can name a program in it — the only writer is the operator. `--no-pager`
+# stays anyway: git starts a pager only when ITS OWN stdout is a terminal, both
+# values here are captured, and the flag is what keeps that true of the next
+# caller that prints one of them straight through instead.
+#
+# A tarball install must not die here, and must not answer with a neighbouring
+# repository's commit either: `.git` beside the script (a directory in a clone, a
+# file in a worktree) is what says this tree is the thing git would answer about.
+cmd_version() {
+    split_args "" "$@"
+    check_operands 0 0 "version"
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    [ $# -eq 0 ] || die "unknown option: $1"
+
+    local commit="" state=""
+    if command -v git >/dev/null 2>&1 && [ -e "${BOX_DIR}/.git" ]; then
+        commit=$(git --no-pager -C "$BOX_DIR" log -1 --format='%h %cs' 2>/dev/null) || commit=""
+        # HEAD, not a bare `diff`: a change that is staged and not committed is
+        # as much a version nobody else has as an unstaged one.
+        if [ -n "$commit" ]; then
+            if git --no-pager -C "$BOX_DIR" diff --quiet HEAD 2>/dev/null; then
+                state="(clean)"
+            else
+                state="(dirty)"
+            fi
+        fi
+    fi
+    if [ -n "$commit" ]; then
+        printf 'agentbox %s %s\n' "$commit" "$state"
+    else
+        printf 'agentbox unknown (not a git checkout)\n'
+    fi
+    printf 'checkout: %s\n' "$BOX_DIR"
+    printf 'guest scripts: /opt/agent-box (this same checkout, read-only, re-read on start)\n'
+}
 # ---------------------------------------------------------------------------
 
 case "${1:-}" in
