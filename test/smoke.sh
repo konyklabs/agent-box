@@ -293,24 +293,6 @@ wait_for_guest() {
     return 1
 }
 
-# ---------------------------------------------------------------------------
-# Feature slots
-# ---------------------------------------------------------------------------
-#
-# The slices of roadmap#146 each add their assertions inside one marked slot,
-# planted below in advance and separated by a blank line, so that no two slices
-# edit the same lines and no two hunks touch. A slot is a start line and an end
-# line, both beginning `# ---- `, naming the label and the owning slice.
-#
-# Every slot in this file is listed here with its owner, and nothing may be
-# planted that is not listed: the list and the markers are checked against each
-# other, which is what tells a missing slot from a filled one. When every slice
-# has landed, FIN deletes the markers and this block with them.
-#
-# SLOTS 3f=H1 3g=H2 3h=C2 5c=TA 5d=TB 5e=TB 5f=TB 8d2=M1 8d3=TB 8f-lost=M1
-# SLOTS 8g-kind=W 8k=C2 8l=C3 8m=C2 8j2=S1 8j3=S2 9-ch=C2 9-tc=TA
-# SLOTS 9f-triage=H3 9i=H3 11-pre=H1 11b=H1
-
 # ===========================================================================
 step "1. preflight on a clean repository (expect exit 0)"
 # ===========================================================================
@@ -608,7 +590,6 @@ else
 fi
 rm -f "${AGENT_BOX_CONFIG_DIR}/config"
 
-# ---- slot:3f (owner H1) ----
 # ===========================================================================
 step "3f. a held host port: create refuses it, start refuses it, ports reports it"
 # ===========================================================================
@@ -970,9 +951,7 @@ if [ ! -e "${AGENT_BOX_CONFIG_DIR}/instances/${PF_INSTANCE}" ] && [ ! -d "$PF_DI
 else
     bad "this step left its fake instance state behind"
 fi
-# ---- end slot:3f ----
 
-# ---- slot:3g (owner H2) ----
 # ===========================================================================
 step "3g. bench: a host-side clone of the box's branch, and no VM in sight"
 # ===========================================================================
@@ -1295,9 +1274,7 @@ else
 fi
 
 rm -rf "$BENCH_REPO" "$BENCH_META" "${BENCH_OUT}" "${BENCH_OUT}".*
-# ---- end slot:3g ----
 
-# ---- slot:3h (owner C2) ----
 # ===========================================================================
 step "3h. the channel on the host side, with no VM"
 # ===========================================================================
@@ -1920,7 +1897,40 @@ else
 fi
 rm -rf "$CH_ROOT"
 unset CH_MSG CH_HEAD
-# ---- end slot:3h ----
+
+# ===========================================================================
+step "3i. the other half of the cheap suite: test/no-vm.sh"
+# ===========================================================================
+#
+# test/no-vm.sh holds the checks that need no VM at all: a host helper or a guest
+# text-processing function, pulled out of the real file and driven against a
+# fixture it builds and throws away. It is its own file because that is how it is
+# used — seconds to run, so a change to one of those helpers is checked while it
+# is being written rather than after a VM boots — and it is invoked here so that a
+# regression in one of them fails a smoke run too, instead of waiting for someone
+# to remember the file exists.
+#
+# Its whole output is printed, not just its verdict: a suite that reports another
+# suite's result without its lines is an assertion, and the RESULT line below is
+# this one's evidence for that one. It builds its own fixtures and passes its own
+# AGENT_BOX_CONFIG_DIR wherever it runs a whole command, so it neither reads nor
+# writes the hermetic config directory this run is using.
+#
+# EVERY line of it is prefixed, and that is not cosmetic. This transcript is read
+# as evidence, and the process for reading it is "judge the RESULT: line": an
+# unprefixed `RESULT: 102 passed, 0 failed` from the nested suite lands ABOVE this
+# run's own verdict, so the first `^RESULT:` in a transcript of a FAILED run would
+# say zero failures. One `^RESULT:` line per suite; the nested one is quoted by
+# the ok/bad below, which is what a nested verdict is for.
+NOVM_OUT="${TMP_ROOT}/no-vm.out"
+bash "${BOX_DIR}/test/no-vm.sh" > "$NOVM_OUT" 2>&1
+rc=$?
+sed 's/^/no-vm| /' "$NOVM_OUT"
+if [ "$rc" -eq 0 ]; then
+    ok "test/no-vm.sh passed ($(grep '^RESULT:' "$NOVM_OUT" | tail -1))"
+else
+    bad "test/no-vm.sh exited ${rc} ($(grep -c '^bad ' "$NOVM_OUT" | tr -d ' ') check(s) failed, above)"
+fi
 
 # ===========================================================================
 step "4. create a real instance from the clean repository"
@@ -2049,7 +2059,6 @@ else
     bad "no git identity is configured in the guest"
 fi
 
-# ---- slot:5c (owner TA) ----
 # ===========================================================================
 step "5c. the baseline toolchain, at its pins, on a box created with no flags"
 # ===========================================================================
@@ -2271,9 +2280,7 @@ printf -- '\n--- what the baseline costs, on the guest disk (the measurement the
 guest bash -c 'df -h / | tail -2
                du -sh /opt/node /opt/abx-tools /opt/ms-playwright /usr/local/bin 2>/dev/null
                du -sh /opt/abx-tools/* 2>/dev/null' 2>&1 || true
-# ---- end slot:5c ----
 
-# ---- slot:5d (owner TB) ----
 # ===========================================================================
 step "5d. toolcheck names a missing baseline tool, and the box recovers"
 # ===========================================================================
@@ -2361,9 +2368,7 @@ if [ -n "$TC_RUFF_PATH" ]; then
         bad "toolcheck still exits ${tc2b_rc} after ruff was restored"
     fi
 fi
-# ---- end slot:5d ----
 
-# ---- slot:5e (owner TB) ----
 # ===========================================================================
 step "5e. a project pin that differs is a MISMATCH, not a broken box"
 # ===========================================================================
@@ -2459,9 +2464,7 @@ if [ -n "$NODE_PIN" ] && [ -n "$RUFF_PIN" ]; then
         bad "5e left a pin file in the repository for later steps to trip over"
     fi
 fi
-# ---- end slot:5e ----
 
-# ---- slot:5f (owner TB) ----
 # ===========================================================================
 step "5f. hostile bytes in a project pin file are never echoed or executed"
 # ===========================================================================
@@ -2532,7 +2535,6 @@ if [ ! -e "${CLEAN_REPO}/.python-version" ] && ! guest test -e "$TC_CANARY"; the
 else
     bad "5f left a planted file behind"
 fi
-# ---- end slot:5f ----
 
 # ===========================================================================
 step "6. the egress firewall"
@@ -3282,7 +3284,6 @@ else
     ok "logs --json printed neither the token's head nor its tail"
 fi
 
-# ---- slot:8d2 (owner M1) ----
 # agent-box#5: `abs_file` resolves a brief against the caller's cwd, one search
 # path, deliberately (docs/decisions.md). The issue's own definition of done —
 # "from anywhere" — was never going to be met by that, but the actual failure
@@ -3340,9 +3341,7 @@ else
     bad "the refusal does not say where the brief actually is"
 fi
 rm -f "${CLEAN_REPO}/in-repo-brief.md"
-# ---- end slot:8d2 ----
 
-# ---- slot:8d3 (owner TB) ----
 # ===========================================================================
 step "8d3. a project pin mismatch reaches the run that is about to start"
 # ===========================================================================
@@ -3414,7 +3413,6 @@ if [ ! -e "${CLEAN_REPO}/.tool-versions" ]; then
 else
     bad "8d3 left its pin file in the repository"
 fi
-# ---- end slot:8d3 ----
 
 # ===========================================================================
 step "8a2. heal: a failed run with budget starts its own follow-up, and the chain ends"
@@ -3800,7 +3798,6 @@ else
     bad "runs does not show the lost state"
 fi
 
-# ---- slot:8f-lost (owner M1) ----
 printf -- '\n--- the HOST agrees a lost run is lost, so the watchdog can heal it ---\n'
 #
 # agent-box#24: valid_run_state (bin/agentbox) once rejected `exit:lost`, so
@@ -3884,7 +3881,6 @@ else
     ok "and exit:lost no longer trips the hostile-state warning"
 fi
 guest sh -c "rm -rf \$HOME/.agent-box/runs/${LOSTID}" || true
-# ---- end slot:8f-lost ----
 
 printf -- '\n--- procps is installed, which is what makes the signal find claude ---\n'
 if guest sh -c 'command -v pgrep >/dev/null 2>&1'; then
@@ -3947,7 +3943,6 @@ else
 fi
 guest tmux kill-session -t '=shell' 2>/dev/null || true
 
-# ---- slot:8g-kind (owner W) ----
 printf -- '\n--- 8g-kind: a session row says which session did the work ---\n'
 #
 # Three sessions, one of each kind: the tmux session of a run, a session with a
@@ -4075,7 +4070,6 @@ tmux kill-session -t "=run-${KIND_FIFO_RUNID}" 2>/dev/null || true
 rm -rf "\$HOME/.agent-box/runs/${KIND_RUNID}" "\$HOME/.agent-box/sessions/kindsess" \
        "\$HOME/.agent-box/runs/${KIND_FIFO_RUNID}"
 SH
-# ---- end slot:8g-kind ----
 
 # ===========================================================================
 step "8h. status: the JSON contract, and --watch leaving on Ctrl-C"
@@ -4666,7 +4660,6 @@ guest sh -c 'rm -rf /work/.claude /tmp/repo-hook-ran'
 # Clean up everything this step planted in the guest.
 guest sh -c "rm -rf \$HOME/.agent-box/runs/${HOSTILE_RUNID} \$HOME/.agent-box/runs/${LEAKY_RUNID}" || true
 
-# ---- slot:8k (owner C2) ----
 printf -- '\n--- channel: box to host ---\n'
 #
 # One handoff, written INSIDE the box by the sanctioned writer, read on the host
@@ -4914,9 +4907,7 @@ fi
 # would be a second one.
 guest bash -lc "/opt/agent-box/guest/bin/abx done ${CH8_REQ_ID}" || true
 guest sh -c 'rm -f /work/.agent-box/channel/to-host/*.md /work/.agent-box/channel/to-host/*.read /work/.agent-box/channel/to-host/*.done' || true
-# ---- end slot:8k ----
 
-# ---- slot:8l (owner C3) ----
 printf -- '\n--- channel: host to box ---\n'
 #
 # The floor: a request written by an `agentbox` command ON THE HOST reaches the
@@ -5356,9 +5347,7 @@ if [ "$(jq -r '.counts.to_box_open' "$CH8L_CJ3")" = "0" ]; then
 else
     bad "the step left $(jq -r '.counts.to_box_open' "$CH8L_CJ3") requests open"
 fi
-# ---- end slot:8l ----
 
-# ---- slot:8m (owner C2) ----
 printf -- '\n--- channel: hostile files in the mailbox (8i, extended) ---\n'
 #
 # Step 8i's plants are run directories; these are messages. Everything below is
@@ -5534,7 +5523,6 @@ rm -rf /tmp/abx-stolen
 rm -f to-host/*.md to-host/*.read to-host/*.done to-box/*.md to-box/*.delivered to-box/*.done
 SH
 rm -f "$PWN_MARKER"
-# ---- end slot:8m ----
 
 # ===========================================================================
 step "8j. an interrupted run is recorded as stopped, not as done (issue #14)"
@@ -6016,7 +6004,6 @@ else
     bad "agent-run did not explain the override"
 fi
 
-# ---- slot:8j2 (owner S1) ----
 printf -- '\n--- (c) a run records what it starts, stops it, and survivors are named ---\n'
 # The ledger, the sweep, and the two ownership proofs, on a REAL run — driven by
 # the stand-in, so no model is called and nothing is spent. Everything planted
@@ -6273,9 +6260,7 @@ if guest test -e /tmp/abx-standin-spawn; then
 else
     ok "8j2 removed everything it planted"
 fi
-# ---- end slot:8j2 ----
 
-# ---- slot:8j3 (owner S2) ----
 printf -- '\n--- (8j3) what a run left running is shown, attributed, and never trusted ---\n'
 #
 # A run that was hard-killed never swept, so its ledger is the only record of
@@ -6516,7 +6501,6 @@ if jq -e --arg p "tcp:${LEFT_PORT}" \
 else
     bad "leftovers still names tcp:${LEFT_PORT} after the listener was killed"
 fi
-# ---- end slot:8j3 ----
 
 printf -- '\n--- no token fragment left this step ---\n'
 if grep -qF "$FAKE_HEAD" "$STOPPED_OUT" "$S14_STOP" "$WAIT_OUT" "$FAIL_OUT" 2>/dev/null \
@@ -6682,7 +6666,6 @@ else
     bad "agentbox stop did not exit 0"
 fi
 
-# ---- slot:9-ch (owner C2) ----
 printf -- '\n--- channel: a request queues while the box is stopped ---\n'
 #
 # The window between `stop` and `start` is the only place the "queued, delivered
@@ -6734,7 +6717,6 @@ if [ "$(jq -r --arg id "$CHS_ID" '.to_box[] | select(.id == $id) | .subject' "$C
 else
     bad "the subject did not come back from the host's record"
 fi
-# ---- end slot:9-ch ----
 
 printf -- '\n--- limactl start (re-runs provisioning under the firewall) ---\n'
 RESTART_TS=$(date +%s)
@@ -6771,7 +6753,6 @@ rc=$?
 cat "$FW_OUT2"
 if [ "$rc" -eq 0 ]; then ok "firewall-check still passes after the rebuild"; else bad "firewall-check failed after the rebuild"; fi
 
-# ---- slot:9-tc (owner TA) ----
 # ===========================================================================
 step "9-tc. the second boot installed nothing and never reopened the firewall"
 # ===========================================================================
@@ -6832,7 +6813,6 @@ case "${NEWEST_MARK:-x}" in
             bad "a toolchain marker was rewritten during the second boot"
         fi ;;
 esac
-# ---- end slot:9-tc ----
 
 # ===========================================================================
 step "9b. resize changes the VM's shape and the box comes back"
@@ -7447,7 +7427,6 @@ for b in d["boxes"]:
     fi
 fi
 
-# ---- slot:9f-triage (owner H3) ----
 printf -- '\n--- agentbox triage --json across every box ---\n'
 #
 # triage makes one guest call per RUNNING box from inside a loop that reads the
@@ -7467,7 +7446,7 @@ printf -- '\n--- agentbox triage --json across every box ---\n'
 # destroy takes and no host disk has, and both have to be reported BY CATEGORY
 # rather than as a byte count — "nothing is only inside this box" is a claim, and
 # a box holding an unexported patch must never make it. The paired control is at
-# the end of the slot: the plants are removed and both categories go away.
+# the end of this step: the plants are removed and both categories go away.
 PLANT_OUT="${TMP_ROOT}/triage-plant.out"
 # shellcheck disable=SC2016  # $HOME is the guest's, expanded in there.
 guest bash -lc '
@@ -7642,7 +7621,6 @@ if [ -n "$FILES_WITH" ] && [ -n "$FILES_AFTER" ] \
 else
     bad "the loose-file count did not follow the plants exactly: with=${FILES_WITH:-?} without=${FILES_AFTER:-?}"
 fi
-# ---- end slot:9f-triage ----
 
 # ===========================================================================
 step "9g. the resolver keeps feeding: cache expiry, mode survival, bad input"
@@ -7844,7 +7822,6 @@ else
 fi
 guest sudo systemctl restart agent-box-firewall.service >/dev/null 2>&1 || true
 
-# ---- slot:9i (owner H3) ----
 # ===========================================================================
 step "9i. the triage watermark: how a stopped box can answer at all"
 # ===========================================================================
@@ -7968,7 +7945,6 @@ if grep -q '^AGAIN state=running .* known=True$' "${TMP_ROOT}/wm-again.txt"; the
 else
     bad "the restarted box did not answer triage: $(cat "${TMP_ROOT}/wm-again.txt")"
 fi
-# ---- end slot:9i ----
 
 # ===========================================================================
 step "10. destroy the instance, by bare name"
@@ -8001,7 +7977,6 @@ step "11. a second instance with the Docker and browser-testing profile"
 # time — that is the whole design — so the only way to test both shapes is to
 # build both.
 
-# ---- slot:11-pre (owner H1) ----
 # The preamble probed these three ports free tens of minutes ago, and `create`
 # now REFUSES a forward whose host port is bound. A stranger that took one since
 # then would therefore stop this step from creating anything at all — a failure
@@ -8032,7 +8007,6 @@ else
     bad "no three free host ports in 20000-27999; create will refuse the forward"
     summarise_and_exit
 fi
-# ---- end slot:11-pre ----
 
 mkdir -p "$DOCKER_REPO"
 git init -q "$DOCKER_REPO"
@@ -8083,7 +8057,6 @@ fi
 printf -- '\n--- the sizing Lima actually gave it ---\n'
 "$LIMACTL" list "$DOCKER_INSTANCE"
 
-# ---- slot:11b (owner H1) ----
 # ===========================================================================
 step "11b. ports: both sides of a real forward, on the only box that has any"
 # ===========================================================================
@@ -8230,7 +8203,6 @@ else
     bad "the planted guest listener is still holding ${FORWARD_PORT}"
 fi
 rm -f "$DK_PORTS_TXT" "$DK_PORTS_JSON" "$DK_PORTS_LIMA"
-# ---- end slot:11b ----
 
 # ===========================================================================
 step "12. Docker inside the guest, under the same allowlist"

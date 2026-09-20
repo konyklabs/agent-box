@@ -2,7 +2,7 @@
 #
 # agent-box — no-VM regression checks.
 #
-# Eleven checks the implementers wrote as throwaway scripts while reviewing
+# Twelve checks the implementers wrote as throwaway scripts while reviewing
 # bin/agentbox, guest/lib.sh and the status document, promoted here so a
 # regression in any of them fails a test run instead of waiting for someone to
 # remember a fixture under /tmp. Every function under test is pulled out of the
@@ -540,7 +540,12 @@ BROKEN
     if [ -f "$SMOKE" ]; then
         out=$("$PY" "${sl}/check_slots.py" "$SMOKE" 2>&1); rc=$?
         if [ "$rc" -eq 0 ] && case "$out" in *"OK "*) true ;; *) false ;; esac; then
-            ok "test/smoke.sh: every listed slot is planted once, with its owner, and nothing else is"
+            # The checker's own verdict line, not a sentence of our own: the two
+            # shapes it accepts say different things, and since FIN deleted the
+            # markers this one is the second (0 listed, 0 planted). A hardcoded
+            # "every listed slot is planted once" would read as a stronger claim
+            # than the run made.
+            ok "test/smoke.sh: $(printf '%s' "$out" | grep '^OK ' | tail -1)"
         else
             bad "test/smoke.sh's own slot registry has a problem: ${out}"
         fi
@@ -941,6 +946,134 @@ check_box_json_hostile_values() {
     rm -rf "${sessions:?}/claude"
 }
 
+# ---------------------------------------------------------------------------
+# 12. `agentbox version`: the tree it reads, and the programs it does not run
+# ---------------------------------------------------------------------------
+#
+# The verb answers "what code is in this box", so every guard in it is about
+# reading the right tree — and one is about not running what that tree names.
+# A checkout is not necessarily host-written: nothing refuses
+# `agentbox create <this checkout>`, and then the checkout IS /work, mounted
+# `writable: true`, and the agent owns its `.git/config`. The `-c` flags are what
+# stop `diff` running a program named there; the vacuity guard below fires the
+# same planted program without them, so the assertion is not empty.
+#
+# The other two guards are deviations from the spec's literal spelling and
+# neither has any other check: `[ -e .git ]` (a tarball inside another
+# repository must not answer with THAT repository's commit) and `diff --quiet
+# HEAD` rather than a bare `diff --quiet` (a staged-and-uncommitted change is as
+# much a version nobody else has as an unstaged one).
+#
+# Every case runs the real script from a fixture tree holding only
+# `bin/agentbox`, so the script's own BOX_DIR is the fixture, never this worktree.
+check_version() {
+    section "agentbox version: the tree it reads, and the programs it does not run"
+    local v="${WORK}/version" out rc sha ran
+    mkdir -p "${v}/cfg"
+
+    vfix() { mkdir -p "${1}/bin"; cp "$AGENTBOX" "${1}/bin/agentbox"; }
+    vcommit() {
+        git init -q "$1"
+        git -C "$1" config user.email a@b.c
+        git -C "$1" config user.name check
+        git -C "$1" add -A
+        git -C "$1" -c commit.gpgsign=false commit -qm init
+    }
+    # The fixture's own script, with a throwaway config directory: `version`
+    # reads none of it, and a check that lets a command near the real one is a
+    # check that can write there.
+    vrun() {
+        local dir="$1"; shift
+        AGENT_BOX_CONFIG_DIR="${v}/cfg" bash "${dir}/bin/agentbox" version "$@" 2>&1
+    }
+
+    # (a) A guest-writable checkout: a program named in its .git/config must not
+    #     run on the host.
+    local hostile="${v}/hostile" m="${v}/markers"
+    mkdir -p "$m"
+    vfix "$hostile"
+    vcommit "$hostile" >/dev/null 2>&1
+    git -C "$hostile" config core.fsmonitor "touch ${m}/RAN-fsmonitor; false"
+    mkdir -p "${hostile}/.git/evilhooks"
+    printf '#!/bin/sh\ntouch %s/RAN-hook\n' "$m" > "${hostile}/.git/evilhooks/post-checkout"
+    chmod +x "${hostile}/.git/evilhooks/post-checkout"
+    git -C "$hostile" config core.hooksPath "${hostile}/.git/evilhooks"
+
+    rm -f "${m:?}"/RAN-*
+    out=$(vrun "$hostile"); rc=$?
+    if [ -z "$(ls -A "$m" 2>/dev/null)" ]; then
+        ok "version on a guest-writable checkout: nothing the repository named ran"
+    else
+        ran=$(cd "$m" && printf '%s ' RAN-*)
+        bad "version ran a program the repository named: ${ran}"
+    fi
+    case "$out" in
+        *'(clean)'*|*'(dirty)'*) ok "version still answers over that repository (rc=${rc})" ;;
+        *) bad "version answered nothing usable on the hostile checkout: ${out}" ;;
+    esac
+    # Vacuity guard: the same planted program DOES run without the flags, so the
+    # assertion above is about the flags and not about this git build.
+    rm -f "${m:?}"/RAN-*
+    git --no-pager -C "$hostile" diff --quiet HEAD >/dev/null 2>&1 || true
+    if [ -e "${m}/RAN-fsmonitor" ]; then
+        ok "vacuity guard: an unprotected 'diff --quiet HEAD' DOES run the planted program"
+    else
+        bad "vacuity guard: the planted fsmonitor never fires here; the fixture proves nothing"
+    fi
+
+    # (b) Not a checkout at all: no die, and no answer invented.
+    vfix "${v}/nogit"
+    out=$(vrun "${v}/nogit"); rc=$?
+    if [ "$rc" -eq 0 ] && case "$out" in *'unknown (not a git checkout)'*) true ;; *) false ;; esac; then
+        ok "version on a non-git tree: 'unknown (not a git checkout)', exit 0"
+    else
+        bad "version on a non-git tree: rc=${rc}, out='${out}'"
+    fi
+
+    # (c) Unpacked INSIDE another repository: that repository's commit is not
+    #     this tool's version, and must not be printed as if it were.
+    mkdir -p "${v}/outer"
+    printf 'an unrelated repository\n' > "${v}/outer/README.md"
+    vcommit "${v}/outer" >/dev/null 2>&1
+    sha=$(git -C "${v}/outer" rev-parse --short HEAD)
+    vfix "${v}/outer/agent-box-example"
+    out=$(vrun "${v}/outer/agent-box-example"); rc=$?
+    if [ -n "$sha" ] && case "$out" in *"$sha"*) false ;; *) true ;; esac; then
+        ok "version inside another repository does not print that repository's commit (${sha})"
+    else
+        bad "version answered with the enclosing repository's commit: '${out}'"
+    fi
+    case "$out" in
+        *'unknown (not a git checkout)'*) ok "and it says so, rather than dying (rc=${rc})" ;;
+        *) bad "version inside another repository: rc=${rc}, out='${out}'" ;;
+    esac
+
+    # (d) Staged and not committed is dirty. The clean reading first, so the
+    #     `(dirty)` below is a change in the answer and not the only answer.
+    vfix "${v}/staged"
+    vcommit "${v}/staged" >/dev/null 2>&1
+    out=$(vrun "${v}/staged")
+    case "$out" in
+        *'(clean)'*) ok "version on an untouched checkout: (clean)" ;;
+        *) bad "version on an untouched checkout is not clean: '${out}'" ;;
+    esac
+    printf '\n# staged, not committed\n' >> "${v}/staged/bin/agentbox"
+    git -C "${v}/staged" add bin/agentbox
+    out=$(vrun "${v}/staged")
+    case "$out" in
+        *'(dirty)'*) ok "version with a staged-only change: (dirty)" ;;
+        *) bad "a staged-only change reads as a version somebody else has: '${out}'" ;;
+    esac
+
+    # (e) It takes no operands and no options.
+    out=$(vrun "${v}/staged" extra); rc=$?
+    if [ "$rc" -ne 0 ]; then ok "version with an operand is refused (rc=${rc})"
+    else bad "version accepted an operand: '${out}'"; fi
+    out=$(vrun "${v}/staged" --json); rc=$?
+    if [ "$rc" -ne 0 ]; then ok "version --json is refused (rc=${rc})"
+    else bad "version accepted --json, which it does not implement: '${out}'"; fi
+}
+
 check_repo_git
 check_host_clip
 check_meta_race
@@ -953,6 +1086,7 @@ check_chromium_found
 check_status_text_clamp
 check_toolchain_snapshot_keep
 check_box_json_hostile_values
+check_version
 
 printf -- '\nRESULT: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
