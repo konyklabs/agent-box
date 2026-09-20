@@ -76,7 +76,9 @@ cd ~/dev/agent-box
 
 `create` takes a few minutes the first time, mostly downloading the Ubuntu
 image, and ends by checking the toolchain by name — so a box that is not at
-baseline says which tool and exits non-zero rather than reporting itself ready.
+baseline says which tool rather than reporting itself ready. `create` still
+exits 0, because the box exists and is usable; `agentbox toolcheck <repo>` is
+the check that fails (exit 10) until the named tool is fixed.
 Full walkthrough, including what each step actually checks:
 **[docs/first-run.md](docs/first-run.md)**. Setting up a second machine, with
 the human-only steps marked so an agent can drive the rest:
@@ -118,7 +120,7 @@ One instance per repository, named `agent-box-<repo basename>`.
 | `agentbox destroy <repo\|name>` | Stop and delete the VM, and remind you to revoke the token. |
 | `agentbox bench <repo\|name> [--branch B] [--json] \| --list [--json] \| <repo\|name> --remove [--force]` | A host-side clone for rebuilding and checking the box's branch, outside the mount. |
 | `agentbox status [repo] [--json] [--watch [SECS]]` | One line per box: current run, sessions, firewall, standing session, channel counts, toolchain, leftovers. |
-| `agentbox triage [repo\|name] [--json]` | Across the fleet: keep, pause, remove or ask — and what is only inside each box. |
+| `agentbox triage [repo\|name] [--json]` | Across the fleet: a verdict (`active`, `waiting`, `attention`, `idle`, `parked`, `spent`) and an action (`keep`, `pause`, `remove`, `ask`) per box — and what is only inside each one. |
 | `agentbox egress <repo\|name> [MODE]` | Show, or change, the egress mode: `deny`, `observe` or `open`. A change rebuilds the firewall and prints the verification. |
 | `agentbox egress-log <repo\|name> [--since DUR] [--json] [--as-allowlist]` | What an `observe` box tried to reach, with the names it resolved. `--as-allowlist` emits lines to paste into `allowlist.local`. |
 | `agentbox firewall-check <repo\|name>` | Rebuild the egress allowlist and re-verify it, inside the VM. The container probes are advisory. |
