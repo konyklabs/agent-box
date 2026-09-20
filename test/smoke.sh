@@ -4788,6 +4788,433 @@ guest sh -c 'rm -f /work/.agent-box/channel/to-host/*.md /work/.agent-box/channe
 # ---- end slot:8k ----
 
 # ---- slot:8l (owner C3) ----
+printf -- '\n--- channel: host to box ---\n'
+#
+# The floor: a request written by an `agentbox` command ON THE HOST reaches the
+# standing in-box session by itself, through the CLI's hooks. Nothing here calls
+# a model — the hooks are invoked with fabricated payloads, which is what makes
+# the delivery contract testable at all — except the one step that starts the
+# real CLI to prove the settings wiring and the exported environment.
+#
+# What this step CANNOT prove, and the pull request says so: that the model in an
+# interactive session sees the injected text. That needs a real token and a person
+# looking at a terminal. Everything up to the hook boundary is proven here.
+#
+# The standing session is faked with a live process whose argv[0] is
+# claude-session.sh, because `abx_session_alive` reads the pid file and then
+# /proc/<pid>/cmdline — a pid file alone is not a session.
+
+CH8L_SETUP="${TMP_ROOT}/ch8l-setup.out"
+guest bash -l > "$CH8L_SETUP" 2>&1 <<'SH'
+set -u
+d="$HOME/.agent-box/sessions/claude"
+mkdir -p "$d"
+chmod 700 "$HOME/.agent-box" "$HOME/.agent-box/sessions" "$d"
+printf 'running\n' > "$d/status"; chmod 600 "$d/status"
+setsid nohup bash -c 'exec -a claude-session.sh sleep 900' >/dev/null 2>&1 </dev/null &
+printf '%s\n' "$!" > "$d/pid"
+chmod 600 "$d/pid"
+sleep 1
+echo "FAKE_PID=$(cat "$d/pid")"
+echo "FAKE_CMDLINE=$(tr '\0' ' ' < "/proc/$(cat "$d/pid")/cmdline" 2>/dev/null)"
+echo "STANDING=$(/opt/agent-box/guest/channel.sh standing-state)"
+SH
+cat "$CH8L_SETUP"
+CH8L_PID=$(sed -n 's/^FAKE_PID=//p' "$CH8L_SETUP" | head -1)
+if grep -q 'FAKE_CMDLINE=.*claude-session.sh' "$CH8L_SETUP" && grep -q '^STANDING=idle' "$CH8L_SETUP"; then
+    ok "the stand-in session is alive and reads as the standing session, idle"
+else
+    bad "the stand-in standing session was not set up (pid=${CH8L_PID})"
+fi
+
+printf -- '\n--- (b) the floor: a host request reaches the session hooks ---\n'
+# HC3: the request is written by an agentbox command on the HOST, and its file is
+# on the host's disk before the guest is asked anything.
+CH8L_R1="${TMP_ROOT}/ch8l-req1.out"
+run_bounded 60 "$CH8L_R1" "$AGENTBOX" request "$CLEAN_REPO" \
+    --subject 'two findings on the redirect' --text 'look at the login redirect: SMOKE-8L-BODY-1'
+cat "$CH8L_R1"
+CH8L_ID1=$(sed -n 's/^agentbox: request \([0-9-]*\) queued.*$/\1/p' "$CH8L_R1" | head -1)
+if [ -n "$CH8L_ID1" ] && [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID1}.md" ] \
+   && [ ! -e "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID1}.delivered" ]; then
+    ok "the request is on the host's disk and undelivered (vacuity guard)"
+else
+    bad "the request was not written by the host, so nothing below proves delivery"
+fi
+if grep -q 'the standing session is idle: it arrives at its next prompt' "$CH8L_R1"; then
+    ok "request closes with what will actually happen to it"
+else
+    bad "request did not say how an idle session receives it"
+fi
+
+CH8L_HOOK="${TMP_ROOT}/ch8l-hook.out"
+guest bash -l > "$CH8L_HOOK" 2>&1 <<SH
+set -u
+CH=/opt/agent-box/guest/channel.sh
+export ABX_CHANNEL_SESSION=claude
+d="\$HOME/.agent-box/sessions/claude"
+
+# One UserPromptSubmit, as the CLI fires it.
+printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"carry on"}' | "\$CH" hook UserPromptSubmit > /tmp/abx-8l-1.json 2>/tmp/abx-8l-1.err
+echo "HOOK_RC=\$?"
+echo "CTX_HAS_REQ=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-1.json 2>/dev/null | grep -c 'SMOKE-8L-BODY-1')"
+echo "CTX_EVENT=\$(jq -r '.hookSpecificOutput.hookEventName' /tmp/abx-8l-1.json 2>/dev/null)"
+echo "CTX_LEN=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-1.json 2>/dev/null | wc -c | tr -d ' ')"
+echo "CTX_LINES=\$(grep -c '' /tmp/abx-8l-1.json)"
+echo "SEEN1=\$(grep -c '' "\$d/channel.seen" 2>/dev/null || echo 0)"
+
+# The second firing in the same context: the reminder, never the body again.
+printf '%s' '{"hook_event_name":"UserPromptSubmit","prompt":"and again"}' | "\$CH" hook UserPromptSubmit > /tmp/abx-8l-2.json 2>&1
+echo "CTX2_HAS_BODY=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-2.json 2>/dev/null | grep -c 'SMOKE-8L-BODY-1')"
+echo "CTX2_HAS_REMINDER=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-2.json 2>/dev/null | grep -c 'still open from the host')"
+
+# SessionStart after a compaction: the OPEN set in full, whatever channel.seen says.
+printf '%s' '{"hook_event_name":"SessionStart","source":"compact"}' | "\$CH" hook SessionStart > /tmp/abx-8l-3.json 2>&1
+echo "COMPACT_HAS_BODY=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-3.json 2>/dev/null | grep -c 'SMOKE-8L-BODY-1')"
+echo "COMPACT_HAS_CONVENTION=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-3.json 2>/dev/null | grep -cF \"Run the project's own command, not an equivalent.\")"
+
+# A Stop hook blocks once, with the body, and exits 0 rather than 2.
+printf '%s' '{"hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"committed the branch"}' | "\$CH" hook Stop > /tmp/abx-8l-4.json 2>&1
+echo "STOP_RC=\$?"
+echo "STOP_DECISION=\$(jq -r '.decision // "none"' /tmp/abx-8l-4.json 2>/dev/null)"
+echo "STOP_LASTTEXT=\$(cat "\$d/last-text" 2>/dev/null)"
+printf '%s' '{"hook_event_name":"Stop","stop_hook_active":true}' | "\$CH" hook Stop > /tmp/abx-8l-5.json 2>&1
+echo "STOP_ACTIVE_RC=\$?"
+echo "STOP_ACTIVE_BYTES=\$(wc -c < /tmp/abx-8l-5.json | tr -d ' ')"
+
+# An inert firing: no ABX_CHANNEL_SESSION is what a run and an untracked shell
+# both look like from in here.
+printf '%s' '{"hook_event_name":"UserPromptSubmit"}' | env -u ABX_CHANNEL_SESSION "\$CH" hook UserPromptSubmit > /tmp/abx-8l-6.json 2>&1
+echo "INERT_RC=\$?"
+echo "INERT_BYTES=\$(wc -c < /tmp/abx-8l-6.json | tr -d ' ')"
+SH
+cat "$CH8L_HOOK"
+if grep -q '^HOOK_RC=0' "$CH8L_HOOK" && grep -q '^CTX_HAS_REQ=1' "$CH8L_HOOK" \
+   && grep -q '^CTX_EVENT=UserPromptSubmit' "$CH8L_HOOK"; then
+    ok "the hook injected the host's request into the session's context and exited 0"
+else
+    bad "the hook did not deliver the request"
+fi
+CH8L_LEN=$(sed -n 's/^CTX_LEN=//p' "$CH8L_HOOK" | head -1)
+case "$CH8L_LEN" in ''|*[!0-9]*) CH8L_LEN=0 ;; esac
+if [ "$CH8L_LEN" -gt 0 ] && [ "$CH8L_LEN" -le 8600 ] && grep -q '^CTX_LINES=1' "$CH8L_HOOK"; then
+    ok "the injected text is inside its budget and stdout is one JSON object (${CH8L_LEN} bytes)"
+else
+    bad "the injected text is ${CH8L_LEN} bytes, or stdout was not one object"
+fi
+if [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID1}.delivered" ]; then
+    ok "the box's own word about the delivery is on the host's disk: <id>.delivered"
+else
+    bad "no .delivered sidecar reached the host"
+fi
+CH8L_CJ="${TMP_ROOT}/ch8l-channel.json"
+run_bounded 60 "$CH8L_CJ" "$AGENTBOX" channel "$CLEAN_REPO" --json
+if [ "$(jq -r --arg id "$CH8L_ID1" '.to_box[] | select(.id == $id) | .state' "$CH8L_CJ")" = "delivered" ]; then
+    ok "and the host reads it as delivered"
+else
+    bad "the host does not read the request as delivered: $(jq -c --arg id "$CH8L_ID1" '.to_box[] | select(.id == $id)' "$CH8L_CJ")"
+fi
+if grep -q '^SEEN1=1' "$CH8L_HOOK"; then
+    ok "the session's own seen set holds exactly the one id it was shown"
+else
+    bad "channel.seen holds $(sed -n 's/^SEEN1=//p' "$CH8L_HOOK" | head -1) ids, not 1"
+fi
+if grep -q '^CTX2_HAS_BODY=0' "$CH8L_HOOK" && grep -q '^CTX2_HAS_REMINDER=1' "$CH8L_HOOK"; then
+    ok "inside one live context the body is not repeated, and the reminder names the id"
+else
+    bad "the second firing repeated the body or dropped the reminder"
+fi
+if grep -q '^COMPACT_HAS_BODY=1' "$CH8L_HOOK" && grep -q '^COMPACT_HAS_CONVENTION=1' "$CH8L_HOOK"; then
+    ok "a compacted context is re-told the OPEN request in full, and the conventions with it"
+else
+    bad "a compacted context was not re-told the open request"
+fi
+if grep -q '^STOP_RC=0' "$CH8L_HOOK" && grep -q '^STOP_DECISION=block' "$CH8L_HOOK"; then
+    ok "Stop delivers through decision:block with exit status 0, never exit 2"
+else
+    bad "the Stop hook did not block with exit 0"
+fi
+if grep -q '^STOP_LASTTEXT=committed the branch' "$CH8L_HOOK"; then
+    ok "Stop records the session's last visible answer for status to show"
+else
+    bad "Stop did not record last-text"
+fi
+if grep -q '^STOP_ACTIVE_RC=0' "$CH8L_HOOK" && grep -q '^STOP_ACTIVE_BYTES=0' "$CH8L_HOOK"; then
+    ok "a Stop with stop_hook_active true says nothing: a blocked stop cannot jam the session"
+else
+    bad "the stop_hook_active guard did not hold"
+fi
+if grep -q '^INERT_RC=0' "$CH8L_HOOK" && grep -q '^INERT_BYTES=0' "$CH8L_HOOK"; then
+    ok "without the exported session name the hook is inert, which is what keeps runs mail-free"
+else
+    bad "the hook was not inert without ABX_CHANNEL_SESSION"
+fi
+
+printf -- '\n--- (b) a subagent claims nothing, and two hooks deliver once ---\n'
+CH8L_R2="${TMP_ROOT}/ch8l-req2.out"
+run_bounded 60 "$CH8L_R2" "$AGENTBOX" request "$CLEAN_REPO" --text 'for the main thread only: SMOKE-8L-BODY-2'
+cat "$CH8L_R2"
+CH8L_ID2=$(sed -n 's/^agentbox: request \([0-9-]*\) queued.*$/\1/p' "$CH8L_R2" | head -1)
+CH8L_R3="${TMP_ROOT}/ch8l-req3.out"
+run_bounded 60 "$CH8L_R3" "$AGENTBOX" request "$CLEAN_REPO" --text 'delivered exactly once: SMOKE-8L-BODY-3'
+CH8L_ID3=$(sed -n 's/^agentbox: request \([0-9-]*\) queued.*$/\1/p' "$CH8L_R3" | head -1)
+if [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID2}.md" ] \
+   && [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID3}.md" ]; then
+    ok "both requests are on the host's disk before the box is asked (vacuity guard)"
+else
+    bad "the host did not write both requests"
+fi
+CH8L_PAR="${TMP_ROOT}/ch8l-parallel.out"
+guest bash -l > "$CH8L_PAR" 2>&1 <<SH
+set -u
+CH=/opt/agent-box/guest/channel.sh
+export ABX_CHANNEL_SESSION=claude
+
+# A hook firing inside a subagent: injected context never reaches the main
+# thread, so it shows nothing and records nothing.
+printf '%s' '{"hook_event_name":"PostToolUse","agent_id":"a1","tool_name":"Bash"}' | "\$CH" hook PostToolUse > /tmp/abx-8l-sub.json 2>&1
+echo "SUBAGENT_RC=\$?"
+echo "SUBAGENT_CLAIMED=\$(grep -c 'SMOKE-8L-BODY-2' /tmp/abx-8l-sub.json)"
+
+# Two hooks at once on the same mailbox: the lock is what makes one body one body.
+for i in 1 2; do
+    ( printf '%s' '{"hook_event_name":"PostToolUse","tool_name":"Bash"}' | "\$CH" hook PostToolUse > "/tmp/abx-8l-par-\$i.json" 2>&1 ) &
+done
+wait
+echo "BODY_COUNT=\$(cat /tmp/abx-8l-par-1.json /tmp/abx-8l-par-2.json | grep -c 'SMOKE-8L-BODY-3')"
+echo "PAR_LINES=\$(cat /tmp/abx-8l-par-1.json /tmp/abx-8l-par-2.json | grep -c '')"
+
+# The box's word, as the agent gives it: one request dealt with, one deleted.
+"\$CH" done ${CH8L_ID1} >/dev/null 2>&1
+echo "DONE_RC=\$?"
+rm -f /work/.agent-box/channel/to-box/${CH8L_ID2}.md
+echo "REMOVED=\$?"
+rm -f /tmp/abx-8l-*.json /tmp/abx-8l-*.err
+SH
+cat "$CH8L_PAR"
+if grep -q '^SUBAGENT_RC=0' "$CH8L_PAR" && grep -q '^SUBAGENT_CLAIMED=0' "$CH8L_PAR"; then
+    ok "a hook firing inside a subagent claims nothing"
+else
+    bad "a subagent's firing claimed a request"
+fi
+if [ ! -e "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID2}.delivered" ]; then
+    ok "and the request it did not show is still queued for the main thread"
+else
+    bad "the subagent's firing recorded a delivery"
+fi
+if grep -q '^BODY_COUNT=1' "$CH8L_PAR"; then
+    ok "two hooks racing on one mailbox show the body once"
+else
+    bad "the body was shown $(sed -n 's/^BODY_COUNT=//p' "$CH8L_PAR" | head -1) times by two parallel hooks"
+fi
+CH8L_CJ2="${TMP_ROOT}/ch8l-channel2.json"
+run_bounded 60 "$CH8L_CJ2" "$AGENTBOX" channel "$CLEAN_REPO" --json
+cat "$CH8L_CJ2"
+if [ "$(jq -r --arg id "$CH8L_ID1" '.to_box[] | select(.id == $id) | .state' "$CH8L_CJ2")" = "done" ]; then
+    ok "abx done in the box reaches the host as done"
+else
+    bad "the host does not read the request as done"
+fi
+if [ "$(jq -r --arg id "$CH8L_ID2" '.to_box[] | select(.id == $id) | .state' "$CH8L_CJ2")" = "lost" ]; then
+    ok "a request the guest deleted reads as lost, from the host's own record"
+else
+    bad "a deleted request does not read as lost"
+fi
+
+printf -- '\n--- (c) the real CLI: the settings wiring and the exported environment ---\n'
+# The stand-in has to go first: the name belongs to one process, and that is the
+# refusal this slice adds. The real session takes it from here.
+guest bash -lc "kill ${CH8L_PID:-0} 2>/dev/null; rm -f \$HOME/.agent-box/sessions/claude/pid; true"
+CH8L_R4="${TMP_ROOT}/ch8l-req4.out"
+run_bounded 60 "$CH8L_R4" "$AGENTBOX" request "$CLEAN_REPO" \
+    --subject 'through the real CLI' --text 'the real hooks deliver this: SMOKE-8L-BODY-4'
+cat "$CH8L_R4"
+CH8L_ID4=$(sed -n 's/^agentbox: request \([0-9-]*\) queued.*$/\1/p' "$CH8L_R4" | head -1)
+if [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID4}.md" ] \
+   && [ ! -e "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID4}.delivered" ]; then
+    ok "the fourth request is on the host's disk, undelivered (vacuity guard)"
+else
+    bad "the fourth request was not written, or was already delivered"
+fi
+# Authentication fails on the fake token, which is fine: SessionStart hooks run
+# before the CLI needs the credential (B-12 above proves the merge).
+CH8L_CLI="${TMP_ROOT}/ch8l-cli.out"
+run_bounded 180 "$CH8L_CLI" "$LIMACTL" shell --workdir /work "$INSTANCE" -- \
+    timeout 120 /opt/agent-box/guest/claude-session.sh --session-name claude -p hi
+sed -n '1,25p' "$CH8L_CLI"
+if [ -f "${CLEAN_REPO}/.agent-box/channel/to-box/${CH8L_ID4}.delivered" ]; then
+    ok "the real CLI's SessionStart hook delivered a request the HOST wrote, over virtiofs"
+else
+    bad "the real CLI did not deliver the host's request"
+fi
+CH8L_AFTER="${TMP_ROOT}/ch8l-after.out"
+guest bash -l > "$CH8L_AFTER" 2>&1 <<'SH'
+set -u
+d="$HOME/.agent-box/sessions/claude"
+echo "PID_LEFT=$(test -e "$d/pid" && echo yes || echo no)"
+echo "STATUS=$(cat "$d/status" 2>/dev/null)"
+echo "SEEN=$(grep -c '' "$d/channel.seen" 2>/dev/null || echo 0)"
+SH
+cat "$CH8L_AFTER"
+if grep -q '^PID_LEFT=no' "$CH8L_AFTER"; then
+    ok "the session released the standing name when it ended"
+else
+    bad "the pid file outlived the session, so the name stays taken"
+fi
+
+printf -- '\n--- (d) item 8: a run that ended is named once, not twice ---\n'
+CH8L_RUNID=20260101-000100
+CH8L_RUNS="${TMP_ROOT}/ch8l-runs.out"
+guest bash -l > "$CH8L_RUNS" 2>&1 <<SH
+set -u
+CH=/opt/agent-box/guest/channel.sh
+export ABX_CHANNEL_SESSION=claude
+# First, let the notice consume whatever this box has genuinely run: the first
+# firing in a session announces the three newest and records the rest, and a
+# planted run older than all of them would otherwise land in the recorded half.
+printf '%s' '{"hook_event_name":"SessionStart","source":"startup"}' | "\$CH" hook SessionStart >/dev/null 2>&1
+d="\$HOME/.agent-box/runs/${CH8L_RUNID}"
+mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${CH8L_RUNID}","branch":"agent/ended-earlier"}\n' > "\$d/meta.json"
+printf '%s' '{"hook_event_name":"SessionStart","source":"startup"}' | "\$CH" hook SessionStart > /tmp/abx-8l-r1.json 2>&1
+echo "RUN_NAMED_1=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-r1.json 2>/dev/null | grep -c '${CH8L_RUNID}')"
+echo "RUN_BRANCH=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-r1.json 2>/dev/null | grep -c 'agent/ended-earlier')"
+printf '%s' '{"hook_event_name":"SessionStart","source":"startup"}' | "\$CH" hook SessionStart > /tmp/abx-8l-r2.json 2>&1
+echo "RUN_NAMED_2=\$(jq -r '.hookSpecificOutput.additionalContext' /tmp/abx-8l-r2.json 2>/dev/null | grep -c '${CH8L_RUNID}')"
+rm -rf "\$d" /tmp/abx-8l-r1.json /tmp/abx-8l-r2.json
+SH
+cat "$CH8L_RUNS"
+if grep -q '^RUN_NAMED_1=1' "$CH8L_RUNS" && grep -q '^RUN_BRANCH=1' "$CH8L_RUNS"; then
+    ok "a run that ended is announced once, with its branch"
+else
+    bad "the runs notice did not name the ended run"
+fi
+if grep -q '^RUN_NAMED_2=0' "$CH8L_RUNS"; then
+    ok "and never again: runs-seen is a set, not a watermark"
+else
+    bad "the same run was announced twice"
+fi
+
+printf -- '\n--- (e) six requests at once get six ids ---\n'
+for i in 1 2 3 4 5 6; do
+    "$AGENTBOX" request "$CLEAN_REPO" --text "parallel request ${i}" > "${TMP_ROOT}/ch8l-par-${i}.out" 2>&1 &
+done
+wait
+cat "${TMP_ROOT}"/ch8l-par-[1-6].out
+CH8L_IDS=$(sed -n 's/^agentbox: request \([0-9-]*\) queued.*$/\1/p' "${TMP_ROOT}"/ch8l-par-[1-6].out | sort -u | grep -c '')
+CH8L_SAMESEC=$(sed -n 's/^agentbox: request \([0-9-]*\)-[0-9][0-9] queued.*$/\1/p' "${TMP_ROOT}"/ch8l-par-[1-6].out | sort | uniq -d | grep -c '')
+printf 'distinct ids: %s  seconds shared by two or more: %s\n' "$CH8L_IDS" "$CH8L_SAMESEC"
+if [ "$CH8L_SAMESEC" -ge 1 ]; then
+    ok "at least two of the six landed in the same second (vacuity guard)"
+else
+    adv "the six requests did not share a second; the collision path was not exercised"
+fi
+if [ "$CH8L_IDS" -eq 6 ]; then
+    ok "six requests published at once get six distinct ids"
+else
+    bad "six parallel requests produced ${CH8L_IDS} distinct ids"
+fi
+
+printf -- '\n--- (f) a term in a request is refused before anything is published ---\n'
+CH8L_TOBOX_BEFORE=$(find "${CLEAN_REPO}/.agent-box/channel/to-box" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+printf 'quincewood\n' > "$AGENT_BOX_BLOCKLIST"
+CH8L_TERM="${TMP_ROOT}/ch8l-term.out"
+run_bounded 60 "$CH8L_TERM" "$AGENTBOX" request "$CLEAN_REPO" --text 'this one mentions quincewood'
+CH8L_TERM_RC=$BOUNDED_RC
+cat "$CH8L_TERM"
+CH8L_TOBOX_AFTER=$(find "${CLEAN_REPO}/.agent-box/channel/to-box" -maxdepth 1 -name '*.md' | wc -l | tr -d ' ')
+printf 'to-box messages before: %s  after: %s\n' "$CH8L_TOBOX_BEFORE" "$CH8L_TOBOX_AFTER"
+if [ "$CH8L_TERM_RC" -ne 0 ] && grep -q 'contains a configured term' "$CH8L_TERM" \
+   && ! grep -qi quincewood "$CH8L_TERM" && [ "$CH8L_TOBOX_AFTER" = "$CH8L_TOBOX_BEFORE" ]; then
+    ok "a term-bearing request is refused, the term never echoed, nothing published"
+else
+    bad "a term-bearing request was not refused cleanly (rc=${CH8L_TERM_RC})"
+fi
+rm -f "$AGENT_BOX_BLOCKLIST"
+
+printf -- '\n--- the standing session in status --json, host keys last ---\n'
+# A live stand-in again, with a task the agent declared and a last line it wrote:
+# both are guest bytes on their way to the host's terminal.
+CH8L_STAND="${TMP_ROOT}/ch8l-standing.out"
+guest bash -l > "$CH8L_STAND" 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/sessions/claude"
+mkdir -p "\$d"; chmod 700 "\$d"
+setsid nohup bash -c 'exec -a claude-session.sh sleep 900' >/dev/null 2>&1 </dev/null &
+printf '%s\n' "\$!" > "\$d/pid"; chmod 600 "\$d/pid"
+printf 'running\n' > "\$d/status"
+sleep 1
+ABX_CHANNEL_SESSION=claude /opt/agent-box/guest/channel.sh status 'rebuilding the login branch' >/dev/null 2>&1
+echo "TASK_RC=\$?"
+printf 'x\033[2Jhostile last line\n' > "\$d/last-text"
+echo "PID2=\$(cat "\$d/pid")"
+echo "STANDING=\$(/opt/agent-box/guest/channel.sh standing-state)"
+SH
+cat "$CH8L_STAND"
+CH8L_PID2=$(sed -n 's/^PID2=//p' "$CH8L_STAND" | head -1)
+CH8L_SJ="${TMP_ROOT}/ch8l-status.json"
+run_bounded 90 "$CH8L_SJ" "$AGENTBOX" status "$CLEAN_REPO" --json
+cat "$CH8L_SJ"
+if jq -e '.boxes[0].standing | .name and .state and has("task") and has("last_text") and has("runs_unseen")' "$CH8L_SJ" >/dev/null 2>&1; then
+    ok "status --json carries the standing session's documented fields"
+else
+    bad "status --json does not carry the standing object: $(jq -c '.boxes[0].standing' "$CH8L_SJ" 2>/dev/null)"
+fi
+if [ "$(jq -r '.boxes[0].standing.task' "$CH8L_SJ" 2>/dev/null)" = "rebuilding the login branch" ]; then
+    ok "the task the box declared reaches the host"
+else
+    bad "the declared task did not reach status --json"
+fi
+case "$(jq -r '.boxes[0].standing.state' "$CH8L_SJ" 2>/dev/null)" in
+    working|idle|waiting|gone) ok "standing.state is one of the four documented words" ;;
+    *) bad "standing.state is '$(jq -r '.boxes[0].standing.state' "$CH8L_SJ" 2>/dev/null)'" ;;
+esac
+if LC_ALL=C grep -q "$(printf '\033')" "$CH8L_SJ"; then
+    bad "an ESC byte from the guest reached status --json"
+else
+    ok "the hostile last line is scrubbed on its way through"
+fi
+if "$PY" - "$CH8L_SJ" <<'PY'
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+box = raw[raw.index('"boxes"'):]
+guest_last = max(box.index('"standing"'), box.index('"sessions"'))
+host_first = min(box.index('"instance"'), box.index('"repo"'))
+sys.exit(0 if guest_last < host_first else 1)
+PY
+then
+    ok "the host's own keys are printed after the guest object, so a duplicate key cannot win"
+else
+    bad "the host keys are not last in the box object"
+fi
+guest bash -lc "kill ${CH8L_PID2:-0} 2>/dev/null; rm -f \$HOME/.agent-box/sessions/claude/pid; true"
+
+# Everything this step planted, gone: the queued requests are answered (a
+# leftover would be counted by 9-ch), the session's own records are removed, and
+# the next steps see the box as they found it.
+CH8L_CLEAN="${TMP_ROOT}/ch8l-clean.out"
+guest bash -l > "$CH8L_CLEAN" 2>&1 <<'SH'
+set -u
+export ABX_CHANNEL_SESSION=claude
+for f in /work/.agent-box/channel/to-box/*.md; do
+    [ -f "$f" ] || continue
+    id=$(basename "$f" .md)
+    /opt/agent-box/guest/channel.sh done "$id" >/dev/null 2>&1 || true
+done
+rm -rf "$HOME/.agent-box/sessions/claude"
+echo "OPEN_LEFT=$(ls /work/.agent-box/channel/to-box/*.md 2>/dev/null | wc -l | tr -d ' ')"
+echo "DONE_MARKS=$(ls /work/.agent-box/channel/to-box/*.done 2>/dev/null | wc -l | tr -d ' ')"
+SH
+cat "$CH8L_CLEAN"
+CH8L_CJ3="${TMP_ROOT}/ch8l-channel3.json"
+run_bounded 60 "$CH8L_CJ3" "$AGENTBOX" channel "$CLEAN_REPO" --json
+cat "$CH8L_CJ3"
+if [ "$(jq -r '.counts.to_box_open' "$CH8L_CJ3")" = "0" ]; then
+    ok "nothing this step queued is left open, so the counts the later steps read are their own"
+else
+    bad "the step left $(jq -r '.counts.to_box_open' "$CH8L_CJ3") requests open"
+fi
 # ---- end slot:8l ----
 
 # ---- slot:8m (owner C2) ----
