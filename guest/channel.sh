@@ -149,15 +149,25 @@ channel_workdir() {
 #
 # One `find`, bounded: `-type f` excludes a symlink wearing a message's name,
 # `-size +0c` excludes a reservation whose content has not arrived, and the head
-# bounds a directory somebody filled. A name with a newline in it arrives here as
-# two lines and fails the shape twice.
+# bounds a directory somebody filled.
+#
+# A name with a newline in it arrives here as TWO lines, and each half can be
+# shaped exactly like a message name — `A<LF>B.md` yields `A` and `B.md`, both of
+# which pass the shape on their own and neither of which names a file. So the
+# shape is not enough: the line has to be the whole path the id reconstructs, and
+# that path has to be a message file still. Without both, one such name in
+# `to-box/` puts an id in OPEN that `abx done` can never clear, and a hundred in
+# `to-host/` push the pending count past its limit and stop this box publishing.
 channel_ids() {
     local dir="${1:?}" line id
+    dir="${dir%/}"
     [ -d "$dir" ] || return 0
     while IFS= read -r line; do
         id="${line##*/}"
         id="${id%.md}"
         abx_valid_msgid "$id" || continue
+        [ "$line" = "${dir}/${id}.md" ] || continue
+        [ -f "${dir}/${id}.md" ] && [ ! -L "${dir}/${id}.md" ] || continue
         printf '%s\n' "$id"
     done < <(find "$dir" -maxdepth 1 -type f -size +0c -name '[0-9]*.md' 2>/dev/null |
         head -n 1000 | sort)
@@ -316,10 +326,17 @@ channel_mark_invalid() {
 # The cap is applied last, so a body that is cut is cut at the byte the caller
 # asked for; `awk` never sees an unbounded file because channel_message_ok has
 # already refused anything that could not be a message.
+#
+# `LC_ALL=C` on the awk as well as the tr, and it is not cosmetic: a message file
+# comes off a shared mount and can hold any byte at all. In a UTF-8 locale awk
+# ABORTS on a byte that is not valid UTF-8 (measured: `towc: multibyte conversion
+# failure`, exit 2) and the caller gets an empty body — the same trap the tool's
+# own `host_clip` records. Under C the bytes go through untouched and `tr` strips
+# the controls, so a body is read whatever the other side wrote.
 channel_body() {
     local f="${1:?}" bytes="${2:-$CH_BODY_LIMIT}"
     channel_message_ok "$f" || return 1
-    awk 'body { print; next } /^$/ { body = 1 }' "$f" |
+    LC_ALL=C awk 'body { print; next } /^$/ { body = 1 }' "$f" |
         LC_ALL=C tr -d "$CH_CONTROLS" | head -c "$bytes"
 }
 
@@ -480,11 +497,18 @@ channel_record_delivered() {
 #
 # BUDGET is in bytes and bounds the body alone. A body that does not fit is cut
 # with a line naming the command that prints the whole of it.
+#
+# A body that could not be READ is a different thing from a body that is empty,
+# and the difference matters here more than anywhere else in this file: `abx read`
+# records the id as delivered the moment this function returns 0, so a swallowed
+# failure would frame an empty request, write `.delivered` on the mount and put
+# the id in `channel.seen` — telling the host the request arrived while the model
+# saw none of it. The floor's promise is late, never lost, so this fails instead.
 channel_request_frame() {
     local id="${1:?}" budget="${2:-$CH_BODY_LIMIT}" f body bytes cut="" verdict="" head2=""
     f="${CH_TO_BOX}/${id}.md"
     channel_parse_headers "$f" || return 1
-    body=$(channel_body "$f" "$((budget + 1))") || true
+    body=$(channel_body "$f" "$((budget + 1))") || return 1
     bytes=$(printf '%s' "$body" | wc -c)
     bytes="${bytes//[[:space:]]/}"
     if [ "$bytes" -gt "$budget" ]; then
@@ -628,6 +652,16 @@ channel_session_label() {
 
 # The body a verb was given, scrubbed, into the private workdir. TEXT or `-`;
 # stdin when the verb takes it there. Prints nothing; sets CH_BODY_FILE.
+#
+# Every write here is status-checked, and a byte count is no substitute for it.
+# The staging steps are the one place in this file where a partial write cannot be
+# caught downstream: channel_publish compares the staged file with its copy, and
+# a short staged file and its faithful copy are the same size, so the publish
+# agrees with itself and the operator is told the message went. Two things really
+# do this — the scrubber refusing a byte that is not valid UTF-8 (it decodes
+# strictly, and stdio has already flushed what came before the bad byte), and a
+# full disk. Either one silently cuts a `## Verify` section off a handoff, which
+# is exactly the failure the host cannot see. So: refuse, and publish nothing.
 channel_stage_body() {
     local source="${1:?}" text="${2-}" cap="${3:?}" raw bytes
     channel_workdir
@@ -636,13 +670,15 @@ channel_stage_body() {
     case "$source" in
         stdin)
             [ ! -t 0 ] || die "the body goes on stdin (end it with Ctrl-D), or pass it as an argument"
-            cat > "$raw" ;;
-        text) printf '%s\n' "$text" > "$raw" ;;
+            cat > "$raw" || die "refusing: the body could not be read in full (is this box's disk full?); nothing was published" ;;
+        text) printf '%s\n' "$text" > "$raw" \
+            || die "refusing: the body could not be written in full (is this box's disk full?); nothing was published" ;;
     esac
     bytes=$(channel_bytes "$raw") || die "the body could not be measured"
     [ "$bytes" -le "$cap" ] \
         || die "refusing: the body is ${bytes} bytes and the cap is ${cap}. Shorten it, or leave the detail in a file on the branch and say where"
-    channel_scrub < "$raw" > "$CH_BODY_FILE"
+    channel_scrub < "$raw" > "$CH_BODY_FILE" \
+        || die "refusing: the body could not be redacted in full, so it is not safe to publish and would be cut where the redaction stopped; nothing was published. A byte that is not valid UTF-8 in the body does this — write it as text and try again"
     bytes=$(channel_bytes "$CH_BODY_FILE") || die "the body could not be measured after redaction"
     [ "$bytes" -le "$cap" ] \
         || die "refusing: the body is ${bytes} bytes after redaction and the cap is ${cap}"
@@ -680,12 +716,17 @@ channel_default_subject() {
 
 # Assemble the file and publish it. The header order is the format's; every value
 # has already been validated by its caller, which is why nothing here re-checks.
+#
+# The assembly's own status is checked for the reason channel_stage_body gives: the
+# body is the last thing written and the biggest, so a disk that fills cuts the
+# message here, where channel_publish's byte check cannot see it. `cat` is the
+# group's last command, so the group's status is the body write's status.
 channel_write_message() {
     local dir="${1:?}" type="${2:?}" subject="${3-}" re="${4-}" branch="${5-}" commit="${6-}" dirty="${7-}"
     local staged
     channel_workdir
     staged="${CH_WORKDIR}/message"
-    {
+    if ! {
         printf 'created: %s\n' "$(abx_now_iso)"
         printf 'type: %s\n' "$type"
         printf 'session: %s\n' "$(channel_session_label)"
@@ -696,7 +737,9 @@ channel_write_message() {
         [ -n "$subject" ] && printf 'subject: %s\n' "$subject"
         printf '\n'
         cat "$CH_BODY_FILE"
-    } > "$staged"
+    } > "$staged"; then
+        die "refusing: the message could not be assembled in full (is this box's disk full?); nothing was published"
+    fi
     channel_publish "$dir" "$staged"
 }
 
