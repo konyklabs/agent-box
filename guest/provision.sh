@@ -894,10 +894,17 @@ fi
 # with more at stake: this code runs on every EXISTING box the first time it
 # starts under a new checkout, and those boxes hold real work. A toolchain
 # problem is a warning and a retry on the next start, never a failed boot.
+#
+# And bounded, because fail-soft has to cover TIME as well as exit status: under
+# the standing deny a blocked or stalled address is DROPPED rather than refused,
+# so an unbounded install can sit in connect and the operator sees `agentbox
+# create` hang with no output and no way to tell it from a wedge. An hour is far
+# more than the install needs; reaching it is a warning and a retry on the next
+# start, like every other failure here.
 
 log "Installing the baseline toolchain from ${BOX_DIR}/guest/toolchain.pins"
-"${BOX_DIR}/guest/install-toolchain.sh" --user "$BOX_USER" \
-    || log "WARN: parts of the toolchain are missing; 'agentbox toolcheck <repo>' names them"
+timeout -k 30 3600 "${BOX_DIR}/guest/install-toolchain.sh" --user "$BOX_USER" \
+    || log "WARN: parts of the toolchain are missing, or it ran out of time; 'agentbox toolcheck <repo>' names them"
 
 # ---------------------------------------------------------------------------
 # 6. Personal configuration and plugins, as the guest user, under the firewall

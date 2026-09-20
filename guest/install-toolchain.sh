@@ -56,6 +56,29 @@ MIN_FREE_MIB=4096
 log()  { printf '[agent-box toolchain] %s\n' "$*"; }
 warn() { printf '[agent-box toolchain] WARN: %s\n' "$*" >&2; }
 
+# Fail-soft has to cover TIME as well as exit status. This script runs inside a
+# boot, so nothing in it may block for ever: the egress default is deny, which
+# DROPS rather than rejects, so a connect to an off-allowlist or stalled address
+# waits out its timeout instead of erroring, and a tool that phones home on
+# --version stalls every single start. Every download is bounded by curl's own
+# flags; every version probe goes through bounded(); and the provisioner bounds
+# this whole script with `timeout` at the call site, so the worst case is a
+# warning, never an `agentbox create` that sits there with no output.
+#
+# `timeout` is in coreutils (Essential in the guest image). The fallback is for
+# an image without it: unbounded, as before, rather than broken.
+TIMEOUT_CMD=$(command -v timeout 2>/dev/null) || TIMEOUT_CMD=""
+PROBE_SECS=15
+
+bounded() {
+    local secs="$1"; shift
+    if [ -n "$TIMEOUT_CMD" ]; then
+        "$TIMEOUT_CMD" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+
 usage() {
     cat >&2 <<'EOF'
 usage: install-toolchain.sh --user <box-user> [--pins FILE]
@@ -232,9 +255,24 @@ write_marker() {
 # Guessing wrong in the other direction would be expensive and silent: the tool
 # would be re-downloaded on every boot for ever, which is precisely what smoke's
 # "the second boot never reopened the firewall" step is there to catch.
+#
+# Bounded, because this is the one call every boot makes for every tool: twelve
+# steps × one probe each on a box where nothing needs installing. A tool that
+# blocks on its own update check (trufflehog asks oss.trufflehog.org, which is
+# not on the allowlist, so the packet is dropped rather than refused) would make
+# every `agentbox start` pay that stall, twice. A probe that does not answer is
+# named and treated as "not at its pin", which is what it is.
 answers_with() {
-    local want="$1" bin="$2" out
-    out=$("$bin" --version 2>&1) || out=$("$bin" -version 2>&1) || return 1
+    local want="$1" bin="$2" out rc
+    out=$(bounded "$PROBE_SECS" "$bin" --version 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then
+        out=$(bounded "$PROBE_SECS" "$bin" -version 2>&1); rc=$?
+    fi
+    if [ "$rc" -eq 124 ]; then
+        warn "${bin}: the version probe did not answer within ${PROBE_SECS}s"
+        return 1
+    fi
+    [ "$rc" -eq 0 ] || return 1
     printf '%s' "$out" | grep -qF -- "$want"
 }
 
@@ -274,7 +312,13 @@ fetch_verify() {
     local url="$1" want_sha="$2" out="$3"
     valid_url "$url"         || { warn "not a usable URL in the pins: ${url}"; return 1; }
     valid_sha256 "$want_sha" || { warn "not a sha256 in the pins for ${url}"; return 1; }
-    curl -fsSL --retry 3 --retry-delay 2 --max-time 600 "$url" -o "$out" || {
+    # --connect-timeout, because a dropped SYN is the normal failure here: an
+    # asset host that is off the allowlist, or the near-zero-TTL resolver race
+    # guest/allowlist.base documents, would otherwise sit in connect for the
+    # whole --max-time. --retry-max-time bounds the retry loop as a whole, so
+    # one bad asset cannot cost 3 × 600 s of a boot.
+    curl -fsSL --connect-timeout 20 --retry 3 --retry-delay 2 \
+         --retry-max-time 600 --max-time 600 "$url" -o "$out" || {
         warn "download failed: ${url}"; return 1; }
     printf '%s  %s\n' "$want_sha" "$(basename "$out")" \
         | (cd "$(dirname "$out")" && sha256sum -c -) >/dev/null 2>&1 || {
@@ -414,9 +458,36 @@ install_node() {
 # "checksum-verified" true for these three without a human pasting digests: the
 # files are compiled by host/refresh-pins.sh and committed.
 
+# The version the requirement file pins for the tool itself. The pins file and
+# the requirements file are two artefacts that have to agree: host/refresh-pins.sh
+# writes both, but an operator can commit a half-finished bump, and then the
+# install would put one version on the box and write_marker would record the
+# other — after which `satisfied` is false on every boot for ever and the tool is
+# torn down and re-downloaded each time, silently, because the install succeeds.
+# So the disagreement fails by name instead. uv writes the line as
+# `<name>==<version> \`, the name normalised to lower case with dashes.
+req_pinned_version() {
+    local tool="$1" req="$2"
+    sed -n "s/^${tool}==\\([A-Za-z0-9._+-]*\\).*\$/\\1/p" "$req" 2>/dev/null | head -1
+}
+
+# Put the previous install back, after a failed upgrade of it. `had` is 1 when
+# there was one to put back. The /usr/local/bin symlinks point at
+# ${venv}/bin/<tool>, so restoring the directory restores them too.
+restore_venv() {
+    local tool="$1" venv="$2" had="$3"
+    [ "$had" -eq 1 ] || return 0
+    rm -rf "$venv"
+    if mv "${venv}.old" "$venv"; then
+        log "${tool}: the previous install is still in place at ${venv}"
+    else
+        warn "${tool}: the previous install could not be put back at ${venv}"
+    fi
+}
+
 install_python_tool() {
     local tool="$1" version="$2" req="${REQ_DIR}/$3"; shift 3
-    local venv="${TOOLS_DIR}/${tool}" bin
+    local venv="${TOOLS_DIR}/${tool}" bin req_version had_venv=0
     valid_version "$version" || { warn "${tool}: no usable version in the pins"; return 1; }
     if satisfied "$tool" "$version" "${venv}/bin/$1"; then
         log "${tool} ${version} already at its pin"
@@ -425,21 +496,60 @@ install_python_tool() {
     command -v uv >/dev/null 2>&1 || { skipped "$tool" "uv is not installed"; return 1; }
     have_pkg python3-venv    || { skipped "$tool" "python3-venv is not installed"; return 1; }
     [ -f "$req" ] || { warn "${tool}: no requirement file at ${req}"; return 1; }
+    req_version=$(req_pinned_version "$tool" "$req")
+    if [ "$req_version" != "$version" ]; then
+        warn "${tool}: the pins say ${version} but ${req} pins ${req_version:-no ${tool}== line}; not installing"
+        return 1
+    fi
+    # The swap, and it is the same shape as install_binary_tool's and
+    # install_node's: the working tool survives a failed upgrade.
+    #
+    # It is also what makes this step idempotent at all. `uv venv` REFUSES a
+    # path that already holds a virtual environment — measured with the pinned
+    # uv 0.12.17: "error: Failed to create virtual environment / cause: A
+    # virtual environment already exists at: <path>", exit 2 — so a second call
+    # on the same path fails, which means a pin bump and the retry this script's
+    # header promises after a failed install would BOTH have been dead ends.
+    #
+    # The new venv is built at its FINAL path, not at a temporary one that is
+    # then renamed: uv bakes absolute paths into a venv's console scripts, so a
+    # venv built at ${venv}.new and moved would leave every entry point pointing
+    # at a directory that no longer exists. So the OLD tree is renamed aside
+    # first and moved back if anything below fails.
+    rm -rf "${venv}.old"
+    if [ -e "$venv" ]; then
+        if ! mv "$venv" "${venv}.old"; then
+            warn "${tool}: could not move the previous install aside at ${venv}"
+            return 1
+        fi
+        had_venv=1
+    fi
     if ! uv venv --python python3 "$venv" >/dev/null 2>&1; then
         warn "${tool}: could not create the venv at ${venv}"
+        restore_venv "$tool" "$venv" "$had_venv"
         return 1
     fi
     if ! uv pip install --python "${venv}/bin/python" --require-hashes -r "$req" >/dev/null 2>&1; then
         warn "${tool} ${version}: 'uv pip install --require-hashes' failed"
+        rm -rf "$venv"
+        restore_venv "$tool" "$venv" "$had_venv"
         return 1
     fi
+    # Every entry point is checked before any symlink is repointed: a half-built
+    # venv must not leave /usr/local/bin pointing into a tree this function is
+    # about to remove.
     for bin in "$@"; do
         if [ ! -x "${venv}/bin/${bin}" ]; then
             warn "${tool}: ${bin} is not in the venv"
+            rm -rf "$venv"
+            restore_venv "$tool" "$venv" "$had_venv"
             return 1
         fi
+    done
+    for bin in "$@"; do
         ln -sfn "${venv}/bin/${bin}" "${BIN_DIR}/${bin}"
     done
+    rm -rf "${venv}.old"
     write_marker "$tool" "$version"
     CHANGED=$((CHANGED + 1))
     log "${tool} ${version} installed at ${venv}"
@@ -469,6 +579,17 @@ install_playwright_deps() {
     if marker_says playwright-deps "$version"; then
         log "playwright ${version} system libraries already installed"
         return 0
+    fi
+    # Step 10 failing does not stop step 11, and on a pin bump the venv still
+    # holds the previous release until step 10 replaces it. install-deps installs
+    # the system libraries THAT release asks for, so running whatever binary is
+    # there and then stamping the marker with the pin would make the marker a
+    # false record — and smoke's "install-deps was run from the pinned version,
+    # per its own marker" would pass on a box where it was not. The binary has to
+    # agree first.
+    if ! answers_with "$version" "$PLAYWRIGHT_BIN"; then
+        skipped playwright-deps "the installed playwright is not at the pinned ${version}"
+        return 1
     fi
     export DEBIAN_FRONTEND=noninteractive
     if ! "$PLAYWRIGHT_BIN" install-deps >/dev/null 2>&1; then

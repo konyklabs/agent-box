@@ -287,9 +287,17 @@ esac
 # guest has something to refuse against; --python-version 3.12, which is what
 # the guest image ships and what the venvs are built with.
 
+# Compiled into the temporary directory, NEVER straight into the committed
+# guest/toolchain/: this script's promise is that nothing is written until every
+# asset verifies, and a compile that landed before the FETCH_FAILURES gate below
+# broke that promise for exactly these three files. A committed pins file naming
+# one version beside a requirements file naming another is the worst pair to
+# leave behind — the guest install succeeds and the marker records the other
+# version, so `satisfied` is false on every boot and the tool is torn down and
+# re-downloaded for ever, with nothing logged, because nothing failed. The three
+# files move into place after the gate, beside the pins file.
 compile_requirements() {
-    local tool="$1" ver="$2" out="${REQ_DIR}/${1}.requirements.txt"
-    mkdir -p "$REQ_DIR" || return 1
+    local tool="$1" ver="$2" out="${TMP}/${1}.requirements.txt"
     printf '%s==%s\n' "$tool" "$ver" > "${TMP}/${tool}.in"
     if ! uv pip compile "${TMP}/${tool}.in" \
             --generate-hashes --universal --python-version 3.12 \
@@ -298,11 +306,11 @@ compile_requirements() {
         sed -n '1,8p' "${TMP}/${tool}.err" >&2
         return 1
     fi
-    # The header uv writes names the input file by its temporary path and the
-    # output by its absolute one. Both are rewritten: the committed file says
-    # how to regenerate itself, and no path from the machine that ran this
-    # script ends up in a committed artefact.
+    # The header uv writes names both the input and the output file by their
+    # temporary paths. Both are rewritten to what the committed file is: how to
+    # regenerate itself, with no path from the machine that ran this script.
     sed -e "s|${TMP}/${tool}.in|(host/refresh-pins.sh: ${tool}==${ver})|g" \
+        -e "s|${TMP}/${tool}.requirements.txt|guest/toolchain/${tool}.requirements.txt|g" \
         -e "s|${BOX_DIR}/||g" \
         "$out" > "${TMP}/${tool}.req" && mv "${TMP}/${tool}.req" "$out"
     printf '%-34s %s\n' "${tool} ${ver} requirements" \
@@ -392,6 +400,20 @@ EOF
 if grep -nE '^[A-Z][A-Z0-9_]*=""$' "$NEW" >&2; then
     warn "the lines above have no value; ${PINS} was NOT changed"
     exit 1
+fi
+
+# The requirement files first, then the pins, so that every refusal above this
+# line leaves the committed pair exactly as it was. The two are a pair: the
+# guest's install_python_tool refuses to install when the version they name
+# disagrees, which is what catches the one window left — a pins move that fails
+# after the requirement files have landed.
+if [ "$SKIP_PYTHON" -eq 0 ]; then
+    mkdir -p "$REQ_DIR" || die "could not create ${REQ_DIR}"
+    for tool in $PYTHON_TOOLS; do
+        mv "${TMP}/${tool}.requirements.txt" "${REQ_DIR}/${tool}.requirements.txt" \
+            || die "could not write ${REQ_DIR}/${tool}.requirements.txt"
+        chmod 0644 "${REQ_DIR}/${tool}.requirements.txt"
+    done
 fi
 
 mkdir -p "$(dirname "$PINS")" || die "could not create $(dirname "$PINS")"

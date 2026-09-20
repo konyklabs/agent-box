@@ -4714,16 +4714,32 @@ fi
 
 # And that the pin is what provisioning actually used: the marker
 # install-toolchain.sh writes names the version it ran.
+#
+# Two captures, not one. Both facts used to come out of a single combined capture
+# and the negative one was expressed as `grep 'No such file'` — a string BOTH
+# commands produce, so it passed in precisely the state it exists to rule out:
+# the new marker absent (cat says "No such file") and the npx-era marker still
+# there. The negative is now the emptiness of its own capture, with the new
+# marker's non-emptiness as the vacuity guard in front of it.
 PWMARK_OUT="${TMP_ROOT}/playwright-marker.out"
-dguest bash -c 'cat /var/lib/agent-box/toolchain/playwright-deps.installed 2>&1;
-                ls /var/lib/agent-box/playwright-deps-installed 2>&1' > "$PWMARK_OUT" 2>&1 || true
-cat "$PWMARK_OUT"
+OLDMARK_OUT="${TMP_ROOT}/playwright-npx-marker.out"
+dguest bash -c 'cat /var/lib/agent-box/toolchain/playwright-deps.installed 2>/dev/null' \
+    > "$PWMARK_OUT" 2>/dev/null || true
+dguest bash -c 'ls -1 /var/lib/agent-box/playwright-deps-installed 2>/dev/null' \
+    > "$OLDMARK_OUT" 2>/dev/null || true
+printf 'playwright-deps.installed: %s\n' "$(tr -d '\n' < "$PWMARK_OUT")"
+printf 'npx-era marker:            %s\n' "$(tr -d '\n' < "$OLDMARK_OUT")"
+if [ -s "$PWMARK_OUT" ]; then
+    ok "there is an install-deps marker to read"
+else
+    bad "there is no /var/lib/agent-box/toolchain/playwright-deps.installed at all"
+fi
 if grep -q "^${PLAYWRIGHT_PIN} " "$PWMARK_OUT"; then
     ok "install-deps was run from the pinned version, per its own marker"
 else
     bad "the install-deps marker does not name playwright ${PLAYWRIGHT_PIN}"
 fi
-if grep -q 'No such file' "$PWMARK_OUT"; then
+if [ ! -s "$OLDMARK_OUT" ]; then
     ok "and the npx-era marker was removed when its replacement was written"
 else
     bad "the old playwright-deps-installed marker is still there"
