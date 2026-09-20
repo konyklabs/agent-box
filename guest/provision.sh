@@ -688,7 +688,7 @@ fi
 
 cat > /etc/profile.d/agent-box.sh <<EOF
 # Managed by agent-box provisioning. Do not edit.
-export PATH="\$HOME/.local/bin:/opt/npm-global/bin:\$PATH"
+export PATH="\$HOME/.local/bin:/opt/agent-box/guest/bin:/opt/npm-global/bin:\$PATH"
 export CLAUDE_CONFIG_DIR="${BOX_HOME}/.claude"
 export DISABLE_TELEMETRY=1
 export DISABLE_ERROR_REPORTING=1

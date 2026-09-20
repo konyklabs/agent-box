@@ -2172,6 +2172,23 @@ TC_PATH="${TMP_ROOT}/toolchain-path.out"
 guest sh -c 'for t in uv uvx ruff node npm npx mise trufflehog actionlint dprint basedpyright semgrep playwright; do command -v "$t" || echo "MISSING $t"; done' \
     > "$TC_PATH" 2>&1 || true
 cat "$TC_PATH"
+# The two commands this project puts in the guest itself. Nothing asserted them
+# before, and they were NOT on PATH: the profile's PATH line carried
+# /opt/npm-global/bin but not /opt/agent-box/guest/bin, so an agent following the
+# injected card straight into `abx handoff` got "command not found", and
+# conventions.md's "toolcheck (on PATH in this box)" was false. Found by driving
+# the installed CLI against a real box, not by this suite.
+ABX_PATH_OUT="${TMP_ROOT}/abx-on-path.out"
+guest bash -lc 'command -v abx; command -v toolcheck' > "$ABX_PATH_OUT" 2>&1 || true
+cat "$ABX_PATH_OUT"
+for abx_tool in abx toolcheck; do
+    if grep -qE "/${abx_tool}\$" "$ABX_PATH_OUT"; then
+        ok "the box's own ${abx_tool} is on PATH in a login shell"
+    else
+        bad "the box's own ${abx_tool} is NOT on PATH in a login shell; the injected card tells the agent to run it by name"
+    fi
+done
+
 for tc_tool in uv ruff node npm mise trufflehog actionlint dprint basedpyright semgrep playwright; do
     if grep -qE "/${tc_tool}\$" "$TC_PATH"; then
         ok "toolchain: ${tc_tool} is on PATH in a non-login shell"
