@@ -903,24 +903,347 @@ valid_port() {
 # host port probes (H1)
 # ---------------------------------------------------------------------------
 #
-# Lima cannot bind a host port something else already holds, and the forward then
-# simply does not answer — which reads as a guest problem and is not one. These
-# answer "is the host side of this forward free, and if not, who has it" for
-# `create`, `start` and `ports`.
+# Lima cannot bind a host port something else already holds at the address it
+# binds, and the forward then simply does not answer — which reads as a guest
+# problem and is not one. These answer "is the host side of this forward free,
+# and if not, who has it" for `create`, `start` and `ports`.
 #
-# The placeholders keep `cmd_create` and `cmd_start` honest until H1 lands: a
-# call with nothing behind it is better than a call site added later to a command
-# nobody re-read. They are also why H1 does not have to touch either command's
-# own lines — the call sites, the `--ignore-port-conflict` parsing and its usage
-# text are already here, so H1 adds only the two bodies.
-check_forward_ports() { :; }
+# Three probes and two refusals. `create` refuses before it builds anything,
+# `start` refuses before it boots anything — a forward is a frozen create-time
+# parameter, so a port taken while the box was stopped cannot be moved, only
+# reported — and `ports` reads both sides of every forward a box has.
+#
+# Nothing here writes: the host-side probe opens one TCP connection to the
+# loopback address and closes it, and `lsof` is read-only. No egress, no guest.
+#
+# A forward binds ONE host address. Lima's own template says which —
+# `hostIP: "0.0.0.0" # overrides the default value "127.0.0.1"` (lima 2.2.0,
+# share/lima/templates/default.yaml:517) — and the entry `create` prepends is
+# `{"guestPort": N}`, which takes that default. So the question here is not "is
+# this port held anywhere on this Mac" but "is 127.0.0.1:PORT taken", and the two
+# differ often enough to matter: a dev server bound to `::1`, or to the Mac's own
+# en0 address, holds the port for `localhost` and leaves 127.0.0.1 free for Lima.
+
+# Every TCP listener on a host port: one `<address> <pid> <command>` line per
+# socket, in lsof's order, or nothing when the probe could look and found nobody.
+# A return of 1 means no tool on this host could look at all, which is a
+# different answer from "nobody" and leads to a different message.
+#
+# `lsof -F pcn`, never the human table: the table's columns move between versions
+# and parsing them is parsing somebody else's formatting, while `-F` prints one
+# tagged field per line — `p<pid>`, `c<command>`, `n<address>`, plus the `f<fd>`
+# lsof emits as its per-file delimiter whether it was asked for or not. The
+# command name is chosen by whatever happens to be running on this Mac, so it
+# goes through `host_clip`; the address is checked against the characters an
+# address can be made of and becomes `?` when it is anything else.
+host_port_sockets() {
+    local port="${1:?}" out line pid="" comm="" addr
+    command -v lsof >/dev/null 2>&1 || return 1
+    out=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -F pcn 2>/dev/null) || out=""
+    while IFS= read -r line; do
+        case "$line" in
+            # A new process set. The command name that follows belongs to this
+            # pid, so the last one must not be carried over.
+            p[0-9]*) pid="${line#p}"; comm="" ;;
+            c?*)     comm="${line#c}" ;;
+            n?*)
+                case "$pid" in ''|*[!0-9]*) continue ;; esac
+                addr="${line#n}"
+                # `127.0.0.1:8080` → `127.0.0.1`, `[::1]:8080` → `[::1]`,
+                # `*:8080` → `*`. An IPv6 address keeps its brackets, which is
+                # what makes the trailing `:<port>` unambiguous.
+                addr="${addr%:*}"
+                case "$addr" in
+                    ''|*[!0-9a-fA-F:.%*\[\]]*) addr='?' ;;
+                esac
+                printf '%s %s %s\n' "$addr" "$pid" "$(host_clip "${comm:-unknown}" 40)" ;;
+        esac
+    done <<EOF
+$out
+EOF
+}
+
+# Would a listener at this address stand in the way of a forward, which binds
+# 127.0.0.1?
+#
+# MEASURED (macOS, lsof 4.x), one python listener per case, each time asking
+# whether a second process can still bind 127.0.0.1 beside it:
+#
+#   bound to        lsof's address    a 127.0.0.1 bind    in the way
+#   127.0.0.1       127.0.0.1         EADDRINUSE          yes
+#   0.0.0.0         *                 EADDRINUSE          yes
+#   :: dual-stack   *                 EADDRINUSE          yes
+#   :: v6only       *                 succeeds            no
+#   ::1             [::1]             succeeds            no
+#
+# `*` is therefore ambiguous: lsof prints it for both wildcards and cannot see
+# IPV6_V6ONLY, and a dual-stack `::` socket (node's `server.listen(port)` default)
+# takes 127.0.0.1 with it while a v6-only one does not. The caller settles that by
+# asking 127.0.0.1 itself; this answers "in the way, or may be", which is all a
+# probe that cannot connect has to go on.
+host_addr_blocks_loopback() {
+    case "${1:?}" in
+        '*'|'0.0.0.0'|'127.0.0.1'|'[::ffff:127.0.0.1]') return 0 ;;
+        # An address this host printed and the character check rejected: read as
+        # in the way, because the conservative direction is to refuse a create
+        # rather than to hand over a forward that never answers.
+        '?') return 0 ;;
+    esac
+    return 1
+}
+
+# Who holds a host port: `<pid> <address> <command>`, or nothing when the probe
+# could look and found nobody. A return of 1 means no tool could look at all.
+#
+# When several sockets share the port, the one in a forward's way is named first:
+# a message about 127.0.0.1 being taken must name the process that took it, not
+# whichever process happens to be listed first on `::1`.
+host_port_holder() {
+    local addr pid comm sockets fallback=""
+    sockets=$(host_port_sockets "${1:?}") || return 1
+    while read -r addr pid comm; do
+        [ -n "$pid" ] || continue
+        if host_addr_blocks_loopback "$addr"; then
+            printf '%s %s %s' "$pid" "$addr" "$comm"
+            return 0
+        fi
+        [ -n "$fallback" ] || fallback="${pid} ${addr} ${comm}"
+    done <<EOF
+$sockets
+EOF
+    [ -z "$fallback" ] || printf '%s' "$fallback"
+}
+
+# Is the host side of a forward busy? 0 taken, 1 free, 2 could not tell, and
+# 3 free for a forward but the port held on some other address.
+#
+# Three probes, in the order that answers the narrowest question first:
+#
+#   1. `lsof`, for a listener on 127.0.0.1 itself — direct evidence of the one
+#      bind that matters, and the common case (a running box's own hostagent
+#      binds 127.0.0.1 exactly), so the usual answer costs no connection.
+#   2. bash's own net redirection to 127.0.0.1, which settles the wildcard
+#      ambiguity above and sees what lsof cannot — a socket in another user's
+#      process. In a subshell, so a stray fd 3 cannot leak into the caller. Then
+#      `nc`, for a bash built without net redirections.
+#   3. Neither of those available: lsof's addresses are all there is to go on,
+#      and a wildcard is then read as in the way.
+#
+# Nothing to ask with at all is the one case that answers "could not tell" rather
+# than "free": refusing to create a box because a probe is missing would be worse
+# than the silent forward it is trying to prevent.
+host_port_busy() {
+    local port="${1:?}" err rc=0 addr pid comm sockets other=0 wild=0 have_lsof=0
+    if sockets=$(host_port_sockets "$port"); then
+        have_lsof=1
+        while read -r addr pid comm; do
+            [ -n "$pid" ] || continue
+            case "$addr" in
+                '127.0.0.1'|'[::ffff:127.0.0.1]') return 0 ;;
+                '*'|'?') wild=1 ;;
+                *)       other=1 ;;
+            esac
+        done <<EOF
+$sockets
+EOF
+    fi
+    err=$( (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>&1 ) || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    case "$err" in
+        # A refused connection is an answer: 127.0.0.1 is free, whatever else
+        # lsof saw there. A bash that cannot open the pseudo-device at all says
+        # so with the file error instead, and only then is there nothing left to
+        # ask.
+        *'No such file or directory'*|*'not supported'*)
+            if command -v nc >/dev/null 2>&1; then
+                nc -z 127.0.0.1 "$port" >/dev/null 2>&1 && return 0
+                [ "$wild" -eq 0 ] && [ "$other" -eq 0 ] || return 3
+                return 1
+            fi
+            [ "$wild" -eq 0 ] || return 0
+            [ "$other" -eq 0 ] || return 3
+            [ "$have_lsof" -eq 1 ] || return 2
+            return 1 ;;
+    esac
+    # 127.0.0.1 is free. A listener elsewhere on the same port is not a conflict,
+    # and it is not nothing either: it is why `localhost:PORT` on this Mac may
+    # answer from the wrong process, so it gets its own answer.
+    [ "$wild" -eq 0 ] && [ "$other" -eq 0 ] || return 3
+    return 1
+}
+
+# The agent-box instance whose Lima hostagent holds a pid, or nothing.
+#
+# `~/.lima/<instance>/ha.pid` holds the hostagent's own pid (measured: present,
+# six bytes). Which process actually binds the host end of a forward — the
+# hostagent itself or a child it spawns — depends on the Lima version and is
+# UNVERIFIED on this host, so the pid is compared against every hostagent's and
+# then against its parents, at most three levels up. Naming the box is the point:
+# on a machine with a fleet, the likeliest holder of a forwarded port is another
+# box, and "bound by pid 421 (ssh)" would send somebody hunting for a stranger.
+lima_instance_for_pid() {
+    local pid="${1:?}" level=0 f hapid name
+    case "$pid" in ''|*[!0-9]*) return 0 ;; esac
+    while [ "$level" -lt 4 ]; do
+        for f in "${LIMA_HOME:-${HOME}/.lima}"/*/ha.pid; do
+            [ -r "$f" ] || continue
+            hapid=""
+            # An exact compare, not a grep: `4` must not match `421`.
+            read -r hapid < "$f" 2>/dev/null || true
+            [ "$hapid" = "$pid" ] || continue
+            name=$(basename "$(dirname "$f")")
+            case "$name" in agent-box-*) printf '%s' "$name" ;; esac
+            return 0
+        done
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ') || pid=""
+        # pid 1 and 0 end the walk: nothing above them is a box's hostagent.
+        case "$pid" in ''|0|1|*[!0-9]*) return 0 ;; esac
+        level=$((level + 1))
+    done
+}
+
+# The forwards an existing box has: `<source> <port>…`, or nothing (return 1).
+#
+# The host's own record is the first source, because a forward is a create-time
+# parameter and `create` wrote it down at the one moment it was known without
+# asking anybody. A box created before that record existed has no line, and then
+# Lima's own view is read back with the template measured in the design notes,
+# which skips the template's two catch-all `ignore: true` entries. Either way:
+# digits and commas only, every port through `valid_port`, duplicates collapsed.
+# The record file is host-written and never mounted, and it is still validated —
+# `ports` prints what it finds there, and a file is a file.
+forward_ports_for() {
+    local inst="${1:?}" raw="" source=record p out=""
+    local -a parts=()
+    raw=$(read_instance_meta_raw "$inst" forward 2>/dev/null || true)
+    if [ -z "$raw" ]; then
+        source=lima
+        raw=$("$LIMACTL" list --format \
+            '{{.Name}}=[{{range .Config.PortForwards}}{{if not .Ignore}}{{index .GuestPortRange 0}},{{end}}{{end}}]' \
+            "$inst" 2>/dev/null | head -1) || raw=""
+        raw="${raw#*\[}"
+        raw="${raw%\]}"
+    fi
+    [ -n "$raw" ] || return 1
+    IFS=',' read -r -a parts <<< "$raw"
+    for p in ${parts[@]+"${parts[@]}"}; do
+        valid_port "$p" || continue
+        case " ${out} " in *" ${p} "*) continue ;; esac
+        out="${out}${p} "
+    done
+    [ -n "$out" ] || return 1
+    printf '%s %s' "$source" "${out% }"
+}
+
+# `<pid> <address> <command>` from `host_port_holder` into three variables, all
+# empty when nothing holds the port.
+#
+# One parse in one place because three callers want the same three fields, and
+# because a command name can contain spaces — so the command is what is left
+# after the pid and the address, not the last field.
+parse_port_holder() {
+    local holder="${1-}" rest
+    ABX_HOLDER_PID=""
+    ABX_HOLDER_ADDR=""
+    ABX_HOLDER_COMM=""
+    [ -n "$holder" ] || return 0
+    ABX_HOLDER_PID="${holder%% *}"
+    case "$holder" in *' '*) rest="${holder#* }" ;; *) return 0 ;; esac
+    ABX_HOLDER_ADDR="${rest%% *}"
+    case "$rest" in *' '*) ABX_HOLDER_COMM="${rest#* }" ;; esac
+}
+
+# `create`'s half: the loop that dies, or warns when it could not look.
+#
+# Silence on success is deliberate and matches the file's style. The evidence that
+# the check ran and passed is that `create --forward` still works. The one case
+# that is neither silence nor a refusal is a port held on an address a forward
+# does not use: Lima will bind 127.0.0.1 and the box will work, and `localhost`
+# on this Mac may still answer from the other process, which is worth one line.
+check_forward_ports() {
+    local port rc holder pid addr comm owner
+    for port in "$@"; do
+        rc=0
+        host_port_busy "$port" || rc=$?
+        case "$rc" in
+            1) continue ;;
+            2) info "NOTE: cannot check whether host port ${port} is free (no lsof, no nc, and this bash has no /dev/tcp); continuing. If the forward does not answer, '${PROG} ports <box>' will say which side is quiet."
+               continue ;;
+            3) holder=$(host_port_holder "$port") || holder=""
+               parse_port_holder "$holder"
+               info "NOTE: host port ${port} is held on ${ABX_HOLDER_ADDR:-another address} by ${ABX_HOLDER_PID:+pid ${ABX_HOLDER_PID} }(${ABX_HOLDER_COMM:-unknown}), not on 127.0.0.1, so the forward can still be bound and continues. Something on this Mac that resolves 'localhost' to that address will reach that process and not the box."
+               continue ;;
+        esac
+        holder=$(host_port_holder "$port") || holder=""
+        parse_port_holder "$holder"
+        pid="$ABX_HOLDER_PID"
+        addr="$ABX_HOLDER_ADDR"
+        comm="$ABX_HOLDER_COMM"
+        owner=""
+        [ -z "$pid" ] || owner=$(lima_instance_for_pid "$pid")
+        if [ -n "$owner" ]; then
+            die "host port ${port} is already bound by ${owner}'s port forward (pid ${pid}). Lima cannot bind it, so the forward would silently not answer. Stop that box, or create this one with a different --forward. '${PROG} ports ${owner}' shows both sides of its forwards."
+        fi
+        if [ -n "$pid" ]; then
+            # The address is in the message because it is the basis of the
+            # refusal: `127.0.0.1` or a wildcard is what makes this a refusal
+            # rather than the NOTE above, and an operator who disagrees can check
+            # it with the lsof line in the third message.
+            die "host port ${port} is already bound by pid ${pid} (${comm:-unknown})${addr:+ on ${addr}}. Lima cannot bind it, so the forward would silently not answer. Free the port, or create the box with a different --forward. '${PROG} ports <box>' shows both sides once a box exists."
+        fi
+        die "host port ${port} is already bound (could not identify the process). Lima cannot bind it, so the forward would silently not answer. 'lsof -nP -iTCP:${port} -sTCP:LISTEN' as a user who can see it will say who."
+    done
+}
 
 # `start`'s half, per amendment A2. A host port can be taken between `stop` and
 # `start`, and the forwards are frozen create-time params, so the only honest
 # answers are refuse-and-name-the-holder or proceed-with-a-WARNING. $2 is 1 when
 # `--ignore-port-conflict` was given; the box's own Lima hostagent holding the
 # port is not a conflict.
-start_port_check() { :; }
+start_port_check() {
+    local inst="${1:?}" ignore="${2:-0}" list port rc holder pid addr comm owner detail i
+    local -a fields=()
+    # A box that is already running is holding its own forwards, and `start` on it
+    # is close to a no-op. Refusing there would be refusing the box's own
+    # hostagent — the identity test below is the backstop, this is the cheap one.
+    [ "$(instance_state "$inst")" != "Running" ] || return 0
+    list=$(forward_ports_for "$inst") || return 0
+    IFS=' ' read -r -a fields <<< "$list"
+    i=1
+    while [ "$i" -lt "${#fields[@]}" ]; do
+        port="${fields[$i]}"
+        i=$((i + 1))
+        rc=0
+        host_port_busy "$port" || rc=$?
+        # Free, unprobeable, or held on an address a forward does not use
+        # (`host_port_busy`'s 3): `start` says nothing at all. Only 0 — 127.0.0.1
+        # itself taken — is a conflict, because that is the one case where the
+        # forward cannot be bound. The NOTE for the others belongs to `create`,
+        # where a port is being chosen; here it would print on every start of
+        # every forwarding box for ever.
+        [ "$rc" -eq 0 ] || continue
+        holder=$(host_port_holder "$port") || holder=""
+        parse_port_holder "$holder"
+        pid="$ABX_HOLDER_PID"
+        addr="$ABX_HOLDER_ADDR"
+        comm="$ABX_HOLDER_COMM"
+        owner=""
+        [ -z "$pid" ] || owner=$(lima_instance_for_pid "$pid")
+        [ "$owner" != "$inst" ] || continue
+        if [ -n "$owner" ]; then
+            detail="${owner}'s port forward (pid ${pid})"
+        elif [ -n "$pid" ]; then
+            detail="pid ${pid} (${comm:-unknown})${addr:+ on ${addr}}"
+        else
+            detail="something this host could not identify"
+        fi
+        if [ "$ignore" = "1" ]; then
+            info "WARNING: host port ${port} is held by ${detail}; starting ${inst} anyway, and that forward will not answer."
+            continue
+        fi
+        die "host port ${port}, which ${inst} forwards, is held by ${detail}. A forward is fixed at create time, so starting the box would give you a port that silently does not answer. Free the port, or run '${PROG} start <repo> --ignore-port-conflict' to start it anyway."
+    done
+}
 
 # ---------------------------------------------------------------------------
 # toolchain readiness (TB)
@@ -4159,7 +4482,255 @@ cmd_egress_log() {
 #
 # A forward has two halves and either can be quiet: nothing listening in the
 # guest, or something else on the Mac holding the host side. `ports` says which.
-cmd_ports() { die "ports: not built in this checkout"; }
+# The guest half is one call for every port, and its answer is a contract of
+# three fields per line — `<port> yes|no loopback|any|other|-` — validated field
+# by field before it is used and dropped when it is anything else. The ports in
+# the table are the HOST's own list either way: the guest fills in two columns, it
+# does not get to say which rows exist.
+#
+# A forward targets the guest's 127.0.0.1:PORT, so a guest socket bound to the
+# loopback address or to every address answers through it and one bound to a
+# specific other address does not. That is what `reaches` means, and it is why
+# `listening other` reads as a no rather than as a yes.
+cmd_ports() {
+    local inst as_json=0 list source="record" state lstate box guest="" map=" " first=1 i
+    local -a fports=() fields=()
+    split_args "" "$@"
+    check_operands 1 1 "ports <repo|name> [--json]"
+    inst=$(instance_name "${ABX_POSV[0]}")
+    set -- ${ABX_OPTV[@]+"${ABX_OPTV[@]}"}
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) as_json=1; shift ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    require_limactl
+    require_instance "$inst"
+    state=$(instance_state "$inst")
+    lstate=$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')
+    box="${inst#agent-box-}"
+
+    list=$(forward_ports_for "$inst") || list=""
+    if [ -n "$list" ]; then
+        source="${list%% *}"
+        IFS=' ' read -r -a fields <<< "$list"
+        i=1
+        while [ "$i" -lt "${#fields[@]}" ]; do
+            fports+=("${fields[$i]}")
+            i=$((i + 1))
+        done
+    fi
+
+    if [ "${#fports[@]}" -eq 0 ]; then
+        # In JSON an empty list, because a consumer asked for a shape and `[]` is
+        # the true answer. In text a refusal, because a person asking this about a
+        # box with no forwards has misremembered what the box is, and an empty
+        # table would let them go on believing it.
+        if [ "$as_json" -eq 1 ]; then
+            printf '{"generated_at":%s,"box":%s,"instance":%s,"state":%s,"source":%s,"ports":[]}\n' \
+                "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+                "$(json_str "$box")" "$(json_str "$inst")" \
+                "$(json_str "$lstate")" "$(json_str "$source")"
+            return 0
+        fi
+        die "${inst} has no forwarded ports. Forwards are fixed at create time ('${PROG} create <repo> --forward PORT')."
+    fi
+
+    if [ "$state" = "Running" ]; then
+        guest=$(guest_shell "$inst" "${GUEST_BIN}/box-listeners.sh" \
+            "$(IFS=,; printf '%s' "${fports[*]}")" 2>/dev/null) || guest=""
+    fi
+
+    local g_port g_listen g_scope g_rest
+    while IFS=' ' read -r g_port g_listen g_scope g_rest; do
+        [ -n "$g_port" ] || continue
+        # A fourth field means it is not the contract's line, whatever the first
+        # three say.
+        [ -z "$g_rest" ] || continue
+        case "$g_port" in ''|*[!0-9]*) continue ;; esac
+        case "${g_listen}:${g_scope}" in
+            yes:loopback|yes:any|yes:other|no:-) ;;
+            *) continue ;;
+        esac
+        # First answer per port wins, so a second line for the same port cannot
+        # overwrite the first.
+        case "$map" in *" ${g_port}="*) continue ;; esac
+        map="${map}${g_port}=${g_listen}:${g_scope} "
+    done <<EOF
+$guest
+EOF
+
+    if [ "$as_json" -eq 1 ]; then
+        printf '{"generated_at":%s,"box":%s,"instance":%s,"state":%s,"source":%s,"ports":[' \
+            "$(json_str "$(date -u +%Y-%m-%dT%H:%M:%SZ)")" \
+            "$(json_str "$box")" "$(json_str "$inst")" \
+            "$(json_str "$lstate")" "$(json_str "$source")"
+    else
+        printf '%-6s %-10s %-30s %-20s %s\n' 'PORT' 'FORWARDED' 'HOST 127.0.0.1' 'GUEST' 'REACHES'
+    fi
+
+    local port ans listen scope rc holder pid addr comm owner
+    local h_bound h_holder h_pid h_conflict h_elsewhere g_listening g_address reaches detail
+    local host_txt guest_txt reach_txt
+    for port in "${fports[@]}"; do
+        ans=""
+        case "$map" in
+            *" ${port}="*)
+                ans="${map#*" ${port}="}"
+                ans="${ans%% *}" ;;
+        esac
+        listen=""
+        scope=""
+        if [ -n "$ans" ]; then
+            listen="${ans%%:*}"
+            scope="${ans#*:}"
+        fi
+
+        rc=0
+        host_port_busy "$port" || rc=$?
+        holder=""
+        pid=""
+        addr=""
+        comm=""
+        owner=""
+        # Asked for 0 (127.0.0.1 taken) and for 3 (taken on another address):
+        # both have a holder worth naming, and they are named in different
+        # columns because one stops the forward and the other does not.
+        if [ "$rc" -eq 0 ] || [ "$rc" -eq 3 ]; then
+            holder=$(host_port_holder "$port") || holder=""
+            parse_port_holder "$holder"
+            pid="$ABX_HOLDER_PID"
+            addr="$ABX_HOLDER_ADDR"
+            comm="$ABX_HOLDER_COMM"
+            [ "$rc" -ne 0 ] || [ -z "$pid" ] || owner=$(lima_instance_for_pid "$pid")
+        fi
+
+        h_elsewhere=null
+        case "$rc" in
+            0)
+                h_bound=true
+                case "$pid" in ''|*[!0-9]*) h_pid=null ;; *) h_pid="$pid" ;; esac
+                if [ "$owner" = "$inst" ]; then
+                    h_holder=$(json_str "this box")
+                    h_conflict=false
+                    host_txt="bound by this box (pid ${pid})"
+                elif [ -n "$owner" ]; then
+                    h_holder=$(json_str "$owner")
+                    h_conflict=true
+                    host_txt="conflict: ${owner} (pid ${pid})"
+                elif [ -n "$pid" ]; then
+                    h_holder=$(json_str "${comm:-unknown}")
+                    h_conflict=true
+                    host_txt="conflict: pid ${pid} (${comm:-unknown})"
+                else
+                    h_holder=null
+                    h_conflict=true
+                    host_txt="conflict: bound, holder unknown"
+                fi ;;
+            1)
+                h_bound=false; h_holder=null; h_pid=null; h_conflict=false
+                host_txt="free" ;;
+            3)
+                # Free where it matters. `bound` is about 127.0.0.1, which is the
+                # column's heading and the only address a forward uses, so this is
+                # `false` — and `held_elsewhere` carries the rest, because an
+                # operator whose `localhost:PORT` answers from the wrong process
+                # needs to be told, not reassured.
+                h_bound=false; h_holder=null; h_pid=null; h_conflict=false
+                h_elsewhere=$(json_str "${addr:-another address}${pid:+ pid ${pid}} (${comm:-unknown})")
+                host_txt="free (held on ${addr:-another address})" ;;
+            *)
+                h_bound=null; h_holder=null; h_pid=null; h_conflict=null
+                host_txt="?" ;;
+        esac
+
+        if [ "$listen" = yes ]; then
+            g_listening=true
+            g_address=$(json_str "$scope")
+            guest_txt="listening ${scope}"
+        elif [ "$listen" = no ]; then
+            g_listening=false
+            g_address=null
+            guest_txt="not listening"
+        else
+            g_listening=null
+            g_address=null
+            guest_txt="?"
+        fi
+
+        # `null` is reserved for the one case where a side is genuinely unknown:
+        # the host had no probe. A stopped box and a silent box are both a plain
+        # no, with the reason in `detail` — neither is a mystery.
+        reaches=false
+        detail=""
+        if [ "$listen" = yes ]; then
+            case "$scope" in
+                loopback|any)
+                    case "$rc" in
+                        0)
+                            if [ "$owner" = "$inst" ]; then
+                                reaches=true
+                            elif [ -n "$owner" ]; then
+                                detail="the host port is held by ${owner}"
+                            elif [ -n "$pid" ]; then
+                                detail="the host port is held by something else (pid ${pid})"
+                            else
+                                detail="the host port is held by something this host could not identify"
+                            fi ;;
+                        1) detail="the box is listening, but nothing holds the host side of the forward" ;;
+                        # Still a plain no, and for the same reason as 1: the
+                        # forward is not up. The other listener is named because
+                        # it is what makes `localhost:PORT` look as if it were.
+                        3) detail="the box is listening, but nothing holds the host side of the forward; the port is held on ${addr:-another address}, which a forward does not use" ;;
+                        *) reaches=null; detail="the host port could not be probed" ;;
+                    esac ;;
+                *) detail="the box is listening on an address a forward cannot reach; only 127.0.0.1 and 0.0.0.0 answer through one" ;;
+            esac
+        elif [ "$listen" = no ]; then
+            detail="nothing in the box is listening"
+        elif [ "$state" = "Running" ]; then
+            detail="the box did not answer"
+        else
+            detail="the box is not running"
+        fi
+
+        if [ "$reaches" = true ]; then
+            reach_txt="yes"
+        elif [ "$reaches" = null ]; then
+            reach_txt="? — ${detail}"
+        else
+            reach_txt="no — ${detail}"
+        fi
+
+        if [ "$as_json" -eq 1 ]; then
+            [ "$first" -eq 1 ] || printf ','
+            first=0
+            printf '{"port":%s,"host":{"bound":%s,"holder":%s,"pid":%s,"conflict":%s,"held_elsewhere":%s},"guest":{"listening":%s,"address":%s},"reaches":%s,"detail":%s}' \
+                "$port" "$h_bound" "$h_holder" "$h_pid" "$h_conflict" "$h_elsewhere" \
+                "$g_listening" "$g_address" "$reaches" \
+                "$(if [ "$reaches" = true ]; then printf 'null'; else json_str "$detail"; fi)"
+        else
+            printf '%-6s %-10s %-30s %-20s %s\n' "$port" 'yes' "$host_txt" "$guest_txt" "$reach_txt"
+        fi
+    done
+
+    if [ "$as_json" -eq 1 ]; then
+        printf ']}\n'
+        return 0
+    fi
+    printf '\n'
+    if [ "$source" = lima ]; then
+        printf 'forwards read back from Lima: this box was created before the host recorded them.\n'
+    else
+        printf 'forwards recorded at create time.\n'
+    fi
+    if [ "$state" = "Running" ]; then
+        printf 'the guest was read just now; a forward only reaches a guest socket bound to 127.0.0.1 or 0.0.0.0.\n'
+    else
+        printf 'the box is not running, so only the host side was read.\n'
+    fi
+}
 # ---------------------------------------------------------------------------
 
 cmd_firewall_check() {

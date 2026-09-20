@@ -91,7 +91,8 @@ PASS=0
 FAIL=0
 # Advisory. Counted and printed, never fatal, and deliberately a third category
 # rather than a quiet pass: a check that is allowed not to hold still has to say
-# when it did not. Exactly one check uses it — see cdn.playwright.dev below.
+# when it did not. Two checks use it — cdn.playwright.dev below, and the `::1`
+# listener in step 3f, which a host with no IPv6 loopback cannot plant.
 WARN=0
 
 hr()   { printf '%s\n' '==============================================================='; }
@@ -608,6 +609,367 @@ fi
 rm -f "${AGENT_BOX_CONFIG_DIR}/config"
 
 # ---- slot:3f (owner H1) ----
+# ===========================================================================
+step "3f. a held host port: create refuses it, start refuses it, ports reports it"
+# ===========================================================================
+#
+# The failure being prevented is silent by construction: Lima cannot bind a host
+# port something else already holds, so the forward simply does not answer and
+# nothing says why — which reads as a broken box and is not one. Three halves,
+# all host-only, with the fake limactl standing in so that not one of them can
+# build, start or reach a VM:
+#
+#   create  refuses before preflight and before anything is built, naming the
+#           port and the process holding it
+#   start   refuses a box whose RECORDED forward was taken while it was stopped
+#           (a forward is a frozen create-time parameter, so there is nothing
+#           else it could honestly do), and --ignore-port-conflict starts it
+#           anyway with a WARNING
+#   ports   answers an empty list for a box with no forwards, marks a foreign
+#           holder as a conflict, and drops a guest line that is not the
+#           three-field contract instead of believing it
+#
+# Planted: a real listener this step owns, on a port derived and probed free here
+# — never one of the suite's three, which step 11 forwards for real. Its pid goes
+# into SMOKE_BG_PIDS, because `set -uo pipefail` without -e means a step can die
+# halfway and the kill has to survive that.
+
+FAKE_LIMACTL="${BOX_DIR}/test/fake-limactl"
+PF_DIR="${TMP_ROOT}/portfake"
+PF_REPO="${TMP_ROOT}/pf-${SMOKE_ID}"
+PF_INSTANCE="agent-box-pf-${SMOKE_ID}"
+PF_NOFWD="agent-box-nofwd-${SMOKE_ID}"
+mkdir -p "$PF_DIR" "$PF_REPO"
+git init -q "$PF_REPO"
+printf 'A throwaway repository for the host-port checks.\n' > "${PF_REPO}/hello.txt"
+
+PROBE_PORT=$((FORWARD_PORT + 3))
+_t=0
+while [ "$_t" -lt 40 ] && ! host_port_free "$PROBE_PORT"; do
+    PROBE_PORT=$((PROBE_PORT + 1))
+    [ "$PROBE_PORT" -le 27999 ] || PROBE_PORT=20000
+    _t=$((_t + 1))
+done
+unset _t
+
+printf -- '--- a host listener holding %s, the port the box below forwards ---\n' "$PROBE_PORT"
+"$PY" -m http.server "$PROBE_PORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+PF_LISTENER_PID=$!
+SMOKE_BG_PIDS+=("$PF_LISTENER_PID")
+_t=0
+while [ "$_t" -lt 15 ] && host_port_free "$PROBE_PORT"; do sleep 1; _t=$((_t + 1)); done
+unset _t
+# The vacuity guard, first: every refusal below means nothing if the port is free.
+if ! host_port_free "$PROBE_PORT"; then
+    ok "the probe listener is holding ${PROBE_PORT}, so the refusals below are not vacuous"
+else
+    bad "nothing is holding ${PROBE_PORT}; the checks below would prove nothing"
+fi
+
+printf -- '\n--- agentbox create --forward <held port> ---\n'
+PF_CREATE_OUT="${TMP_ROOT}/pf-create.out"
+run_bounded 60 "$PF_CREATE_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    "$AGENTBOX" create "$PF_REPO" --egress deny --forward "$PROBE_PORT"
+pf_rc=$BOUNDED_RC
+cat "$PF_CREATE_OUT"
+if [ "$pf_rc" -ne 0 ]; then
+    ok "create refused a --forward whose host port was already bound"
+else
+    bad "create exited 0 with a held forward port"
+fi
+if grep -qF "$PROBE_PORT" "$PF_CREATE_OUT" && grep -qE 'bound by|already bound' "$PF_CREATE_OUT"; then
+    ok "the refusal named the port and said it is bound"
+else
+    bad "the refusal did not name the port and how it is held"
+fi
+# The holder is this suite's own python and lsof can name it, so the refusal has
+# to say WHO rather than only that the port is busy.
+if grep -qE "bound by (pid [0-9]+ \(|agent-box-)" "$PF_CREATE_OUT"; then
+    ok "the refusal named the holder, by pid and command or as another box"
+else
+    bad "the refusal did not name the holder"
+fi
+# Step 1 shows what preflight prints, so this negative is not vacuous.
+if grep -q 'preflight on' "$PF_CREATE_OUT"; then
+    bad "create ran preflight before checking the forward"
+else
+    ok "the refusal came before preflight, so nothing was scanned"
+fi
+# The fake limactl refuses every subcommand but list and shell, and says so. Its
+# absence from the output is the proof that create never got as far as building.
+if grep -q 'is not implemented' "$PF_CREATE_OUT"; then
+    bad "create reached limactl with a held forward port"
+else
+    ok "create never reached limactl"
+fi
+if ! "$LIMACTL" list --quiet 2>/dev/null | grep -qxF "$PF_INSTANCE"; then
+    ok "create left no instance behind after refusing"
+else
+    bad "create left an instance behind after refusing"
+fi
+
+printf -- '\n--- agentbox start of a stopped box whose recorded forward is held ---\n'
+mkdir -p "${AGENT_BOX_CONFIG_DIR}/instances"
+printf 'repo=%s\nforward=%s\n' "$PF_REPO" "$PROBE_PORT" \
+    > "${AGENT_BOX_CONFIG_DIR}/instances/${PF_INSTANCE}"
+printf '%s|Stopped|%s|4|6GiB|40GiB|%s\n' "$PF_INSTANCE" "$PF_REPO" "${PF_DIR}/${PF_INSTANCE}" \
+    > "${PF_DIR}/instances"
+PF_START_OUT="${TMP_ROOT}/pf-start.out"
+run_bounded 120 "$PF_START_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    "$AGENTBOX" start "$PF_REPO"
+pf_rc=$BOUNDED_RC
+cat "$PF_START_OUT"
+if [ "$pf_rc" -ne 0 ] && grep -qF "$PROBE_PORT" "$PF_START_OUT"; then
+    ok "start refused a box whose recorded forward is held on the host, naming the port"
+else
+    bad "start did not refuse a held recorded forward (exit ${pf_rc})"
+fi
+if grep -q -- '--ignore-port-conflict' "$PF_START_OUT"; then
+    ok "the refusal named the escape hatch"
+else
+    bad "the refusal did not name --ignore-port-conflict"
+fi
+if grep -q 'preflight on' "$PF_START_OUT" || grep -q 'is not implemented' "$PF_START_OUT"; then
+    bad "start ran preflight or reached limactl before checking the recorded forwards"
+else
+    ok "start refused before preflight and before limactl"
+fi
+
+printf -- '\n--- the same start with --ignore-port-conflict ---\n'
+PF_START2_OUT="${TMP_ROOT}/pf-start-ignore.out"
+run_bounded 120 "$PF_START2_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    "$AGENTBOX" start "$PF_REPO" --ignore-port-conflict
+cat "$PF_START2_OUT"
+if grep -qE "WARNING: host port ${PROBE_PORT} is held" "$PF_START2_OUT"; then
+    ok "--ignore-port-conflict printed a WARNING naming the port"
+else
+    bad "--ignore-port-conflict printed no WARNING naming the port"
+fi
+# It went on to the start itself, which the fake refuses by design — and that
+# refusal, from limactl and not from the port check, is the proof it got there.
+if grep -q 'start is not implemented' "$PF_START2_OUT"; then
+    ok "and it went on to the start, which only the fake limactl then refused"
+else
+    bad "--ignore-port-conflict did not carry on to the start"
+fi
+
+printf -- '\n--- agentbox ports on a box with no forwards ---\n'
+printf '%s|Stopped|%s|4|6GiB|40GiB|%s\n' "$PF_NOFWD" "$PF_REPO" "${PF_DIR}/${PF_NOFWD}" \
+    >> "${PF_DIR}/instances"
+PF_EMPTY_JSON="${TMP_ROOT}/pf-ports-empty.json"
+run_bounded 60 "$PF_EMPTY_JSON" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    "$AGENTBOX" ports "$PF_NOFWD" --json
+pf_rc=$BOUNDED_RC
+cat "$PF_EMPTY_JSON"
+if [ "$pf_rc" -eq 0 ] && jq -e '.ports == []' "$PF_EMPTY_JSON" >/dev/null 2>&1; then
+    ok "ports --json on a box with no forwards exits 0 with an empty list"
+else
+    bad "ports --json on a box with no forwards did not print an empty list and exit 0 (exit ${pf_rc})"
+fi
+PF_EMPTY_TXT="${TMP_ROOT}/pf-ports-empty.txt"
+run_bounded 60 "$PF_EMPTY_TXT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    "$AGENTBOX" ports "$PF_NOFWD"
+pf_rc=$BOUNDED_RC
+cat "$PF_EMPTY_TXT"
+if [ "$pf_rc" -ne 0 ] && grep -q 'no forwarded ports' "$PF_EMPTY_TXT"; then
+    ok "the same question in text is refused, naming create as the only place a forward is set"
+else
+    bad "ports in text did not refuse a box with no forwards (exit ${pf_rc})"
+fi
+
+printf -- '\n--- agentbox ports with a hostile guest answer, host port held ---\n'
+PF_SHELL="${TMP_ROOT}/pf-fake-shell"
+cat > "$PF_SHELL" <<EOF
+#!/usr/bin/env bash
+# Stands in for the guest's box-listeners.sh. One line is the contract; the other
+# three are what a subverted box would send: a port nobody asked about, a fourth
+# field, and words that are not in the vocabulary.
+printf '%s yes any\n' "$PROBE_PORT"
+printf '65000 yes any\n'
+printf '%s yes any pwned\n' "$PROBE_PORT"
+printf '%s maybe sideways\n' "$PROBE_PORT"
+EOF
+chmod 755 "$PF_SHELL"
+printf '%s|Running|%s|4|6GiB|40GiB|%s\n' "$PF_INSTANCE" "$PF_REPO" "${PF_DIR}/${PF_INSTANCE}" \
+    > "${PF_DIR}/instances"
+PF_PORTS_JSON="${TMP_ROOT}/pf-ports.json"
+run_bounded 60 "$PF_PORTS_JSON" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+    FAKE_LIMA_SHELL="$PF_SHELL" "$AGENTBOX" ports "$PF_INSTANCE" --json
+pf_rc=$BOUNDED_RC
+cat "$PF_PORTS_JSON"
+if [ "$pf_rc" -eq 0 ] && jq -e . "$PF_PORTS_JSON" >/dev/null 2>&1; then
+    ok "ports --json parses with a hostile guest answer"
+else
+    bad "ports --json did not parse with a hostile guest answer (exit ${pf_rc})"
+fi
+if jq -e "(.ports | length) == 1 and (.ports[0].port == ${PROBE_PORT})" "$PF_PORTS_JSON" >/dev/null 2>&1; then
+    ok "the rows are the host's own record: the port the guest invented is not one of them"
+else
+    bad "a port the guest invented reached the table"
+fi
+if jq -e '.ports[0].guest.listening == true and .ports[0].guest.address == "any"' "$PF_PORTS_JSON" >/dev/null 2>&1; then
+    ok "the one line that matched the contract was used"
+else
+    bad "the contract-shaped guest line was not used"
+fi
+if grep -qE 'pwned|maybe|sideways' "$PF_PORTS_JSON"; then
+    bad "a guest line that is not the contract reached the output"
+else
+    ok "the lines that are not the contract were dropped, not printed"
+fi
+# The host port is still held by this step's listener, which is not this box's
+# hostagent: a forward with a foreign holder is a conflict, and it does not reach.
+if jq -e '.ports[0].host.conflict == true and .ports[0].reaches == false and (.ports[0].detail | test("held by"))' "$PF_PORTS_JSON" >/dev/null 2>&1; then
+    ok "a foreign process on the host side is marked as a conflict and reaches=false"
+else
+    bad "a foreign holder of the host side was not reported as a conflict"
+fi
+if jq -e '.ports[0].host.pid | type == "number"' "$PF_PORTS_JSON" >/dev/null 2>&1; then
+    ok "the holder's pid crosses as a number, and its command name as a string"
+else
+    bad "the holder's pid is not a number"
+fi
+
+printf -- '\n--- a port held on an address a forward does not use ---\n'
+# The other half of "is this port free", and the half an address-blind probe gets
+# wrong: a forward binds 127.0.0.1 and nothing else (lima's own template
+# documents hostIP's default as that), so a listener on `::1` — what a dev server
+# that resolves `localhost` and binds the first answer gets on a Mac — holds the
+# port for `localhost` and leaves the forward perfectly bindable. Refusing there
+# refuses a box that would have worked, and `create` has no escape flag.
+#
+# MEASURED, one python listener per case, each time asking whether a second
+# process can still bind 127.0.0.1: `127.0.0.1`, `0.0.0.0` and a dual-stack `::`
+# take it with them (EADDRINUSE), `::1` and a v6-only `::` do not.
+V6_PORT=$((PROBE_PORT + 1))
+_t=0
+while [ "$_t" -lt 40 ] && ! host_port_free "$V6_PORT"; do
+    V6_PORT=$((V6_PORT + 1))
+    [ "$V6_PORT" -le 27999 ] || V6_PORT=20000
+    _t=$((_t + 1))
+done
+unset _t
+"$PY" -m http.server "$V6_PORT" --bind ::1 >/dev/null 2>&1 &
+V6_LISTENER_PID=$!
+SMOKE_BG_PIDS+=("$V6_LISTENER_PID")
+_t=0
+while [ "$_t" -lt 15 ]; do
+    [ -z "$(lsof -nP -iTCP:"$V6_PORT" -sTCP:LISTEN -t 2>/dev/null)" ] || break
+    sleep 1; _t=$((_t + 1))
+done
+unset _t
+V6_LSOF=$(lsof -nP -iTCP:"$V6_PORT" -sTCP:LISTEN -F pcn 2>/dev/null)
+printf '%s\n' "$V6_LSOF"
+# Two vacuity guards, in opposite directions: the port has to be held on `::1`
+# where lsof can see it, and 127.0.0.1 has to still be bindable beside it. A host
+# with no `::1` on its loopback cannot show this at all, and says so rather than
+# passing quietly.
+if printf '%s' "$V6_LSOF" | grep -qF "[::1]:${V6_PORT}" \
+    && "$PY" -c "
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('127.0.0.1', int(sys.argv[1]))); s.listen(1)
+" "$V6_PORT" 2>/dev/null; then
+    ok "port ${V6_PORT} is held on [::1] where lsof can see it, and 127.0.0.1 is still bindable"
+
+    V6_REPO="${TMP_ROOT}/v6-${SMOKE_ID}"
+    V6_INSTANCE="agent-box-v6-${SMOKE_ID}"
+    mkdir -p "$V6_REPO"
+    git init -q "$V6_REPO"
+    printf 'A throwaway repository for the address-scope checks.\n' > "${V6_REPO}/hello.txt"
+    V6_CREATE_OUT="${TMP_ROOT}/v6-create.out"
+    run_bounded 120 "$V6_CREATE_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        "$AGENTBOX" create "$V6_REPO" --egress deny --forward "$V6_PORT"
+    cat "$V6_CREATE_OUT"
+    if grep -qE "host port ${V6_PORT} is already bound" "$V6_CREATE_OUT"; then
+        bad "create refused a forward Lima can bind: the probe read the port and not the address"
+    else
+        ok "create did not refuse a forward whose host address is free"
+    fi
+    if grep -qE "NOTE: host port ${V6_PORT} is held on \[::1\]" "$V6_CREATE_OUT"; then
+        ok "it said so in a NOTE naming the address, so 'localhost' answering elsewhere is not a mystery"
+    else
+        bad "create said nothing about the listener on the other address"
+    fi
+    # It got as far as building, which only the fake limactl refuses — the proof
+    # that the port check let it past rather than dying quietly somewhere else.
+    if grep -q 'create is not implemented' "$V6_CREATE_OUT"; then
+        ok "and it carried on to limactl, which is where the fake stops it"
+    else
+        bad "create stopped before limactl for some other reason"
+    fi
+
+    printf 'repo=%s\nforward=%s\n' "$V6_REPO" "$V6_PORT" \
+        > "${AGENT_BOX_CONFIG_DIR}/instances/${V6_INSTANCE}"
+    printf '%s|Stopped|%s|4|6GiB|40GiB|%s\n' "$V6_INSTANCE" "$V6_REPO" "${PF_DIR}/${V6_INSTANCE}" \
+        > "${PF_DIR}/instances"
+    V6_START_OUT="${TMP_ROOT}/v6-start.out"
+    run_bounded 120 "$V6_START_OUT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        "$AGENTBOX" start "$V6_REPO"
+    tail -2 "$V6_START_OUT"
+    if grep -qE "host port ${V6_PORT}, which ${V6_INSTANCE} forwards, is held" "$V6_START_OUT"; then
+        bad "start refused a box whose forward Lima can bind"
+    else
+        ok "start did not refuse a box whose forward's host address is free"
+    fi
+    if grep -q 'start is not implemented' "$V6_START_OUT"; then
+        ok "start reached the start itself, which only the fake limactl refused"
+    else
+        bad "start did not reach limactl"
+    fi
+
+    printf '%s|Running|%s|4|6GiB|40GiB|%s\n' "$V6_INSTANCE" "$V6_REPO" "${PF_DIR}/${V6_INSTANCE}" \
+        > "${PF_DIR}/instances"
+    V6_SHELL="${TMP_ROOT}/v6-fake-shell"
+    printf '#!/usr/bin/env bash\nprintf "%s yes any\\n"\n' "$V6_PORT" > "$V6_SHELL"
+    chmod 755 "$V6_SHELL"
+    V6_PORTS_JSON="${TMP_ROOT}/v6-ports.json"
+    run_bounded 60 "$V6_PORTS_JSON" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        FAKE_LIMA_SHELL="$V6_SHELL" "$AGENTBOX" ports "$V6_INSTANCE" --json
+    cat "$V6_PORTS_JSON"
+    if jq -e '.ports[0].host.conflict == false and .ports[0].host.bound == false' "$V6_PORTS_JSON" >/dev/null 2>&1; then
+        ok "ports calls the host side of that forward free, not a conflict"
+    else
+        bad "ports marked a bindable forward as a conflict"
+    fi
+    if jq -e '.ports[0].host.held_elsewhere | test("\\[::1\\]")' "$V6_PORTS_JSON" >/dev/null 2>&1; then
+        ok "and it still names the other listener, in held_elsewhere"
+    else
+        bad "ports dropped the other listener instead of naming it"
+    fi
+    V6_PORTS_TXT="${TMP_ROOT}/v6-ports.txt"
+    run_bounded 60 "$V6_PORTS_TXT" env LIMACTL="$FAKE_LIMACTL" FAKE_LIMA_DIR="$PF_DIR" \
+        FAKE_LIMA_SHELL="$V6_SHELL" "$AGENTBOX" ports "$V6_INSTANCE"
+    cat "$V6_PORTS_TXT"
+    if grep -qE "free \(held on \[::1\]\)" "$V6_PORTS_TXT"; then
+        ok "the text HOST column reads free, with the other address in brackets"
+    else
+        bad "the text HOST column does not read free for a bindable forward"
+    fi
+    rm -f "${AGENT_BOX_CONFIG_DIR}/instances/${V6_INSTANCE}" "$V6_SHELL" \
+        "$V6_CREATE_OUT" "$V6_START_OUT" "$V6_PORTS_JSON" "$V6_PORTS_TXT"
+    rm -rf "$V6_REPO"
+else
+    adv "advisory: this host could not hold ${V6_PORT} on [::1] where lsof can see it, so the address-scope checks were skipped"
+fi
+kill "$V6_LISTENER_PID" 2>/dev/null || true
+wait "$V6_LISTENER_PID" 2>/dev/null || true
+
+printf -- '\n--- clean up what this step planted ---\n'
+# `wait` after the kill, not only the kill: without it the shell reports the job
+# as Terminated in the middle of the next step's output. cleanup() still has the
+# pid, so an abort before this line kills the listener anyway.
+kill "$PF_LISTENER_PID" 2>/dev/null || true
+wait "$PF_LISTENER_PID" 2>/dev/null || true
+rm -f "${AGENT_BOX_CONFIG_DIR}/instances/${PF_INSTANCE}" "$PF_SHELL" \
+    "$PF_CREATE_OUT" "$PF_START_OUT" "$PF_START2_OUT" \
+    "$PF_EMPTY_JSON" "$PF_EMPTY_TXT" "$PF_PORTS_JSON"
+rm -rf "$PF_DIR" "$PF_REPO"
+if [ ! -e "${AGENT_BOX_CONFIG_DIR}/instances/${PF_INSTANCE}" ] && [ ! -d "$PF_DIR" ]; then
+    ok "the fake instance record and the fake limactl state are gone"
+else
+    bad "this step left its fake instance state behind"
+fi
 # ---- end slot:3f ----
 
 # ---- slot:3g (owner H2) ----
@@ -6293,6 +6655,36 @@ step "11. a second instance with the Docker and browser-testing profile"
 # build both.
 
 # ---- slot:11-pre (owner H1) ----
+# The preamble probed these three ports free tens of minutes ago, and `create`
+# now REFUSES a forward whose host port is bound. A stranger that took one since
+# then would therefore stop this step from creating anything at all — a failure
+# that reads as "the Docker profile is broken" and is not. So: probe again here,
+# immediately before the create, and walk the trio upward together if one is
+# taken, exactly as the preamble does. Moving all three together is what keeps
+# step 12's "nothing answers on the unforwarded port" meaningful.
+printf -- '--- the three host ports, re-probed immediately before the create ---\n'
+_t=0
+while [ "$_t" -lt 40 ]; do
+    if host_port_free "$FORWARD_PORT" && host_port_free "$FORWARD_PORT2" && host_port_free "$UNFORWARDED_PORT"; then
+        break
+    fi
+    printf 'ports %s/%s/%s: one was taken since the preamble, moving up\n' \
+        "$FORWARD_PORT" "$FORWARD_PORT2" "$UNFORWARDED_PORT"
+    FORWARD_PORT=$((FORWARD_PORT + 3))
+    [ "$FORWARD_PORT" -le 27997 ] || FORWARD_PORT=20000
+    FORWARD_PORT2=$((FORWARD_PORT + 1))
+    UNFORWARDED_PORT=$((FORWARD_PORT + 2))
+    _t=$((_t + 1))
+done
+unset _t
+printf 'host ports now: %s and %s to forward, %s deliberately not\n' \
+    "$FORWARD_PORT" "$FORWARD_PORT2" "$UNFORWARDED_PORT"
+if host_port_free "$FORWARD_PORT" && host_port_free "$FORWARD_PORT2" && host_port_free "$UNFORWARDED_PORT"; then
+    ok "three free host ports for the forwarding box, re-derived at the point of use"
+else
+    bad "no three free host ports in 20000-27999; create will refuse the forward"
+    summarise_and_exit
+fi
 # ---- end slot:11-pre ----
 
 mkdir -p "$DOCKER_REPO"
@@ -6345,6 +6737,152 @@ printf -- '\n--- the sizing Lima actually gave it ---\n'
 "$LIMACTL" list "$DOCKER_INSTANCE"
 
 # ---- slot:11b (owner H1) ----
+# ===========================================================================
+step "11b. ports: both sides of a real forward, on the only box that has any"
+# ===========================================================================
+#
+# This box is the only one in the suite with real forwards, so it is the only
+# place `ports` can be checked against a live hostagent and a live guest. What it
+# catches: a forward that is quiet for either of the two possible reasons, blamed
+# on the wrong side. The guest listener is planted and killed here, because step
+# 12 needs ${FORWARD_PORT} free for its compose stack.
+
+printf -- '--- agentbox ports, before anything in the box is listening ---\n'
+DK_PORTS_TXT="${TMP_ROOT}/dk-ports.txt"
+run_bounded 120 "$DK_PORTS_TXT" "$AGENTBOX" ports "$DOCKER_INSTANCE"
+cat "$DK_PORTS_TXT"
+DK_PORT_ROWS=$(awk 'NR > 1 && $1 ~ /^[0-9]+$/ { print $1 }' "$DK_PORTS_TXT" | sort -n | tr '\n' ' ')
+printf 'port rows: [%s]\n' "$DK_PORT_ROWS"
+if [ "$DK_PORT_ROWS" = "${FORWARD_PORT} ${FORWARD_PORT2} " ]; then
+    ok "ports listed exactly the forwards the box was created with"
+else
+    bad "ports listed [${DK_PORT_ROWS}], not the two forwards the box was created with"
+fi
+if grep -q 'nothing in the box is listening' "$DK_PORTS_TXT"; then
+    ok "with nothing listening in the guest, the table says which side is quiet"
+else
+    bad "the table did not name the quiet side for a forward with no guest listener"
+fi
+
+printf -- '\n--- a listener in the guest, bound 0.0.0.0, on %s ---\n' "$FORWARD_PORT"
+# shellcheck disable=SC2016  # $! must expand in the guest, not here.
+dguest bash -lc "setsid nohup python3 -m http.server ${FORWARD_PORT} --bind 0.0.0.0 >/dev/null 2>&1 </dev/null & echo \$! > /tmp/abx-ports-listener.pid"
+DK_LISTEN=""
+_t=0
+while [ "$_t" -lt 20 ]; do
+    DK_LISTEN=$(dguest /opt/agent-box/guest/box-listeners.sh "$FORWARD_PORT" 2>/dev/null) || DK_LISTEN=""
+    case "$DK_LISTEN" in *" yes "*) break ;; esac
+    sleep 1
+    _t=$((_t + 1))
+done
+unset _t
+printf 'box-listeners.sh %s -> %s\n' "$FORWARD_PORT" "${DK_LISTEN:-<no answer>}"
+# The guest half's own contract, read from the box itself: this is the only place
+# the /proc decoding in guest/lib.sh's abx_listeners meets a real listener.
+if [ "$DK_LISTEN" = "${FORWARD_PORT} yes any" ]; then
+    ok "the guest half reports the 0.0.0.0 listener as 'yes any', in the contract's three fields"
+else
+    bad "the guest half answered '${DK_LISTEN}', not '${FORWARD_PORT} yes any'"
+fi
+DK_QUIET=$(dguest /opt/agent-box/guest/box-listeners.sh "$UNFORWARDED_PORT" 2>/dev/null) || DK_QUIET=""
+printf 'box-listeners.sh %s -> %s\n' "$UNFORWARDED_PORT" "${DK_QUIET:-<no answer>}"
+if [ "$DK_QUIET" = "${UNFORWARDED_PORT} no -" ]; then
+    ok "and a port nothing is listening on still gets a row, saying no"
+else
+    bad "the guest half answered '${DK_QUIET}' for a port with no listener"
+fi
+
+printf -- '\n--- who holds the host side of a live forward (the ha.pid identity) ---\n'
+# Evidence, not an assertion: whether the process that binds the host port IS the
+# hostagent or a child of it decides whether the holder can be named as this box.
+# The host walks at most three parents to find out; this prints both ends of that
+# comparison so a failure below is diagnosable from the transcript alone.
+lsof -nP -iTCP:"$FORWARD_PORT" -sTCP:LISTEN -F pcn 2>/dev/null || true
+printf 'ha.pid: %s\n' "$(cat "${HOME}/.lima/${DOCKER_INSTANCE}/ha.pid" 2>/dev/null || echo '<none>')"
+DK_HOLDER_PID=$(lsof -nP -iTCP:"$FORWARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1)
+if [ -n "$DK_HOLDER_PID" ]; then
+    ps -o pid,ppid,comm -p "$DK_HOLDER_PID" 2>/dev/null || true
+    ps -o pid,ppid,comm -p "$(ps -o ppid= -p "$DK_HOLDER_PID" 2>/dev/null | tr -d ' ')" 2>/dev/null || true
+fi
+
+printf -- '\n--- agentbox ports --json with one side live and one side quiet ---\n'
+DK_PORTS_JSON="${TMP_ROOT}/dk-ports.json"
+run_bounded 120 "$DK_PORTS_JSON" "$AGENTBOX" ports "$DOCKER_INSTANCE" --json
+cat "$DK_PORTS_JSON"
+if jq -e . "$DK_PORTS_JSON" >/dev/null 2>&1; then
+    ok "ports --json parses"
+else
+    bad "ports --json did not parse"
+fi
+if jq -e "(.ports | length) == 2
+          and (.ports | map(.port) | sort == [${FORWARD_PORT}, ${FORWARD_PORT2}])
+          and (.ports | all(has(\"host\") and has(\"guest\") and has(\"reaches\")))" \
+        "$DK_PORTS_JSON" >/dev/null 2>&1; then
+    ok "ports --json names both sides of each forward"
+else
+    bad "ports --json did not carry both sides of both forwards"
+fi
+if jq -e "(.ports[] | select(.port == ${FORWARD_PORT}) | .guest.listening == true and .reaches == true)" \
+        "$DK_PORTS_JSON" >/dev/null 2>&1; then
+    ok "a forwarded port with a listener in the guest reports reaches=yes"
+else
+    bad "a forwarded port with a live guest listener did not report reaches=yes"
+fi
+if jq -e "(.ports[] | select(.port == ${FORWARD_PORT}) | .host.holder == \"this box\" and .host.conflict == false)" \
+        "$DK_PORTS_JSON" >/dev/null 2>&1; then
+    ok "the host side of a working forward is attributed to this box, not to a stranger"
+else
+    bad "the host side of a working forward was not attributed to this box (see the ha.pid evidence above)"
+fi
+if jq -e "(.ports[] | select(.port == ${FORWARD_PORT2}) | .reaches == false and (.detail | test(\"listening\")))" \
+        "$DK_PORTS_JSON" >/dev/null 2>&1; then
+    ok "a forwarded port with nothing listening reports reaches=no and says which side is quiet"
+else
+    bad "a forward with no guest listener did not say which side is quiet"
+fi
+
+printf -- '\n--- the fallback: a box created before the host recorded its forwards ---\n'
+DK_META="${AGENT_BOX_CONFIG_DIR}/instances/${DOCKER_INSTANCE}"
+cp "$DK_META" "${DK_META}.bak"
+grep -v '^forward=' "$DK_META" > "${DK_META}.tmp" && mv -f "${DK_META}.tmp" "$DK_META"
+printf 'record without the forward line:\n'
+cat "$DK_META"
+DK_PORTS_LIMA="${TMP_ROOT}/dk-ports-lima.json"
+run_bounded 120 "$DK_PORTS_LIMA" "$AGENTBOX" ports "$DOCKER_INSTANCE" --json
+cat "$DK_PORTS_LIMA"
+if jq -e "(.source == \"lima\")
+          and (.ports | map(.port) | sort == [${FORWARD_PORT}, ${FORWARD_PORT2}])" \
+        "$DK_PORTS_LIMA" >/dev/null 2>&1; then
+    ok "ports read the forwards back from Lima for a box created before the record existed"
+else
+    bad "the Lima fallback did not produce the same two forwards"
+fi
+mv -f "${DK_META}.bak" "$DK_META"
+if grep -q "^forward=" "$DK_META"; then
+    ok "the record is restored"
+else
+    bad "the forward record was not restored"
+fi
+
+printf -- '\n--- take the guest listener away again ---\n'
+# shellcheck disable=SC2016  # the pid file must be read in the guest.
+dguest bash -lc 'p=$(cat /tmp/abx-ports-listener.pid 2>/dev/null); case "$p" in ""|*[!0-9]*) ;; *) kill "$p" 2>/dev/null ;; esac; rm -f /tmp/abx-ports-listener.pid'
+DK_LISTEN=""
+_t=0
+while [ "$_t" -lt 20 ]; do
+    DK_LISTEN=$(dguest /opt/agent-box/guest/box-listeners.sh "$FORWARD_PORT" 2>/dev/null) || DK_LISTEN=""
+    case "$DK_LISTEN" in *" no "*) break ;; esac
+    sleep 1
+    _t=$((_t + 1))
+done
+unset _t
+printf 'box-listeners.sh %s -> %s\n' "$FORWARD_PORT" "${DK_LISTEN:-<no answer>}"
+if [ "$DK_LISTEN" = "${FORWARD_PORT} no -" ]; then
+    ok "the planted listener is gone, so step 12 can bind ${FORWARD_PORT} itself"
+else
+    bad "the planted guest listener is still holding ${FORWARD_PORT}"
+fi
+rm -f "$DK_PORTS_TXT" "$DK_PORTS_JSON" "$DK_PORTS_LIMA"
 # ---- end slot:11b ----
 
 # ===========================================================================
