@@ -128,7 +128,7 @@ MISE_FILES = (
 )
 
 # A row's state. `mismatch` is the only one that makes the caller exit 11.
-FINDING_STATES = ("mismatch", "unparseable", "refused")
+FINDING_STATES = ("mismatch", "unparseable", "refused", "unpinned")
 
 
 # ---------------------------------------------------------------------------
@@ -393,6 +393,7 @@ class Scan:
         self.scan_mise()
         self.scan_tool_versions()
         self.scan_single_version_files()
+        self.scan_dprint()
         self.scan_pyproject()
         self.scan_uv_lock()
         self.scan_package_json()
@@ -448,6 +449,40 @@ class Scan:
                     continue
                 self.add_pin(rel, number, tool, bare)
                 break
+
+    # dprint's formatter rules are WASM modules fetched at run time from
+    # plugins.dprint.dev, which guest/allowlist.base admits so that a project's
+    # own `dprint check` works in a box. A plugin URL may carry `@<sha256>`, and
+    # dprint verifies it when it does; without one, whatever that host serves is
+    # what runs. The host is on the allowlist for the formatter's sake, so this
+    # is the check that keeps the remaining exposure visible rather than silent.
+    def scan_dprint(self):
+        for rel in ("dprint.json", ".dprint.json", "dprint.jsonc", ".dprint.jsonc"):
+            text = self.read(rel)
+            if text is None:
+                continue
+            for number, line in enumerate(text.splitlines(), 1):
+                bare = line.strip()
+                if "plugins.dprint.dev" not in bare and "://" not in bare:
+                    continue
+                if ".wasm" not in bare and ".json" not in bare:
+                    continue
+                url = bare.strip(' \t",[]')
+                if not url.startswith("http"):
+                    continue
+                # `url@<64 hex>` is the pinned form. Anything else is unpinned,
+                # including a truncated or non-hex tail.
+                head, sep, tail = url.rpartition("@")
+                pinned = bool(sep) and len(tail) == 64 and all(
+                    c in "0123456789abcdefABCDEF" for c in tail
+                )
+                if pinned:
+                    continue
+                self.add(
+                    rel, number, "dprint-plugin", safe_version(url.rsplit("/", 1)[-1]),
+                    state="unpinned",
+                    note="no @<sha256> on the plugin URL: whatever that host serves is what runs",
+                )
 
     def scan_pyproject(self):
         rel = "pyproject.toml"
@@ -704,6 +739,7 @@ STATE_WORD = {
     "unknown": "(cannot be compared)",
     "no_opinion": "(box has no opinion)",
     "unparseable": "UNPARSEABLE",
+    "unpinned": "UNPINNED",
 }
 
 
