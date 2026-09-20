@@ -1527,7 +1527,17 @@ fi
 REL_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$REL_OUT" | head -1)
 if [ -n "$REL_RUNID" ]; then
     run_bounded 300 "${TMP_ROOT}/relative-follow.out" "$AGENTBOX" logs "$CLEAN_REPO" "$REL_RUNID" -f
+    rel_follow_rc=$BOUNDED_RC
     cat "${TMP_ROOT}/relative-follow.out"
+    # Asserted, not just attempted: a follow that the bound has to kill
+    # (BOUNDED_RC=124) or that fails at once leaves the run possibly still
+    # alive, and 8f's fixed-date "newest running run" checks below would then
+    # misattribute the failure to stop-run instead of to this silent miss.
+    if [ "$rel_follow_rc" -eq 0 ]; then
+        ok "the relative-brief run ${REL_RUNID} was followed to its end"
+    else
+        bad "the relative-brief run ${REL_RUNID} was not followed to its end (logs -f exited ${rel_follow_rc}); 8f's newest-running checks below are not trustworthy"
+    fi
 fi
 
 printf -- '\n--- and the hint when the brief is in the repo but the cwd is not ---\n'
@@ -1535,7 +1545,17 @@ printf 'Do nothing.\n' > "${CLEAN_REPO}/in-repo-brief.md"
 HINT_OUT="${TMP_ROOT}/brief-hint.out"
 (cd "$TMP_ROOT" && "$AGENTBOX" run "$CLEAN_REPO" in-repo-brief.md > "$HINT_OUT" 2>&1) || true
 cat "$HINT_OUT"
-if grep -qF "there is a in-repo-brief.md in ${CLEAN_REPO}" "$HINT_OUT"; then
+# agentbox resolves the repo with `pwd -P` before this message is ever built
+# (abs_repo, called before require_brief), so the hint always names the
+# PHYSICAL path. $CLEAN_REPO itself is the LOGICAL path `mktemp -d -t` gave
+# us, and on macOS that sits under /var/folders/..., a symlink to
+# /private/var/folders/... -- comparing the hint against $CLEAN_REPO directly
+# fails this check on a correct build, every time, on this OS. Resolve the
+# same way the CLI does and assert on that; the trailing `;` (immediately
+# after the path in the real message) keeps this from matching a refusal
+# that named some other, unrelated path.
+CLEAN_REPO_PHYS=$(cd "$CLEAN_REPO" && pwd -P)
+if grep -qF "there is a in-repo-brief.md in ${CLEAN_REPO_PHYS};" "$HINT_OUT"; then
     ok "the refusal names the brief that is sitting in the repository"
 else
     bad "the refusal does not say where the brief actually is"
