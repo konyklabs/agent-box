@@ -518,7 +518,7 @@ case run `agentbox token` on each.
 | 3 | `agentbox version` | a commit, a date, `(clean)` |
 | 4 | `ls ~/.config/agent-box` | `blocklist.txt` mode 600 in the parent, nothing named blocklist under `guest/` |
 | 5 | `agentbox preflight` | exit 0 |
-| 5 | `agentbox create` | exit 0; exit 10 with `NOT READY:` lines is a usable box that is not at baseline |
+| 5 | `agentbox create` | exit 0. `NOT READY:` lines name any tool the box came up without: the box is usable, and `agentbox toolcheck <repo>` is the check that fails (exit 10) until they are fixed |
 | 5 | `agentbox status` | `running`, `fw=deny`, `runs=0`, `tools=ok` |
 | 7 | `agentbox verify-auth` | `pass` and a reply |
 | 7 | `agentbox firewall-check` | all `PASS`; container lines `PASS` after `docker pull alpine:3` |
