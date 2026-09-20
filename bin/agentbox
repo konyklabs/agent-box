@@ -1929,11 +1929,33 @@ bench_dirty_count() {
 # never gets to remove a bench that is in fact perfectly disposable.
 # Unverifiable is not zero: every caller treats it as "this may be the only home
 # of a commit".
+#
+# The tip defaults to HEAD, which is the question for the branch the bench is
+# standing on. A caller asking about a branch it is NOT standing on passes
+# `refs/heads/<branch>`: the commits at risk there are that branch's own, and
+# against HEAD the count would be another branch's divergence.
 bench_ahead_count() {
-    local bench="${1:?}" branch="${2:?}" n
+    local bench="${1:?}" branch="${2:?}" tip="${3:-HEAD}" n
     git -C "$bench" rev-parse --verify --quiet "refs/remotes/origin/${branch}" >/dev/null 2>&1 \
         || return 1
-    n=$(git -C "$bench" rev-list --count "refs/remotes/origin/${branch}..HEAD" 2>/dev/null | tr -d ' ') \
+    n=$(git -C "$bench" rev-list --count "refs/remotes/origin/${branch}..${tip}" 2>/dev/null | tr -d ' ') \
+        || return 1
+    case "$n" in ''|*[!0-9]*) return 1 ;; esac
+    printf '%s' "$n"
+}
+
+# The same question asked about the whole directory instead of one branch:
+# commits on ANY local branch in the bench that no ref fetched from the
+# repository contains. `--remove` and destroy's hook delete every branch here at
+# once, so a guard that measures only the branch HEAD is on lets `rm -rf` take a
+# local branch that is the only home of a commit — measured on this host: a bench
+# standing on a clean branch, a committed fix on a second local branch, `--remove`
+# with no `--force` removed it and exited 0.
+# Prints the count, 0 when the bench is disposable, and returns 1 when git could
+# not answer at all — which every caller treats as "this may be the only home".
+bench_only_home_count() {
+    local bench="${1:?}" n
+    n=$(git -C "$bench" rev-list --count --branches --not --remotes=origin 2>/dev/null | tr -d ' ') \
         || return 1
     case "$n" in ''|*[!0-9]*) return 1 ;; esac
     printf '%s' "$n"
@@ -1990,10 +2012,14 @@ bench_path_for() {
 # pager named there runs when stdout is a terminal — which is exactly what it is
 # when somebody pastes this. The `rev-list` half runs in the bench, which this
 # host owns, so it needs none of them.
+#
+# The tip follows `bench_ahead_count`'s: HEAD by default, `refs/heads/<branch>`
+# when the commits are on a branch the bench is not standing on, so the command
+# printed picks up the same commits the refusal counted.
 bench_recovery_command() {
-    local repo="${1:?}" bench="${2:?}" branch="${3:?}"
-    printf "git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C '%s' cherry-pick \$(git -C '%s' rev-list --reverse 'origin/%s..HEAD')" \
-        "$repo" "$bench" "$branch"
+    local repo="${1:?}" bench="${2:?}" branch="${3:?}" tip="${4:-HEAD}"
+    printf "git --no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null -C '%s' cherry-pick \$(git -C '%s' rev-list --reverse 'origin/%s..%s')" \
+        "$repo" "$bench" "$branch" "$tip"
 }
 
 # The bench is on a branch with no `origin/<branch>` in it, so nothing can prove
@@ -2174,6 +2200,20 @@ bench_ensure() {
             || die "$(bench_gone_message "$inst" "$bench" "$on")"
         [ "$ahead" = "0" ] \
             || die "the bench for ${inst} has ${ahead} commits that are not in ${repo}. The bench is disposable by design — move them into the repository first: $(bench_recovery_command "$repo" "$bench" "$on")"
+        # And the branch being ASKED for, when the bench is not standing on it:
+        # `checkout -B` below resets refs/heads/<branch>, so the guard above — which
+        # measures the branch HEAD is on — lets a local branch made in the bench be
+        # reset with no check at all. Measured before this guard existed: exit 0,
+        # `Switched to and reset branch`, `already at` printed over it, and the
+        # commit in no other ref. Measured against that branch's own upstream, for
+        # the reason `bench_ahead_count`'s tip argument exists.
+        if [ "$branch" != "$on" ] \
+           && git -C "$bench" rev-parse --verify --quiet "refs/heads/${branch}" >/dev/null 2>&1; then
+            ahead=$(bench_ahead_count "$bench" "$branch" "refs/heads/${branch}") \
+                || die "the bench at ${bench} has its own '${branch}' and no origin/${branch}, so nothing here can tell whether a refresh would reset away the only copy of a commit. Look with 'git -C ${bench} log --oneline -20 ${branch}', then remove the bench with '${PROG} bench ${inst#agent-box-} --remove --force'."
+            [ "$ahead" = "0" ] \
+                || die "the bench for ${inst} has ${ahead} commits on '${branch}' that are not in ${repo}, and a refresh resets that branch to origin/${branch}. The bench is disposable by design — move them into the repository first: $(bench_recovery_command "$repo" "$bench" "$branch" "refs/heads/${branch}")"
+        fi
         git -C "$bench" checkout -B "$branch" "refs/remotes/origin/${branch}" >&2 \
             || die "the bench at ${bench} could not be moved to ${branch}; look at it before running bench again"
         head=$(bench_head_of "$bench") \
@@ -2236,6 +2276,14 @@ bench_remove() {
                 || tail="move them into the repository first: $(bench_recovery_command "$repo" "$bench" "$branch")"
             die "the bench for ${inst} has ${ahead} commits that are not in the repository. The bench is disposable by design — ${tail}"
         fi
+        # `rm -rf` takes every branch in the directory, not only the one HEAD is
+        # on, so the last question is asked about all of them. Measured before this
+        # guard existed: a bench standing on a clean branch with a committed fix on
+        # a second local branch was removed, exit 0.
+        ahead=$(bench_only_home_count "$bench") \
+            || die "git could not tell whether the bench at ${bench} holds the only copy of a commit; look at it, then remove it with --force"
+        [ "$ahead" = "0" ] \
+            || die "the bench for ${inst} has ${ahead} commits on its own branches that are not in the repository; --remove would discard them. Look with 'git -C ${bench} log --oneline --branches --not --remotes=origin', move them into the repository, or '${PROG} bench ${inst#agent-box-} --remove --force'."
     fi
     rm -rf "$bench" || die "could not remove ${bench}"
     info "removed the bench at ${bench}"
@@ -2253,7 +2301,7 @@ bench_remove() {
 # a reason for destroy to stop half way — and it keeps anything it cannot prove
 # disposable, which after the box is gone is the last chance anybody gets.
 destroy_bench_hook() {
-    local inst="${1:?}" bench dirty ahead branch why=""
+    local inst="${1:?}" bench dirty ahead only branch why=""
     bench=$(bench_path_for "$inst")
     [ -n "$bench" ] && [ -d "$bench" ] || return 0
     if ! bench_path_is_ours "$inst" "$bench"; then
@@ -2267,6 +2315,9 @@ destroy_bench_hook() {
         branch=$(bench_branch_of "$bench") || branch=""
         ahead=""
         [ -z "$branch" ] || ahead=$(bench_ahead_count "$bench" "$branch") || ahead=""
+        # Every local branch, not only the one HEAD is on: `rm -rf` below takes
+        # all of them (the same gap `bench_remove` closes).
+        only=$(bench_only_home_count "$bench") || only=""
         if [ -z "$dirty" ]; then
             why="git could not read it"
         elif [ "$dirty" != "0" ]; then
@@ -2277,6 +2328,10 @@ destroy_bench_hook() {
             why="it is on '${branch}' and has no origin/${branch}, so nothing here can tell what it holds"
         elif [ "$ahead" != "0" ]; then
             why="${ahead} commits that are not in the repository"
+        elif [ -z "$only" ]; then
+            why="git could not tell whether it holds the only copy of a commit"
+        elif [ "$only" != "0" ]; then
+            why="${only} commits on its own branches that are not in the repository"
         fi
     fi
     if [ -n "$why" ]; then

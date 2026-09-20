@@ -806,6 +806,68 @@ else
 fi
 git -C "$BENCH_PATH" reset -q --hard "refs/remotes/origin/${BENCH_BRANCH}"
 
+# The same guard, for a branch the bench is NOT standing on. `checkout -B` resets
+# the REQUESTED branch, so a guard that measures only the branch HEAD is on lets a
+# local branch made in the bench be reset with no check: silently, exit 0, with
+# "already at" printed over it. `rm -rf` is the same gap — it takes every branch in
+# the directory at once. Both were measured that way before the guards existed.
+BENCH_OTHER="agent/other-${SMOKE_ID}"
+git -C "$BENCH_REPO" branch "$BENCH_OTHER"
+git -C "$BENCH_PATH" fetch -q --prune -- origin
+git -C "$BENCH_PATH" checkout -q -b "$BENCH_OTHER" "refs/remotes/origin/${BENCH_OTHER}"
+printf 'fixed on the host, on another branch\n' > "${BENCH_PATH}/fix-other.txt"
+git -C "$BENCH_PATH" add fix-other.txt
+git -C "$BENCH_PATH" -c user.name='smoke test' -c user.email='smoke@localhost' \
+    commit -q -m 'a fix made in the bench on a branch it is not standing on'
+BENCH_ONLY=$(git -C "$BENCH_PATH" rev-parse HEAD)
+git -C "$BENCH_PATH" checkout -q "$BENCH_BRANCH"
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_OTHER" > "${BENCH_OUT}.other" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.other"
+BENCH_OTHER_NOW=$(git -C "$BENCH_PATH" rev-parse "refs/heads/${BENCH_OTHER}" 2>/dev/null)
+printf -- '--- %s is at %s; the bench-only commit was %s ---\n' \
+    "$BENCH_OTHER" "${BENCH_OTHER_NOW:-gone}" "$BENCH_ONLY"
+if [ "$bench_rc" -ne 0 ] && [ "$BENCH_OTHER_NOW" = "$BENCH_ONLY" ] \
+   && grep -qF "commits on '${BENCH_OTHER}'" "${BENCH_OUT}.other" \
+   && grep -q -- '--no-pager -c core.fsmonitor=false -c core.hooksPath=/dev/null' "${BENCH_OUT}.other"; then
+    ok "a refresh to another branch refuses instead of resetting a commit only the bench has"
+else
+    bad "a refresh to ${BENCH_OTHER} did not protect ${BENCH_ONLY} (exit ${bench_rc})"
+fi
+# And --remove, from a bench whose own HEAD is on a clean branch: the guards are
+# about the directory `rm -rf` deletes, not about HEAD.
+"$AGENTBOX" bench "$BENCH_REPO" --remove > "${BENCH_OUT}.otherrm" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.otherrm"
+if [ "$rm_rc" -ne 0 ] && [ -d "$BENCH_PATH" ] \
+   && [ "$(git -C "$BENCH_PATH" rev-parse "refs/heads/${BENCH_OTHER}" 2>/dev/null)" = "$BENCH_ONLY" ]; then
+    ok "--remove refuses a bench whose only copy of a commit is on another branch"
+else
+    bad "--remove discarded ${BENCH_ONLY}, which nothing else had (exit ${rm_rc})"
+fi
+# The other half of that guard, or it would be a guard against the command: a
+# branch the bench is not standing on and holds nothing of its own on is still
+# switched to, and switched back from. Both directions, because a refusal of every
+# `--branch` that differs from HEAD's would pass the two checks above.
+git -C "$BENCH_PATH" branch -f "$BENCH_OTHER" "refs/remotes/origin/${BENCH_OTHER}"
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_OTHER" > "${BENCH_OUT}.switch" 2>&1
+bench_rc=$?
+cat "${BENCH_OUT}.switch"
+BENCH_ON=$(git -C "$BENCH_PATH" symbolic-ref --quiet --short HEAD 2>/dev/null)
+"$AGENTBOX" bench "$BENCH_REPO" --branch "$BENCH_BRANCH" > "${BENCH_OUT}.switchback" 2>&1
+rm_rc=$?
+cat "${BENCH_OUT}.switchback"
+BENCH_BACK=$(git -C "$BENCH_PATH" symbolic-ref --quiet --short HEAD 2>/dev/null)
+if [ "$bench_rc" -eq 0 ] && [ "$BENCH_ON" = "$BENCH_OTHER" ] \
+   && [ "$rm_rc" -eq 0 ] && [ "$BENCH_BACK" = "$BENCH_BRANCH" ]; then
+    ok "a branch the bench holds nothing of its own on is still switched to, and back"
+else
+    bad "a legitimate switch was blocked (to ${BENCH_OTHER}: ${bench_rc} on '${BENCH_ON}'; back: ${rm_rc} on '${BENCH_BACK}')"
+fi
+git -C "$BENCH_PATH" branch -D "$BENCH_OTHER" > /dev/null 2>&1
+git -C "$BENCH_REPO" branch -D "$BENCH_OTHER" > /dev/null 2>&1
+git -C "$BENCH_PATH" fetch -q --prune -- origin
+
 # The branch the bench is on, deleted in the repository. A refresh's fetch --prune
 # then takes origin/<branch> with it, and the bare `rev-list origin/<branch>..HEAD`
 # both guards are built on exits 128 — under `set -e` that is the whole command
