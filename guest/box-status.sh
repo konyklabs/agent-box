@@ -88,7 +88,12 @@ fi
 # A run whose process died without its EXIT trap says `running` for ever. This
 # is one of the three places that reconciles it, and the cheapest: `status` is
 # the command someone runs to find out what is going on.
-"${ABX_LIB_DIR}/run-ctl.sh" reconcile 2>/dev/null || true
+#
+# STDOUT is redirected, not only stderr: this script's stdout IS the JSON object
+# the host splices into `status --json`, so one stray line from anything called
+# here corrupts the document. `reconcile` prints nothing today; the redirect is
+# what makes that a property of this file rather than a fact about that one.
+"${ABX_LIB_DIR}/run-ctl.sh" reconcile >/dev/null 2>&1 || true
 
 # --- tmux sessions ---------------------------------------------------------
 #
@@ -97,9 +102,46 @@ fi
 # passed straight through rather than being turned into `[]`: run-format.py
 # reports an unreadable list as null, which a consumer can tell apart from a
 # box that genuinely has no sessions.
-SESSIONS='[]'
+#
+# Which is why the no-tmux arm is the empty string as well. `[]` there would
+# claim this box has no sessions where the truth is that nobody could look — the
+# same lie the host's not-running literal used to tell about a box it never
+# reached, and the distinction the null/`[]` rule exists to keep usable.
+SESSIONS=''
 if command -v tmux >/dev/null 2>&1; then
     SESSIONS=$("${ABX_LIB_DIR}/run-ctl.sh" sessions --json 2>/dev/null) || SESSIONS=''
+fi
+
+# --- what earlier runs left running ----------------------------------------
+#
+# The resource ledger's own reader, in the guest, as JSON rows; run-format.py
+# folds them into the `leftovers` object and `agentbox leftovers` prints the same
+# rows, so the two can never disagree about what is still up.
+#
+# The empty string is deliberate in both arms, for the reason above: a box whose
+# ledger reader is missing (a box provisioned by an older checkout) or failed
+# reports `leftovers: null`, and a box that really has nothing left running
+# reports zeros.
+LEFTOVERS=''
+if [ -x "${ABX_LIB_DIR}/run-ledger.sh" ]; then
+    LEFTOVERS=$("${ABX_LIB_DIR}/run-ledger.sh" survivors --json 2>/dev/null) || LEFTOVERS=''
+fi
+
+# --- the toolchain snapshot ------------------------------------------------
+#
+# Root writes it at the end of provisioning, and provisioning re-runs at every
+# start, so on a box started since this checkout landed it is current. Read from
+# the file rather than swept live for the same reason the CLI version is cached
+# above: `status --watch` ticks every few seconds, and a dozen `--version` calls
+# per tick would compete with the agent this is supposed to be observing.
+#
+# The read is CAPPED at 4096 bytes. The four fields the status object takes from
+# it are the first of the document (the snapshot's own `tools` array follows
+# them), and a document too long for the cap is cut, fails to parse, and reports
+# `toolchain: null` — unanswered, never half-read.
+TOOLCHAIN=''
+if [ -r /var/lib/agent-box/toolcheck.json ]; then
+    TOOLCHAIN=$(head -c 4096 /var/lib/agent-box/toolcheck.json 2>/dev/null) || TOOLCHAIN=''
 fi
 
 # --- the run, the totals, and the scrub ------------------------------------
@@ -107,4 +149,6 @@ exec python3 "${ABX_LIB_DIR}/run-format.py" "$MODE" \
     --claude-version "$CLAUDE_VERSION" \
     --firewall "$FIREWALL" \
     --firewall-detail "$FIREWALL_DETAIL" \
-    --sessions "$SESSIONS"
+    --sessions "$SESSIONS" \
+    --leftovers "$LEFTOVERS" \
+    --toolchain "$TOOLCHAIN"

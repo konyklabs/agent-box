@@ -4122,10 +4122,77 @@ if jq -e '.boxes[0] | has("firewall_detail") | not' "$STATUSJ" >/dev/null 2>&1; 
 else
     bad "firewall_detail is present on a healthy box: $(jq -c '.boxes[0].firewall_detail' "$STATUSJ" 2>/dev/null)"
 fi
-if jq -e '.boxes[0] | has("name") and has("instance") and has("repo") and has("state") and has("claude_version") and has("run") and has("runs_total") and has("sessions")' "$STATUSJ" >/dev/null 2>&1; then
+# Every key of the contract, the four sensors merged into it included. A
+# consumer branches on VALUES, never on a key being there, so a missing key is a
+# broken contract even when the thing it describes does not exist on this box.
+if jq -e '.boxes[0] | has("name") and has("instance") and has("repo") and has("state") and has("claude_version") and has("run") and has("runs_total") and has("sessions") and has("standing") and has("toolchain") and has("leftovers") and has("channel")' "$STATUSJ" >/dev/null 2>&1; then
     ok "status --json carries every documented key"
 else
-    bad "status --json is missing documented keys"
+    bad "status --json is missing documented keys: $(jq -c '.boxes[0] | keys_unsorted' "$STATUSJ" 2>/dev/null)"
+fi
+# The host's own keys come LAST, after the guest object, because both jq and
+# Python take the last of a duplicated key: printed first, a renderer that
+# emitted `"state":"pwned"` a second time would win, and `name`/`instance`/
+# `repo`/`state` are exactly the four worth forging. The order is asserted, not
+# assumed, because nothing else in this document would notice it changing.
+jq -c '.boxes[0] | keys_unsorted' "$STATUSJ" 2>/dev/null || true
+if jq -e '.boxes[0] | keys_unsorted | .[-5:] == ["name","instance","repo","state","channel"]' "$STATUSJ" >/dev/null 2>&1; then
+    ok "the host-computed keys are printed after the guest object"
+else
+    bad "the host keys are not last: $(jq -c '.boxes[0] | keys_unsorted' "$STATUSJ" 2>/dev/null)"
+fi
+# The channel counts are the host's, read from file names on the mount and from
+# its own private record, so they are an object even on a box with no mailbox.
+if jq -e '.boxes[0].channel | type == "object" and has("to_host_unread") and has("to_host_open") and has("to_host_newest") and has("to_box_queued") and has("to_box_open") and has("to_box_lost")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the six channel counts"
+else
+    bad "the channel object is not shaped as documented: $(jq -c '.boxes[0].channel' "$STATUSJ" 2>/dev/null)"
+fi
+# The toolchain snapshot this box's own provisioning wrote. `null` is a legal
+# answer (a box provisioned by an older checkout has no snapshot), so what is
+# asserted is the DOMAIN: when it is there, the state word is one of three and
+# the counts are counts.
+if jq -e '.boxes[0].toolchain as $t | $t == null or (($t.state | IN("ok","findings","unknown")) and ($t.missing | type) == "number" and ($t.off_pin | type) == "number")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the toolchain snapshot in the documented shape"
+else
+    bad "the toolchain object is not shaped as documented: $(jq -c '.boxes[0].toolchain' "$STATUSJ" 2>/dev/null)"
+fi
+# The same rule for the two objects the hygiene and channel slices feed: a
+# reading or `null`, never a guess. `leftovers` is zeros on a box with nothing
+# left running; `standing` is null until a session has existed in this box.
+if jq -e '.boxes[0].leftovers as $l | $l == null or (($l.procs | type) == "number" and ($l.ports | type) == "array" and ($l.truncated | type) == "boolean")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the leftovers object in the documented shape"
+else
+    bad "the leftovers object is not shaped as documented: $(jq -c '.boxes[0].leftovers' "$STATUSJ" 2>/dev/null)"
+fi
+if jq -e '.boxes[0].standing as $s | $s == null or (($s.state | IN("working","idle","waiting","gone")) and ($s.runs_unseen | type) == "number")' "$STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the standing session in the documented shape"
+else
+    bad "the standing object is not shaped as documented: $(jq -c '.boxes[0].standing' "$STATUSJ" 2>/dev/null)"
+fi
+# The text line carries the same sensors as short fields. The two that are
+# omitted when there is nothing to say are checked AGAINST the JSON rather than
+# against an expectation about this box: `session=` exactly when `standing` is an
+# object, and the state word must be the same one.
+if grep -qE 'tools=(ok|[0-9]+missing|[0-9]+off-pin|\?)' "$STATUS_OUT"; then
+    ok "the text line reports the toolchain as one of the documented words"
+else
+    bad "the text line has no tools= field"
+fi
+ST_STANDING=$(jq -r '.boxes[0].standing | if . == null then "none" else .state end' "$STATUSJ" 2>/dev/null)
+printf 'standing=%s\n' "$ST_STANDING"
+if [ "$ST_STANDING" = "none" ]; then
+    if grep -q 'session=' "$STATUS_OUT"; then
+        bad "the text line claims a standing session where status --json says there is none"
+    else
+        ok "and no session= field, because this box has had no standing session"
+    fi
+else
+    if grep -q "session=claude:${ST_STANDING}" "$STATUS_OUT"; then
+        ok "and session=claude:${ST_STANDING}, the same state the JSON reports"
+    else
+        bad "the text line does not carry session=claude:${ST_STANDING}"
+    fi
 fi
 if jq -e '.boxes[0].run | has("id") and has("state") and has("elapsed_s") and has("turns") and has("cost_usd") and has("last_tool")' "$STATUSJ" >/dev/null 2>&1; then
     ok "status --json includes the current run object"
@@ -4193,6 +4260,23 @@ if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | (.firewall_de
     ok "and firewall_detail says why it is unknown"
 else
     bad "firewall is unknown with no firewall_detail to explain it"
+fi
+# Every guest key of the fallback is NULL, and that is the whole point of it: the
+# box did not answer, so `sessions: []` and `runs_total: 0` would each be a
+# reading nobody took — "this box has no sessions and has never run anything" —
+# about a box that has both.
+if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | .run == null and .runs_total == null and .sessions == null and .standing == null and .toolchain == null and .leftovers == null and .claude_version == null' "$BROKENJ" >/dev/null 2>&1; then
+    ok "and every guest key it could not read is null, not zero and not empty"
+else
+    bad "the fallback claims a reading it does not have: $(jq -c --arg n "$INSTANCE" '.boxes[] | select(.instance == $n)' "$BROKENJ" 2>/dev/null)"
+fi
+# The host's own keys survive the guest failing, in their documented places: the
+# fallback replaces the guest half only, so `channel` is still computed and the
+# four host keys are still last.
+if jq -e --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | (.channel | type) == "object" and (keys_unsorted | .[-5:] == ["name","instance","repo","state","channel"])' "$BROKENJ" >/dev/null 2>&1; then
+    ok "and the host keys are still last, with the channel counts still read"
+else
+    bad "the fallback lost the host keys or their order: $(jq -c --arg n "$INSTANCE" '.boxes[] | select(.instance == $n) | keys_unsorted' "$BROKENJ" 2>/dev/null)"
 fi
 
 BROKENT="${TMP_ROOT}/status-broken.txt"

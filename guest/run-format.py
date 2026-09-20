@@ -1836,6 +1836,312 @@ def cmd_channel_read(args):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# The box's own status object
+# ---------------------------------------------------------------------------
+#
+# `--box-json` is the one document four separate sensors meet in, and it is the
+# only one a host consumer (`agentbox status --json`, porthole) is allowed to
+# read: the standing session's private state, the toolchain snapshot root wrote
+# at boot, the resource ledger a finished run left, and the tmux session list.
+# Every one of them is a file in the guest, which means every one of them is
+# either a file the agent can write or a file that may simply be absent — so the
+# rule for all four is the one `_sessions_or_none` already states: a shape that
+# does not validate is `null`, which means "nobody could answer", and is never
+# the same answer as zero.
+#
+# The keys and their domains are the contract; a consumer branches on values,
+# never on a key being there. That is why nothing below is omitted on a box
+# where the thing it describes does not exist.
+
+# The standing interactive session: one per box, named once here.
+STANDING_SESSION = "claude"
+SESSIONS_DIR = os.environ.get("ABX_SESSIONS_DIR", os.path.join(STATE_DIR, "sessions"))
+
+# Where liveness is read from. A path rather than a literal for the reason
+# run-ledger.sh gives for its own (`run-ledger.sh:267`): the same code is then
+# exercisable on a machine that has no /proc at all, which is where the host-side
+# checks for this file run. Nothing an agent can reach decides this — the host
+# invokes box-status.sh through `limactl shell` with an environment of its own.
+PROC_DIR = os.environ.get("ABX_PROC_DIR", "/proc")
+
+# A hook event name, as guest/channel.sh's sed accepts one. The last event is
+# what the state word is derived from, so a name that is not a name is no name.
+HOOK_EVENT_RE = re.compile(r"^[A-Za-z]{1,40}$")
+
+# How much of the session's sensor log the state word costs: the last lines of
+# one bounded read (`tail_lines` reads at most 512 KiB from the end). `status
+# --watch` asks for this every few seconds while the session is working, and the
+# log grows for as long as the session lives.
+STANDING_TAIL_LINES = 40
+# The task line, the same cap channel.sh writes it with (CH_TASK_LIMIT).
+STANDING_TASK_LIMIT = 200
+# A tool name, before its input head is appended.
+STANDING_TOOL_LIMIT = 40
+
+# The `runs-seen` set: one run id per line, written by the delivery hook. Read
+# bounded, because it is a file in the agent's own home; 2000 ids is more runs
+# than a box will ever hold and 16 bytes is one id and its newline.
+RUNS_SEEN_LIMIT = 2000
+# How many run directories the unseen count looks at, newest first. The notice
+# the count exists for announces at most five runs, and `status --watch` pays
+# for this on every tick.
+RUNS_UNSEEN_SCAN_LIMIT = 200
+
+# The snapshot's state word, as `status --json` may carry it: spec 2.1 and
+# amendment A10, which porthole matches exactly. guest/toolcheck.sh's own
+# `--box-only` snapshot writes one of these three and nothing else
+# (`toolcheck.sh:snapshot_box` validates the same set on the way back in);
+# `project_mismatch`, the fourth word of toolchain.md 1.1, belongs to a scan
+# that reads the repository and is never in a box-only snapshot. A snapshot
+# carrying anything else failed its shape, and a failed shape is `null`.
+TOOLCHAIN_STATES = frozenset({"ok", "findings", "unknown"})
+
+
+def _read_head(path, limit):
+    """The first `limit` bytes of a file the standing session writes, or "".
+
+    Bounded, unlike `read_text`, because these are read on every `status --watch`
+    tick and they are the agent's own files: a task line it decided to make a
+    megabyte long would otherwise be read in full, in the guest, several times a
+    minute. Nothing longer than one short line survives the caps below anyway.
+    """
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(limit).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _mtime_iso(path):
+    """A file's mtime as an ISO timestamp, or None."""
+    try:
+        return iso(datetime.fromtimestamp(os.path.getmtime(path), timezone.utc))
+    except OSError:
+        return None
+
+
+def _standing_pid(session_dir):
+    """The pid the session recorded, digits only, or None."""
+    line = _read_head(os.path.join(session_dir, "pid"), 64).split("\n", 1)[0].strip()
+    return line if line.isdigit() else None
+
+
+def _standing_alive(pid):
+    """Is that pid this box's standing session?
+
+    Both halves are needed, and this is `abx_session_alive` (guest/lib.sh) in
+    Python: the pid file survives a hard VM stop, and after the reboot that
+    number belongs to somebody else. A pid that is alive but is not a
+    claude-session.sh reads as dead, which is the truth about the session.
+    """
+    if not pid:
+        return False
+    raw = _read_head(os.path.join(PROC_DIR, pid, "cmdline"), 4096)
+    return "claude-session.sh" in raw.replace("\x00", " ")
+
+
+def _standing_tail(session_dir):
+    """(last event name, its timestamp, last tool line) from the session's log.
+
+    guest/hook-event.sh writes one object per line: `ts`, `event`, `tool`,
+    `input_head`. The event name decides the state word, so it is matched
+    against a name's shape before it is believed; the tool line is display text
+    and is scrubbed and capped like a run's.
+
+    All three come from the log's TAIL, which is what bounds the cost of a
+    display a watch loop redraws: a session whose last tool call is further back
+    than that reports no last tool rather than paying for the whole log.
+    """
+    event = None
+    when = None
+    tool = None
+    for line in tail_lines(os.path.join(session_dir, "hooks.jsonl"), STANDING_TAIL_LINES):
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        stamp = parse_ts(obj.get("ts"))
+        if stamp:
+            when = stamp
+        name = obj.get("event")
+        if isinstance(name, str) and HOOK_EVENT_RE.match(name):
+            event = name
+        called = obj.get("tool")
+        if isinstance(called, str) and called.strip():
+            text = first_line(scrub(called), STANDING_TOOL_LIMIT)
+            head = obj.get("input_head")
+            if text and isinstance(head, str) and head.strip():
+                text = "%s  %s" % (text, first_line(scrub(head), DETAIL_LIMIT))
+            tool = first_line(text, DETAIL_LIMIT)
+    return event, when, tool
+
+
+def _standing_state(alive, event):
+    """`working`, `idle`, `waiting` or `gone`.
+
+    The same four words `guest/channel.sh:standing_state` prints for the host's
+    `request`, derived the same way from the same two facts, because a box that
+    told `request` one thing and `status` another about the same session would
+    make both unusable. Its known limit is this one's: the sensor logs `Stop`
+    when a turn ends even if a hook then keeps the session going, so this can
+    read `idle` for a moment while the session is in fact working. It corrects
+    itself at the next event and nothing irreversible is decided on the word.
+    """
+    if not alive:
+        return "gone"
+    if event == "Notification":
+        return "waiting"
+    if event in ("Stop", None):
+        return "idle"
+    return "working"
+
+
+def _runs_unseen(session_dir):
+    """Ended runs this session has not been told about yet.
+
+    A SET, not a watermark: `runs-seen` holds every id already announced, so a
+    long run that ends after a newer short one is still counted. `running` and
+    `unknown` are not ended and are not counted -- the second one especially,
+    since it is what a run with a status file nobody can parse reads as.
+    """
+    seen = set()
+    raw = _read_head(os.path.join(session_dir, "runs-seen"), RUNS_SEEN_LIMIT * 16)
+    for line in raw.split("\n")[:RUNS_SEEN_LIMIT]:
+        line = line.strip()
+        if RUNID_RE.match(line):
+            seen.add(line)
+    unseen = 0
+    for runid in all_runids()[:RUNS_UNSEEN_SCAN_LIMIT]:
+        if runid in seen:
+            continue
+        if Run(runid).status in ("running", "unknown"):
+            continue
+        unseen += 1
+    return unseen
+
+
+def standing_object():
+    """The standing in-box session, or None when this box has never had one.
+
+    None means exactly that: `sessions/claude/` does not exist, which is the
+    contract's "nobody could answer" for a box where no session was ever
+    started. A session that has ended leaves its directory behind and is
+    reported as `gone` -- a fact, and a different one.
+
+    This is also the function `_standing_or_none` calls for `--channel-list`, so
+    the channel listing and `status --json` describe the session with one
+    object built in one place.
+    """
+    session_dir = os.path.join(SESSIONS_DIR, STANDING_SESSION)
+    if not os.path.isdir(session_dir):
+        return None
+    alive = _standing_alive(_standing_pid(session_dir))
+    event, when, tool = _standing_tail(session_dir)
+    return {
+        "name": STANDING_SESSION,
+        "state": _standing_state(alive, event),
+        # When the state last changed as far as this box can tell: the newest
+        # event in the session's own log, or -- before it has logged one -- when
+        # the session recorded its pid.
+        "since": iso(when) or _mtime_iso(os.path.join(session_dir, "pid")),
+        "task": first_line(
+            scrub(_read_head(os.path.join(session_dir, "task"), 4096)),
+            STANDING_TASK_LIMIT,
+        ),
+        "last_tool": tool,
+        "last_text": first_line(
+            scrub(_read_head(os.path.join(session_dir, "last-text"), 4096)),
+            TEXT_LIMIT,
+        ),
+        "runs_unseen": _runs_unseen(session_dir),
+    }
+
+
+def _toolchain_or_none(raw):
+    """The `toolchain` object of spec 2.1, or None when the snapshot is no good.
+
+    The input is `/var/lib/agent-box/toolcheck.json` as box-status.sh read it:
+    root-owned, written by `toolcheck.sh --json --box-only` at the end of
+    provisioning, and absent on a box provisioned by an older checkout. Four
+    keys come out of it -- the state word, the two counts a header line is
+    rendered from, and when it was taken -- and the rest of the snapshot (every
+    tool's pin, version and path) is `agentbox toolcheck`'s to print, not a
+    status document's.
+
+    Shape, never bytes: the state word must be one of three, the counts must be
+    counts, and the timestamp is re-rendered from a parsed one rather than
+    passed through. Anything else is None, including a truncated document -- the
+    read is capped, so a snapshot too large to be one reads as unanswered rather
+    than as half a reading.
+    """
+    if not raw or not raw.strip():
+        return None
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    state = _word(parsed.get("state"), TOOLCHAIN_STATES)
+    if state is None:
+        return None
+    counts = parsed.get("counts")
+    if not isinstance(counts, dict):
+        return None
+    missing = _count(counts.get("missing"))
+    off_pin = _count(counts.get("off_pin"))
+    if missing is None or off_pin is None:
+        return None
+    return {
+        "state": state,
+        "missing": missing,
+        "off_pin": off_pin,
+        "checked_at": iso(parse_ts(parsed.get("generated_at"))),
+    }
+
+
+def _toolchain_text(toolchain):
+    """The `tools=` field of the text line: `ok`, `<N>missing`, `<N>off-pin`, `?`.
+
+    `?` is the word for "nobody could answer", so it covers both an unreadable
+    snapshot and one that answered `unknown`. A snapshot with findings that are
+    neither missing nor off-pin -- a tool whose version could not be read at all
+    -- has no count to name and is the third `?`: the JSON carries
+    `state:"findings"` for it, which is what a monitor renders its notice from.
+    Missing before off-pin when there are both: a tool that is not there is the
+    one to act on first, and `agentbox toolcheck` prints the rest by name.
+    """
+    if not isinstance(toolchain, dict) or toolchain.get("state") not in ("ok", "findings"):
+        return "?"
+    if toolchain.get("missing"):
+        return "%dmissing" % toolchain["missing"]
+    if toolchain.get("off_pin"):
+        return "%doff-pin" % toolchain["off_pin"]
+    return "ok" if toolchain.get("state") == "ok" else "?"
+
+
+def _leftovers_text(leftovers):
+    """The `left=` field: the four counts, `?` when nobody could answer, or "".
+
+    Omitted entirely on an all-zero reading, because a clean box is the ordinary
+    case and a line that says so about four things at once is a line nobody
+    reads. The counts are the folded object's own, caps included, so this field
+    and `status --json` can never disagree.
+    """
+    if leftovers is None:
+        return "?"
+    procs = leftovers.get("procs") or 0
+    ports = len(leftovers.get("ports") or ())
+    worktrees = len(leftovers.get("worktrees") or ())
+    tmux = len(leftovers.get("tmux") or ())
+    if not (procs or ports or worktrees or tmux):
+        return ""
+    return "%dproc,%dport,%dwt,%dtmux" % (procs, ports, worktrees, tmux)
+
+
 def cmd_box_json(args):
     sessions = _sessions_or_none(args.sessions, "the session list")
     if sessions is not None:
@@ -1848,6 +2154,14 @@ def cmd_box_json(args):
         "runs_total": len(all_runids()),
         # null, not [], when it could not be read: see _sessions_or_none.
         "sessions": sessions,
+        # null when this box has never had a standing session; `gone` when it
+        # had one and the process is not there any more.
+        "standing": standing_object(),
+        "toolchain": _toolchain_or_none(args.toolchain),
+        # Both halves are null-safe, so there is nothing to branch on here:
+        # _fold_leftovers(None) is None, which is the scan's "nobody could
+        # answer" carried through to the key.
+        "leftovers": _fold_leftovers(_leftovers_or_none(args.leftovers, "the leftovers scan")),
     }
     # PRESENT ONLY when there is something to say: the mode is unknown, or the
     # mode file and the live ruleset disagree. Not `null` on a healthy box.
@@ -1863,7 +2177,15 @@ def cmd_box_json(args):
 
 
 def cmd_box_text(args):
-    """The same facts as --box-json, as one line for a terminal."""
+    """The same facts as --box-json, as one line for a terminal.
+
+    The same four sensors, in the order spec 2.1 fixes for them: the standing
+    session, the toolchain, what earlier runs left running, then the run. Each
+    one is a short field rather than a sentence, and two of them are omitted
+    when there is nothing to say -- a box with no session and nothing left
+    behind is the ordinary case, and a line that reports four absences is a line
+    an operator stops reading.
+    """
     sessions = _sessions_or_none(args.sessions, "the session list")
     if sessions is not None:
         sessions = _clean_sessions(sessions)
@@ -1875,6 +2197,15 @@ def cmd_box_text(args):
         parts.append("claude=%s" % scrub(args.claude_version.split()[0]))
     parts.append("runs=%d" % len(all_runids()))
     parts.append("tmux=%s" % ("?" if sessions is None else len(sessions)))
+    standing = standing_object()
+    if standing is not None:
+        parts.append("session=%s:%s" % (standing["name"], standing["state"]))
+    parts.append("tools=%s" % _toolchain_text(_toolchain_or_none(args.toolchain)))
+    left = _leftovers_text(
+        _fold_leftovers(_leftovers_or_none(args.leftovers, "the leftovers scan"))
+    )
+    if left:
+        parts.append("left=%s" % left)
     if runid:
         run = Run(runid).status_object()
         parts.append(
