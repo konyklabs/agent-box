@@ -23,7 +23,16 @@ agentbox channel <repo> --wait 3600
 ```
 
 It polls the host's own disk, never `limactl`, and exits as soon as something
-is unread, printing the notice below. Re-run it after it returns.
+is unread. Exit 0 means something landed; **exit 75 means the timeout passed
+with nothing**, which is not an error; 130 means it was interrupted. Start it as
+a background command — in the foreground it blocks your whole turn — and re-run
+it after it returns.
+
+Nothing wakes an idle box. A request you send reaches a standing in-box session
+at its **next turn**, not when you send it: late, never lost. `request` says
+which case applies in its own closing line — repeat that line to the operator
+verbatim rather than paraphrasing it, because "queued" and "delivered" mean
+different things to them.
 
 ## Reading what a box sent
 
@@ -58,8 +67,15 @@ Rebuild and run the project's own CI command in the bench, never in the
 repository you are also mounting into the box:
 
 ```
-agentbox bench <repo> [--branch B]
+agentbox bench <repo> --branch <the branch the host check named>
 ```
+
+Pass `--branch` with exactly the branch from the handoff's header — the one the
+host check just confirmed. Do not use the bare form: with no `--branch` the bench
+follows whatever branch the **mounted repository** currently has checked out,
+which is not necessarily the branch the handoff describes. The box may have moved
+on, or the checkout may sit on `main`. Verifying the wrong commit and reporting it
+green is the one failure this whole step exists to prevent.
 
 The bench is a plain clone the host owns; it removes only one hazard —
 the shared checkout's `.git/config` is writable by the box, so even a
