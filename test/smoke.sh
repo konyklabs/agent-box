@@ -3124,6 +3124,133 @@ fi
 guest tmux kill-session -t '=shell' 2>/dev/null || true
 
 # ---- slot:8g-kind (owner W) ----
+printf -- '\n--- 8g-kind: a session row says which session did the work ---\n'
+#
+# Three sessions, one of each kind: the tmux session of a run, a session with a
+# session directory of its own, and one that is neither. The run and the tracked
+# session are given the SAME status bytes, `exit:0`, so the two vocabularies are
+# genuinely being told apart and not merely echoed: the run reads `done` from the
+# run vocabulary, the session reads `ended` from its own.
+KIND_RUNID=20260102-030405
+KIND_BRANCH=agent/example-kinds-20260102-030405
+# And a fourth: a run directory an AGENT could make, with a FIFO where each of
+# the two files this row reads goes, and a tmux session named after it. Nothing
+# filtered that directory -- a `run-` tmux name is all it takes to be read -- so
+# a reader without a regular-file guard blocks forever on the open, and every
+# `agentbox sessions` and fleet-wide `status` stalls at this box. Hence
+# run_bounded on every call below: a regression must fail the step, not hang the
+# suite.
+#
+# BOTH files are FIFOs on purpose, and meta.json especially: all_runids() only
+# lists a run directory whose meta.json is a regular file, so a FIFO there keeps
+# this planted run out of the `latest`/`run` keys that status --json reads
+# separately. Plant a REAL meta.json beside a FIFO status and this step hangs on
+# a reader that is not the one under test here.
+KIND_FIFO_RUNID=20990101-000000
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+d="\$HOME/.agent-box/runs/${KIND_RUNID}"
+rm -rf "\$d"; mkdir -p "\$d"; chmod 700 "\$d"
+printf 'exit:0\n' > "\$d/status"
+printf '{"runid":"${KIND_RUNID}","model":"sonnet","branch":"${KIND_BRANCH}","brief":"kinds","started_at":"2026-01-02T03:04:05Z","tmux":"run-${KIND_RUNID}","max_turns":null,"max_budget_usd":null,"claude_version":null}\n' > "\$d/meta.json"
+s="\$HOME/.agent-box/sessions/kindsess"
+rm -rf "\$s"; mkdir -p "\$s"; chmod 700 "\$s"
+printf 'exit:0\n' > "\$s/status"
+f="\$HOME/.agent-box/runs/${KIND_FIFO_RUNID}"
+rm -rf "\$f"; mkdir -p "\$f"; chmod 700 "\$f"
+mkfifo "\$f/status" "\$f/meta.json"
+tmux new-session -d -s "run-${KIND_RUNID}" -- sleep 600
+tmux new-session -d -s kindsess -- sleep 600
+tmux new-session -d -s shell -- sleep 600
+tmux new-session -d -s "run-${KIND_FIFO_RUNID}" -- sleep 600
+sleep 1
+SH
+KINDJ="${TMP_ROOT}/sessions-kind.json"
+run_bounded 60 "$KINDJ" "$AGENTBOX" sessions "$CLEAN_REPO" --json
+if [ "${BOUNDED_RC}" -ne 124 ]; then
+    ok "sessions --json returned with a FIFO where a run's status and meta.json go"
+else
+    bad "sessions --json never returned: a read of an agent-made file blocked"
+fi
+cat "$KINDJ"
+# The vacuity guard: without all four rows every assertion below would pass on
+# an empty selection.
+if jq -e '[.[] | select(.name == "run-'"${KIND_RUNID}"'" or .name == "kindsess" or .name == "shell" or .name == "run-'"${KIND_FIFO_RUNID}"'")] | length == 4' "$KINDJ" >/dev/null 2>&1; then
+    ok "all four planted sessions are listed"
+else
+    bad "the planted sessions are not all listed; the assertions below prove nothing"
+fi
+if jq -e --arg b "$KIND_BRANCH" '[.[] | select(.name == "run-'"${KIND_RUNID}"'")][0] | .kind == "run" and .runid == "'"${KIND_RUNID}"'" and .state == "done" and .produced.branch == $b' "$KINDJ" >/dev/null 2>&1; then
+    ok "the run's session says kind=run, its run id, state=done and the branch it produced"
+else
+    bad "the run's session row is not as documented: $(jq -c '[.[] | select(.name == "run-'"${KIND_RUNID}"'")][0]' "$KINDJ" 2>/dev/null)"
+fi
+if jq -e '[.[] | select(.name == "kindsess")][0] | .kind == "session" and .runid == null and .state == "ended" and .produced == null' "$KINDJ" >/dev/null 2>&1; then
+    ok "the tracked session says kind=session and maps its own exit:0 to ended"
+else
+    bad "the tracked session row is not as documented: $(jq -c '[.[] | select(.name == "kindsess")][0]' "$KINDJ" 2>/dev/null)"
+fi
+if jq -e '[.[] | select(.name == "shell")][0] | .kind == "other" and .state == "unknown" and .runid == null and .produced == null' "$KINDJ" >/dev/null 2>&1; then
+    ok "a session that is neither says kind=other and claims no state"
+else
+    bad "the other row is not as documented: $(jq -c '[.[] | select(.name == "shell")][0]' "$KINDJ" 2>/dev/null)"
+fi
+# raw_state is the shell's working note on the way to the mapping. A consumer
+# that saw it would have two states to choose between, one of them unmapped.
+if jq -e '[.[] | select(has("raw_state"))] | length == 0' "$KINDJ" >/dev/null 2>&1; then
+    ok "no row carries the raw status word onward"
+else
+    bad "a row carries raw_state to the host"
+fi
+# The FIFO row: listed, and honest about what it could not read. A refused read
+# is not a dropped session -- the operator still sees the tmux session is there.
+if jq -e '[.[] | select(.name == "run-'"${KIND_FIFO_RUNID}"'")][0] | .kind == "run" and .runid == "'"${KIND_FIFO_RUNID}"'" and .state == "unknown" and .produced == {"branch": null}' "$KINDJ" >/dev/null 2>&1; then
+    ok "the run whose status and meta.json are FIFOs reads unknown, and is still listed"
+else
+    bad "the FIFO run row is not as documented: $(jq -c '[.[] | select(.name == "run-'"${KIND_FIFO_RUNID}"'")][0]' "$KINDJ" 2>/dev/null)"
+fi
+KIND_OUT="${TMP_ROOT}/sessions-kind.out"
+run_bounded 60 "$KIND_OUT" "$AGENTBOX" sessions "$CLEAN_REPO"
+if [ "${BOUNDED_RC}" -ne 124 ]; then
+    ok "the sessions table returned too"
+else
+    bad "the sessions table never returned"
+fi
+cat "$KIND_OUT"
+if grep -qE '^SESSION +KIND +STATE +AGE +LAST EVENT' "$KIND_OUT"; then
+    ok "the sessions table has the KIND and STATE columns"
+else
+    bad "the sessions table is missing the KIND or STATE column"
+fi
+if grep -qE "^run-${KIND_RUNID} +run +done " "$KIND_OUT"; then
+    ok "the table's run row reads run and done in the new columns"
+else
+    bad "the table's run row does not read run and done"
+fi
+# status --json reports the same rows: one producer, two readers. The same FIFO
+# row travels this path -- box-status.sh -> --sessions -> the host -- so if it
+# blocked here the whole fleet's status would stall at this box.
+KIND_STATUSJ="${TMP_ROOT}/status-kind.json"
+run_bounded 60 "$KIND_STATUSJ" "$AGENTBOX" status "$CLEAN_REPO" --json
+if [ "${BOUNDED_RC}" -ne 124 ]; then
+    ok "status --json returned with the FIFO run present"
+else
+    bad "status --json never returned: the FIFO row stalled the box's status"
+fi
+if jq -e '[.boxes[0].sessions[] | select(.name == "run-'"${KIND_RUNID}"'")][0] | .kind == "run" and .state == "done"' "$KIND_STATUSJ" >/dev/null 2>&1; then
+    ok "status --json carries the same kind and state for the run's session"
+else
+    bad "status --json does not carry the run session's kind and state: $(jq -c '.boxes[0].sessions' "$KIND_STATUSJ" 2>/dev/null)"
+fi
+guest bash -l > /dev/null 2>&1 <<SH
+set -u
+tmux kill-session -t "=run-${KIND_RUNID}" 2>/dev/null || true
+tmux kill-session -t '=kindsess' 2>/dev/null || true
+tmux kill-session -t '=shell' 2>/dev/null || true
+tmux kill-session -t "=run-${KIND_FIFO_RUNID}" 2>/dev/null || true
+rm -rf "\$HOME/.agent-box/runs/${KIND_RUNID}" "\$HOME/.agent-box/sessions/kindsess" \
+       "\$HOME/.agent-box/runs/${KIND_FIFO_RUNID}"
+SH
 # ---- end slot:8g-kind ----
 
 # ===========================================================================

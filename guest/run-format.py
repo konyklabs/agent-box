@@ -971,6 +971,121 @@ def cmd_learnings(args):
 # from here, and not from there, for the reason every other output is: the
 # session name is chosen by whoever created the session, and inside a run that
 # is the agent. A name is a place a whole OAuth token fits.
+#
+# A row also says which of the box's sessions DID THE WORK and which merely
+# share its disk, which is the question a list of names cannot answer: `kind`
+# and `runid` name the owner, `produced` names the branch a run left behind, and
+# `state` is the row's own vocabulary. Everything here is rebuilt from validated
+# parts, never copied through: the producer is trusted to be well-formed JSON
+# and nothing more.
+
+# The whole vocabulary of `kind`. An unrecognised word becomes `other`, the row
+# that claims the least: neither a run's session nor one agent-box tracks.
+SESSION_KINDS = frozenset({"run", "session", "other"})
+
+# What a `session` row's state may say. A session is not a run: nothing records
+# `stopped`, `waiting` or `lost` about one, so those three words are unreachable
+# here and a consumer that shows them would be showing a state that cannot be.
+SESSION_STATES = frozenset({"running", "ended", "unknown"})
+
+# The status file's word, for a session. `exit:stopped` and `exit:lost` are runs'
+# words and fall through to `unknown`, which is what they mean for a session.
+_SESSION_EXIT_RE = re.compile(r"^exit:[0-9]+$")
+
+
+def _session_age(value):
+    """Seconds since the session was created, or None when nobody could tell.
+
+    A negative age is a clock that moved, not an age: the row says it could not
+    tell rather than claiming a session started in the future.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        seconds = int(value)
+    except (ValueError, OverflowError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _session_last_event(value):
+    """The two fields the contract names, and nothing that rode along beside.
+
+    Scrubbed BEFORE it is cut, never after: hooks.jsonl is agent-writable, and a
+    credential that straddles the cut would otherwise be trimmed below the
+    redactor's 20-character floor and keep its leading characters. The whole
+    credential has to be there for the redactor to see it.
+    """
+    if not isinstance(value, dict):
+        return None
+    ts = value.get("ts")
+    event = value.get("event")
+    ts = first_line(scrub(ts), DETAIL_LIMIT) if isinstance(ts, str) else None
+    event = first_line(scrub(event), DETAIL_LIMIT) if isinstance(event, str) else None
+    # Two blank strings are no event at all, and they must read the same on the
+    # second pass as on the first: box-status.sh pipes `sessions --json` into
+    # --sessions, so every row goes through here twice per `status` refresh.
+    if ts is None and event is None:
+        return None
+    return {"ts": ts, "event": event}
+
+
+def _session_produced(kind, value):
+    """What a run produced: the branch its work is on. Null for any other row.
+
+    A run row always carries the object, with a null branch when the run has no
+    branch of its own -- `{"branch": null}` and `null` are different answers, and
+    the second one is reserved for "this row is not a run's".
+    """
+    if kind != "run":
+        return None
+    branch = value.get("branch") if isinstance(value, dict) else None
+    if not isinstance(branch, str) or not branch:
+        return {"branch": None}
+    return {"branch": scrub(branch)[:PATH_LIMIT]}
+
+
+def _session_state(kind, runid, raw, mapped):
+    """The row's state, in the vocabulary its kind allows.
+
+    A `run` row's state is the RUN's state, read from the run directory here and
+    not taken from the guest shell's `raw_state`: the two markers that turn an
+    exit code into `stopped` or `waiting` are files beside the status, and
+    `Run.state` is the one place in this program that reads them. A run id that
+    reached this function was matched against RUNID_RE first, so the directory it
+    names is inside the run tree.
+
+    A `session` row has only its status file, and `running` / `exit:<code>` are
+    the only two words it can say about itself.
+    """
+    if kind == "run":
+        if not runid:
+            return "unknown"
+        run = Run(runid)
+        # A regular file, or no answer. `sessions` is the one caller that reaches
+        # a run directory named by a TMUX SESSION rather than by all_runids(), so
+        # the directory need not exist and nothing filtered what is in it: the
+        # agent can put a FIFO or a device where the status goes, and the read
+        # would then block forever, with no timeout anywhere between here and the
+        # host's terminal. Nothing but a regular file is a status.
+        if not os.path.isfile(os.path.join(run.dir, "status")):
+            return "unknown"
+        return run.state
+    if kind == "session":
+        if raw == "running":
+            return "running"
+        if _SESSION_EXIT_RE.match(raw or ""):
+            return "ended"
+        # No raw status in the row at all means this row has been through here
+        # already: box-status.sh pipes `sessions --json` into --sessions, so the
+        # mapping runs twice over the same rows and must not undo itself. The
+        # type test is not decoration: `in` on a frozenset raises TypeError for
+        # an unhashable value, and one list from a future producer would turn a
+        # single bad row into a traceback instead of a row that says unknown.
+        if raw is None and isinstance(mapped, str) and mapped in SESSION_STATES:
+            return mapped
+        return "unknown"
+    return "unknown"
 
 
 def _sessions_or_none(raw, where):
@@ -994,9 +1109,35 @@ def _clean_sessions(sessions):
     for item in sessions or []:
         if not isinstance(item, dict):
             continue
-        cleaned = dict(item)
-        cleaned["name"] = scrub(str(item.get("name", "")))[:80]
-        out.append(scrub_obj(cleaned))
+        kind = item.get("kind")
+        # isinstance first: `in` on a frozenset hashes its argument, and a list
+        # or an object here would raise TypeError and lose the whole list --
+        # every key of the box's status object with it, on the --box-json path.
+        if not isinstance(kind, str) or kind not in SESSION_KINDS:
+            kind = "other"
+        runid = item.get("runid")
+        if not (isinstance(runid, str) and RUNID_RE.match(runid)):
+            runid = None
+        raw = item.get("raw_state")
+        if not isinstance(raw, str):
+            raw = None
+        # The seven keys of the contract, in its order, and nothing else. The row
+        # is rebuilt rather than copied so that `raw_state` stops here -- it is
+        # the shell's working note, not an answer -- and so that a key nobody
+        # validated cannot ride along to a consumer as if it had been.
+        out.append(
+            scrub_obj(
+                {
+                    "name": scrub(str(item.get("name", "")))[:80],
+                    "kind": kind,
+                    "runid": runid,
+                    "state": _session_state(kind, runid, raw, item.get("state")),
+                    "age_s": _session_age(item.get("age_s")),
+                    "last_event": _session_last_event(item.get("last_event")),
+                    "produced": _session_produced(kind, item.get("produced")),
+                }
+            )
+        )
     return out
 
 
@@ -1012,16 +1153,26 @@ def cmd_sessions(args):
     if not sessions:
         print("no tmux sessions")
         return 0
-    print("%-24s  %-10s  %s" % ("SESSION", "AGE", "LAST EVENT"))
+    # KIND and STATE before AGE, because "which of these is a run and how did it
+    # end" is the question this table is read for. The run id and the branch are
+    # in --json: a name and a kind are what fit a terminal line.
+    print("%-24s  %-7s  %-8s  %-10s  %s" % ("SESSION", "KIND", "STATE", "AGE", "LAST EVENT"))
     for item in sessions:
         event = item.get("last_event") or {}
         if isinstance(event, dict) and event.get("event"):
             shown = "%s %s" % (event.get("ts") or "?", event.get("event"))
         else:
             shown = "-"
+        age = item.get("age_s")
         print(
-            "%-24s  %-10s  %s"
-            % (item.get("name", "?"), "%ss" % item.get("age_s", "?"), shown)
+            "%-24s  %-7s  %-8s  %-10s  %s"
+            % (
+                item.get("name", "?"),
+                item.get("kind") or "?",
+                item.get("state") or "?",
+                "%ss" % age if age is not None else "-",
+                shown,
+            )
         )
     return 0
 
