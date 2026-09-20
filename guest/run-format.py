@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import stat
@@ -143,13 +144,27 @@ def scrub(value):
 
 
 def scrub_obj(obj):
-    """Scrub every string in a nested structure, on the way out to the host."""
+    """Scrub every string in a nested structure, on the way out to the host.
+
+    A non-finite float is `null` for the same reason a control byte is nothing.
+    `json.loads` accepts `NaN`, `Infinity` and `-Infinity`, and `json.dumps`
+    emits them back as bare words that no JSON reader has to accept — and the
+    numbers in these documents (`cost_usd`, `turns`, `elapsed_s`) come out of
+    events.jsonl, which is a file in the agent's own home. One such number would
+    take the WHOLE guest half of `status --json` down to the host's fallback
+    literal, because the host refuses a document it cannot recognise as JSON
+    (`channel_json_shape_ok`): every sensor null and the firewall reported as
+    `unknown` for a box that is running and whose mode is known. `null` is the
+    contract's word for a number nobody could read, and this is one of those.
+    """
     if isinstance(obj, str):
         return scrub(obj)
     if isinstance(obj, dict):
         return {k: scrub_obj(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [scrub_obj(v) for v in obj]
+    if isinstance(obj, float) and not math.isfinite(obj):
+        return None
     return obj
 
 
@@ -234,17 +249,38 @@ def tail_lines(path, count, budget=512 * 1024):
     live run and grows without bound, so parsing it whole to find the last line
     means the monitor competes for the guest's CPU with the agent it is
     supposed to be watching.
+
+    Opened like `read_message` and `_read_head`, for the reason given there: the
+    files this reads (events.jsonl, hooks.jsonl) are in the agent's own home, a
+    blocking `open()` on a FIFO planted with one of their names never returns,
+    and this is on the path `agentbox status` takes for every running box.
     """
+    text = ""
     try:
-        size = os.path.getsize(path)
-        with open(path, "rb") as fh:
-            if size > budget:
-                fh.seek(size - budget)
-                fh.readline()  # drop the partial line the seek landed inside
-            data = fh.read()
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return []
-    text = data.decode("utf-8", errors="replace")
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return []
+        seeked = info.st_size > budget
+        if seeked:
+            os.lseek(fd, info.st_size - budget, os.SEEK_SET)
+        data = b""
+        while len(data) < budget:
+            chunk = os.read(fd, budget - len(data))
+            if not chunk:
+                break
+            data += chunk
+        text = data.decode("utf-8", errors="replace")
+        if seeked:
+            # Drop the partial line the seek landed inside.
+            _, _, text = text.partition("\n")
+    except OSError:
+        return []
+    finally:
+        os.close(fd)
     lines = [line for line in text.splitlines() if line.strip()]
     return lines[-count:]
 
@@ -286,11 +322,28 @@ def tool_result_text(block):
 
 
 def fmt_cost(value):
-    return "-" if value is None else "$%.4f" % value
+    # `-` for no reading, and for a number that is not one: see fmt_duration.
+    # `"$%.4f" % float("nan")` is `$nan`, which is not a cost.
+    if value is None or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "-"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "-"
+    return "$%.4f" % value
 
 
 def fmt_duration(seconds):
-    if seconds is None:
+    """A number of seconds as `12s` / `3m04s` / `2h05m`, or `-` for no reading.
+
+    `-` also covers a number that is not one. Every value that reaches here came
+    out of a JSON file in the agent's own home, `json.loads` accepts `NaN` and
+    `Infinity`, and `int(float("inf"))` raises OverflowError — which, on the
+    `--box-json` path, is an empty document and a whole box reported as
+    unreachable with its firewall unknown. A run that wrote a duration nobody can
+    read has no duration to show, and that is what `-` says.
+    """
+    if seconds is None or not isinstance(seconds, (int, float)) or isinstance(seconds, bool):
+        return "-"
+    if isinstance(seconds, float) and not math.isfinite(seconds):
         return "-"
     seconds = int(seconds)
     if seconds < 60:
@@ -1905,12 +1958,35 @@ def _read_head(path, limit):
     tick and they are the agent's own files: a task line it decided to make a
     megabyte long would otherwise be read in full, in the guest, several times a
     minute. Nothing longer than one short line survives the caps below anyway.
+
+    Opened the way `read_message` opens a file on the mount, and for the same
+    reason: every path this reads is in the agent's own home, so
+    `mkfifo ~/.agent-box/sessions/claude/task` is one command away and a plain
+    blocking `open()` on a FIFO never returns. The host runs this once per
+    running box, inside `agentbox status`, with no timeout around the call — so
+    one box's FIFO would hang the whole fleet listing, and `status --watch` and
+    porthole's poll with it. `O_NONBLOCK` makes the open answer at once, `fstat`
+    then refuses anything that is not a regular file, and `O_NOFOLLOW` refuses a
+    symlink aimed at the token file.
     """
     try:
-        with open(path, "rb") as fh:
-            return fh.read(limit).decode("utf-8", errors="replace")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        data = b""
+        while len(data) < limit:
+            chunk = os.read(fd, limit - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", errors="replace")
 
 
 def _mtime_iso(path):

@@ -4149,13 +4149,39 @@ else
     bad "the channel object is not shaped as documented: $(jq -c '.boxes[0].channel' "$STATUSJ" 2>/dev/null)"
 fi
 # The toolchain snapshot this box's own provisioning wrote. `null` is a legal
-# answer (a box provisioned by an older checkout has no snapshot), so what is
-# asserted is the DOMAIN: when it is there, the state word is one of three and
-# the counts are counts.
-if jq -e '.boxes[0].toolchain as $t | $t == null or (($t.state | IN("ok","findings","unknown")) and ($t.missing | type) == "number" and ($t.off_pin | type) == "number")' "$STATUSJ" >/dev/null 2>&1; then
-    ok "status --json carries the toolchain snapshot in the documented shape"
+# answer — a box provisioned by an older checkout has no snapshot — but it is
+# legal only for a box that HAS no snapshot, and this box was provisioned by
+# this checkout minutes ago. So the guest is asked first, and what the answer
+# permits is what is then required: an `null or <shape>` assertion on its own
+# passes whatever the producer does, which is the one thing a check of a
+# producer must not do. The failure this catches is the snapshot being discarded
+# at provisioning time for a box with findings — the case the key exists for.
+TC_SNAP_BYTES=$(guest stat -c %s /var/lib/agent-box/toolcheck.json 2>/dev/null || true)
+# Digits or nothing: anything else is `stat` having said something other than a
+# size, which is the no-snapshot arm and not an arithmetic error in this step.
+case "$TC_SNAP_BYTES" in ''|*[!0-9]*) TC_SNAP_BYTES='' ;; esac
+if [ -n "$TC_SNAP_BYTES" ]; then
+    # The live byte count against the 4096-byte cap box-status.sh reads it
+    # with: a snapshot over the cap is cut, fails its shape, and reports
+    # `toolchain: null` — honest, and not the reading anybody wanted.
+    printf 'toolcheck.json: %s bytes (box-status.sh reads the first 4096)\n' "$TC_SNAP_BYTES"
+    if [ "$TC_SNAP_BYTES" -lt 4096 ]; then
+        ok "the toolchain snapshot fits the cap box-status.sh reads it with"
+    else
+        bad "the toolchain snapshot is ${TC_SNAP_BYTES} bytes, at or over the 4096-byte read cap"
+    fi
+    if jq -e '.boxes[0].toolchain | type == "object" and (.state | IN("ok","findings","unknown")) and (.missing | type) == "number" and (.off_pin | type) == "number"' "$STATUSJ" >/dev/null 2>&1; then
+        ok "status --json carries the toolchain snapshot in the documented shape"
+    else
+        bad "this box HAS a snapshot but status --json does not carry it: $(jq -c '.boxes[0].toolchain' "$STATUSJ" 2>/dev/null)"
+    fi
 else
-    bad "the toolchain object is not shaped as documented: $(jq -c '.boxes[0].toolchain' "$STATUSJ" 2>/dev/null)"
+    adv "this box has no /var/lib/agent-box/toolcheck.json; the toolchain key can only be null"
+    if jq -e '.boxes[0].toolchain == null' "$STATUSJ" >/dev/null 2>&1; then
+        ok "and status --json reports toolchain: null for it, never a guess"
+    else
+        bad "there is no snapshot, yet status --json reports one: $(jq -c '.boxes[0].toolchain' "$STATUSJ" 2>/dev/null)"
+    fi
 fi
 # The same rule for the two objects the hygiene and channel slices feed: a
 # reading or `null`, never a guess. `leftovers` is zeros on a box with nothing
@@ -4178,6 +4204,25 @@ if grep -qE 'tools=(ok|[0-9]+missing|[0-9]+off-pin|\?)' "$STATUS_OUT"; then
     ok "the text line reports the toolchain as one of the documented words"
 else
     bad "the text line has no tools= field"
+fi
+# And the WORD is checked against the JSON, the way `session=` is below: all
+# four are legal, so the domain check above passes on a `?` that is a lie about
+# a box whose snapshot was read. The expected word is derived from the same
+# object the JSON carries, so this fails when the two documents disagree —
+# which is the only way either of them can be wrong here without the other
+# saying so.
+ST_TOOLS=$(jq -r '.boxes[0].toolchain
+    | if . == null then "?"
+      elif ((.state | IN("ok","findings")) | not) then "?"
+      elif ((.missing // 0) > 0) then "\(.missing)missing"
+      elif ((.off_pin // 0) > 0) then "\(.off_pin)off-pin"
+      elif .state == "ok" then "ok"
+      else "?" end' "$STATUSJ" 2>/dev/null)
+printf 'tools expected from the JSON: %s\n' "$ST_TOOLS"
+if [ -n "$ST_TOOLS" ] && grep -qF "tools=${ST_TOOLS}" "$STATUS_OUT"; then
+    ok "and the tools= word is the one status --json's toolchain object implies"
+else
+    bad "the text line and status --json disagree about the toolchain (expected tools=${ST_TOOLS})"
 fi
 ST_STANDING=$(jq -r '.boxes[0].standing | if . == null then "none" else .state end' "$STATUSJ" 2>/dev/null)
 printf 'standing=%s\n' "$ST_STANDING"
