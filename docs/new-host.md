@@ -81,12 +81,28 @@ What the answers mean:
   install them the same way you would any other tool on this machine's policy.
   Do not improvise a package manager.
 
+- **An explicit proxy is a stop, not a step.** Check for one before anything else:
+
+  ```
+  scutil --proxy | grep -iE 'HTTPEnable|HTTPSEnable|ProxyAutoConfigEnable'
+  env | grep -i proxy
+  ```
+
+  If the host reaches the internet only through a proxy, the `curl` above still
+  passes — it uses the proxy — and then nothing inside the guest can reach
+  anything, because `lima/agent-box.yaml` sets `propagateProxyEnv: false` on
+  purpose: the host's `http_proxy` is not copied in, so the toolchain install, the
+  plugin install and `verify-auth` all fail with no route. Nothing in the tool
+  configures a guest proxy today. Stop here and report it; putting the proxy's
+  hostname in `allowlist.local` and its root in `ca.pem` is the shape of the
+  answer, but it has never been run on such a network.
+
 **Check:** `kern.hv_support: 1`, and `curl` returned an HTTP status code.
 
 ## 3. Install the tools and the two checkouts
 
 ```
-brew install lima gitleaks uv
+brew install lima gitleaks uv jq
 mkdir -p ~/dev ~/.local/bin
 git clone https://github.com/konyklabs/agent-box ~/dev/agent-box
 git clone https://github.com/konyklabs/porthole  ~/dev/porthole
@@ -258,8 +274,11 @@ Where it can stop, and what that means:
 - Boot completes but the plugin step says the marketplace was unreachable:
   the VM is fine and has no plugins yet. Continue to phase 7 and run
   `agentbox plugins ~/dev/<repo>` after the firewall check passes.
-- **`create` ends with `NOT READY: <tool> …` and a non-zero exit**: the box
-  exists and is usable, and a tool is missing or off its pin. Not a reason to
+- **`create` ends with `NOT READY: <tool> …`**: the box exists and is usable,
+  and a tool is missing or off its pin. `create` still exits 0 — an incomplete
+  toolchain is a fact about the box, not a failed create, and a caller that
+  checked the status would otherwise read a working box as a failure.
+  `agentbox toolcheck <repo>` is the check that fails (exit 10) until it is fixed. Not a reason to
   destroy it. Report the lines verbatim; `agentbox start` retries the install,
   and `agentbox toolcheck` is the report.
 
@@ -309,7 +328,15 @@ firewall unit; a run that builds its own images does not change that. Pull it
 once, then re-run:
 
 ```
-limactl shell agent-box-<repo basename> -- docker pull alpine:3
+limactl shell --workdir /work <instance> -- docker pull alpine:3
+```
+
+`<instance>` is the name `agentbox status` prints, not `agent-box-` plus the
+directory name: the CLI slugifies it, so `~/dev/My_App` is
+`agent-box-my-app`. `--workdir /work` is not optional either — without it
+limactl tries to enter the host's current directory inside the guest, which
+fails noisily and hands the guest a host path it has no business knowing.
+```
 agentbox firewall-check ~/dev/<repo>
 ```
 
@@ -371,13 +398,13 @@ the run starts with half an environment. From the host, one line, nothing
 printed:
 
 ```
-limactl shell agent-box-<repo basename> -- sh -c 'umask 077; cat > ~/app.env' < /path/on/this/mac/app.env
+limactl shell --workdir /work <instance> -- sh -c 'umask 077; cat > ~/app.env' < /path/on/this/mac/app.env
 ```
 
 Then, inside the guest, make sure it sources cleanly:
 
 ```
-limactl shell agent-box-<repo basename> -- sh -c 'set -a; . ~/app.env; set +a; echo sourced ok'
+limactl shell --workdir /work <instance> -- sh -c 'set -a; . ~/app.env; set +a; echo sourced ok'
 ```
 
 `python-dotenv`, `pydantic-settings` and Node's `dotenv` all read the process
@@ -430,7 +457,7 @@ When it ends:
 
 ```
 agentbox runs ~/dev/<repo>
-cat ~/dev/<repo>/.agent-box/last-run.txt
+agentbox logs ~/dev/<repo>
 git -C ~/dev/<repo> log --oneline main..agent/<branch>
 git -C ~/dev/<repo> diff main..agent/<branch> --stat
 ```
@@ -507,8 +534,10 @@ Ask first what only that box holds:
 agentbox triage ~/dev/<repo>
 ```
 
-The verdict is `keep`, `pause`, `remove` or `ask`, with what is only inside the box
-beside it. `ask` means stopping or deleting would end something only a person can
+`triage` prints a VERDICT and an ACTION, and they are different vocabularies.
+The ACTION is `keep`, `pause`, `remove` or `ask`; the VERDICT is `active`,
+`waiting`, `attention`, `idle`, `parked`, `spent` or `unknown`. What is only
+inside the box is beside them. `ask` means stopping or deleting would end something only a person can
 decide about — an open standing session or a queued request while the box runs;
 work found only inside it, or commits on an `agent/` branch that are on no remote,
 once it is stopped. An unread handoff raises the verdict and leaves the action at
@@ -530,6 +559,7 @@ case run `agentbox token` on each.
 | Phase | Command | Good |
 |---|---|---|
 | 2 | `sysctl kern.hv_support` | `1` |
+| 3 | `jq --version` | a version (the CLI and `preflight` both use it) |
 | 3 | `agentbox`, `porthole --version` | usage text; a version |
 | 3 | `agentbox version` | a commit, a date, `(clean)` |
 | 4 | `ls ~/.config/agent-box` | `blocklist.txt` mode 600 in the parent, nothing named blocklist under `guest/` |
