@@ -159,14 +159,27 @@ TOOLS
 # the shared browser path whose name carries the revision the installed
 # Playwright asked for, plus an executable inside it. The revision is read back
 # from what is installed, never chosen here.
+#
+# The subdirectory carries the architecture, so the name differs per host:
+# `chrome-linux64` on x86_64 and `chrome-linux-arm64` on this Mac's guests
+# (measured on a real box: Playwright 1.63 revision 1243 unpacks
+# `chromium-1243/chrome-linux-arm64/chrome`). An earlier version of this
+# function looked only for `chrome-linux/chrome`, which exists on neither, so a
+# correctly installed browser read as missing on every box, `toolcheck` exited
+# non-zero for ever, and `create` ended with a false NOT READY. Match the
+# executable by glob rather than by naming the layouts, so the next rename is
+# not another false alarm.
 chromium_found() {
-    local dir
+    local dir exe
     for dir in "${BROWSERS_PATH}"/chromium-*; do
         [ -d "$dir" ] || continue
-        if [ -x "${dir}/chrome-linux/chrome" ] || [ -x "${dir}/chrome-linux/headless_shell" ]; then
-            printf '%s' "${dir##*/chromium-}"
-            return 0
-        fi
+        for exe in "$dir"/chrome-linux*/chrome "$dir"/chrome-linux*/headless_shell \
+                   "$dir"/chrome-*/chrome "$dir"/chrome-*/headless_shell; do
+            if [ -x "$exe" ]; then
+                printf '%s' "${dir##*/chromium-}"
+                return 0
+            fi
+        done
     done
     return 0
 }

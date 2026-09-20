@@ -651,6 +651,42 @@ check_channel_read() {
     done
 }
 
+# chromium_found reads a browser directory whose subdirectory carries the host's
+# architecture. Measured on a real box: Playwright 1.63 revision 1243 unpacks
+# `chromium-1243/chrome-linux-arm64/chrome`, and an earlier version of the
+# function looked only for `chrome-linux/chrome` — so a correctly installed
+# browser read as missing on every arm64 box, `toolcheck` exited non-zero for
+# ever, and `create` ended with a false NOT READY.
+check_chromium_found() {
+    section "chromium_found: every per-architecture layout"
+    local fn root got
+    fn=$(sed -n '/^chromium_found() {/,/^}/p' "${BOX_DIR}/guest/toolcheck.sh")
+    if [ -z "$fn" ]; then bad "could not extract chromium_found from guest/toolcheck.sh"; return; fi
+    root="${WORK}/chromium"; mkdir -p "$root"
+    _cf() { BROWSERS_PATH="$1" bash -c "${fn}"$'\nchromium_found'; }
+    local layout
+    for layout in chrome-linux-arm64/chrome chrome-linux64/chrome chrome-linux-arm64/headless_shell chrome-linux/chrome; do
+        rm -rf "${root:?}"/*; mkdir -p "${root}/chromium-1243/${layout%/*}"
+        : > "${root}/chromium-1243/${layout}"; chmod +x "${root}/chromium-1243/${layout}"
+        got=$(_cf "$root")
+        if [ "$got" = "1243" ]; then ok "the ${layout%/*} layout reads revision 1243"
+        else bad "the ${layout%/*} layout read '${got}' instead of 1243"; fi
+    done
+    # A file that is not executable is not a browser: the guard that keeps a
+    # half-finished download from reading as installed.
+    rm -rf "${root:?}"/*; mkdir -p "${root}/chromium-1243/chrome-linux-arm64"
+    : > "${root}/chromium-1243/chrome-linux-arm64/chrome"
+    got=$(_cf "$root")
+    if [ -z "$got" ]; then ok "a non-executable chrome reads missing"
+    else bad "a non-executable chrome read '${got}'"; fi
+    rm -rf "${root:?}"/*; mkdir -p "${root}/chromium-1243"
+    got=$(_cf "$root")
+    if [ -z "$got" ]; then ok "an empty chromium-<rev> directory reads missing"
+    else bad "an empty chromium-<rev> directory read '${got}'"; fi
+    rm -rf "$root"
+    unset -f _cf
+}
+
 check_repo_git
 check_host_clip
 check_meta_race
@@ -659,6 +695,7 @@ check_require_brief
 check_slot_list
 check_proc_starttime
 check_channel_read
+check_chromium_found
 
 printf -- '\nRESULT: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
