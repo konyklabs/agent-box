@@ -1590,12 +1590,264 @@ guest bash -c 'df -h / | tail -2
 # ---- end slot:5c ----
 
 # ---- slot:5d (owner TB) ----
+# ===========================================================================
+step "5d. toolcheck names a missing baseline tool, and the box recovers"
+# ===========================================================================
+#
+# Non-vacuous by construction: a real binary is moved aside, and that the move
+# worked is its own assertion. Without it every line below would report a pass
+# on a box where nothing had happened.
+#
+# ruff is the one moved because it is a single file with no dependants, so a box
+# that spends thirty seconds without it is a box with one fewer formatter and
+# nothing else.
+TC_RUFF_PATH=$(guest bash -lc 'command -v ruff' 2>/dev/null | tr -d '\r')
+case "$TC_RUFF_PATH" in
+    /usr/*|/opt/*)
+        ok "ruff is installed at ${TC_RUFF_PATH}" ;;
+    *)
+        bad "ruff is not on PATH in the box (command -v said '${TC_RUFF_PATH}'); 5d can prove nothing"
+        TC_RUFF_PATH="" ;;
+esac
+
+if [ -n "$TC_RUFF_PATH" ]; then
+    guest sudo mv "$TC_RUFF_PATH" "${TC_RUFF_PATH}.hidden"
+    TC_GONE="${TMP_ROOT}/ruff-gone.out"
+    guest bash -lc 'command -v ruff' > "$TC_GONE" 2>&1 || true
+    cat "$TC_GONE"
+    if grep -q 'ruff' "$TC_GONE"; then
+        bad "ruff is still on PATH after the move; the assertions below would prove nothing"
+    else
+        ok "ruff really is gone from the box"
+    fi
+
+    TC2="${TMP_ROOT}/toolcheck-missing.out"
+    "$AGENTBOX" toolcheck "$CLEAN_REPO" > "$TC2" 2>&1
+    tc2_rc=$?
+    cat "$TC2"
+    if [ "$tc2_rc" -eq 10 ]; then
+        ok "toolcheck exits 10 when a baseline tool is missing"
+    else
+        bad "toolcheck exited ${tc2_rc} with a tool missing; 10 is the documented status"
+    fi
+    if grep -qE '^ruff +[^ ]+ +- +MISSING' "$TC2"; then
+        ok "and the row names ruff, its pin and the dash for what was found"
+    else
+        bad "no MISSING row naming ruff in the table"
+    fi
+    if grep -qE '^toolcheck: 1 missing' "$TC2"; then
+        ok "and the summary line counts exactly one missing tool"
+    else
+        bad "the summary line does not count one missing tool"
+    fi
+
+    TC2J="${TMP_ROOT}/toolcheck-missing.json"
+    "$AGENTBOX" toolcheck "$CLEAN_REPO" --json > "$TC2J" 2>&1 || true
+    if jq -e '.state == "findings"
+              and (.tools[] | select(.name == "ruff") | .state == "missing" and .found == null)
+              and .counts.missing == 1' "$TC2J" >/dev/null 2>&1; then
+        ok "--json says so in the documented shape, with found and path null"
+    else
+        bad "--json does not carry the documented missing-tool shape"
+        cat "$TC2J"
+    fi
+
+    # The line `create` and `start` prefix with NOT READY / WARNING (amendment
+    # A3) is the guest's own findings line, so this is that mechanism's input
+    # asserted where it is produced. A `start` here would re-run provisioning
+    # and reinstall the very tool that was hidden.
+    TC2F="${TMP_ROOT}/toolcheck-findings.out"
+    guest /opt/agent-box/guest/toolcheck.sh --box-only --findings-only > "$TC2F" 2>&1
+    tc2f_rc=$?
+    cat "$TC2F"
+    if [ "$tc2f_rc" -eq 10 ] && grep -qE '^ruff is missing \(pinned ' "$TC2F"; then
+        ok "the readiness line create and start print names ruff and its pin"
+    else
+        bad "--box-only --findings-only exited ${tc2f_rc} without a by-name line for ruff"
+    fi
+
+    guest sudo mv "${TC_RUFF_PATH}.hidden" "$TC_RUFF_PATH"
+    TC2B="${TMP_ROOT}/toolcheck-restored.out"
+    "$AGENTBOX" toolcheck "$CLEAN_REPO" > "$TC2B" 2>&1
+    tc2b_rc=$?
+    tail -3 "$TC2B"
+    if [ "$tc2b_rc" -eq 0 ]; then
+        ok "and toolcheck is clean again once the tool is back"
+    else
+        bad "toolcheck still exits ${tc2b_rc} after ruff was restored"
+    fi
+fi
 # ---- end slot:5d ----
 
 # ---- slot:5e (owner TB) ----
+# ===========================================================================
+step "5e. a project pin that differs is a MISMATCH, not a broken box"
+# ===========================================================================
+#
+# The pin files are written into $CLEAN_REPO on the HOST, which is both the
+# natural place for a repository's own files and the right direction: they reach
+# the guest through the virtiofs mount, exactly as a real project's files do.
+PINS="${BOX_DIR}/guest/toolchain.pins"
+NODE_PIN=$(sed -n 's/^NODE_VERSION="\(.*\)"$/\1/p' "$PINS" 2>/dev/null | head -1)
+RUFF_PIN=$(sed -n 's/^RUFF_VERSION="\(.*\)"$/\1/p' "$PINS" 2>/dev/null | head -1)
+printf 'pins: node=%s ruff=%s\n' "${NODE_PIN:-<none>}" "${RUFF_PIN:-<none>}"
+if [ -n "$NODE_PIN" ] && [ -n "$RUFF_PIN" ]; then
+    ok "the node and ruff pins were read back out of guest/toolchain.pins"
+else
+    bad "guest/toolchain.pins carries no NODE_VERSION or RUFF_VERSION; 5e cannot compare anything"
+fi
+
+if [ -n "$NODE_PIN" ] && [ -n "$RUFF_PIN" ]; then
+    # A node version that cannot accidentally BE the box's pin, whatever the
+    # pins file says today.
+    NODE_PROJ="22.19.0"
+    [ "$NODE_PIN" = "$NODE_PROJ" ] && NODE_PROJ="20.19.0"
+    printf 'node %s\nruff %s\n' "$NODE_PROJ" "$RUFF_PIN" > "${CLEAN_REPO}/.tool-versions"
+    mkdir -p "${CLEAN_REPO}/.github/workflows"
+    # A mapped action (ruff-action -> ruff) and an unmapped one (setup-go) with
+    # the same bare `version:` key. The second is the whole reason the bare key
+    # is read only inside a step whose action is known.
+    printf 'jobs:\n  ci:\n    steps:\n      - uses: astral-sh/ruff-action@v3\n        with:\n          version: 9.9.9\n      - uses: actions/setup-go@v5\n        with:\n          version: 1.99.0\n' \
+        > "${CLEAN_REPO}/.github/workflows/ci.yml"
+
+    TC3="${TMP_ROOT}/toolcheck-project.out"
+    "$AGENTBOX" toolcheck "$CLEAN_REPO" > "$TC3" 2>&1
+    tc3_rc=$?
+    cat "$TC3"
+    if [ "$tc3_rc" -eq 11 ]; then
+        ok "a project mismatch exits 11, not 10 — the box is not the thing that is wrong"
+    else
+        bad "toolcheck exited ${tc3_rc} on a project mismatch; 11 is the documented status"
+    fi
+    if grep -qE "\.tool-versions:1 +node ${NODE_PROJ} .*MISMATCH" "$TC3"; then
+        ok "the node mismatch names the file, the line and the project's version"
+    else
+        bad "no MISMATCH row naming .tool-versions:1 and node ${NODE_PROJ}"
+    fi
+    if grep -qE "\.tool-versions:1 .*box ${NODE_PIN} " "$TC3"; then
+        ok "and the same row names the version this box carries"
+    else
+        bad "the node mismatch row does not name the box's own version"
+    fi
+    if grep -qE "\.tool-versions:2 +ruff ${RUFF_PIN} .* match$" "$TC3"; then
+        ok "a project pin that agrees is reported as a match, not a mismatch"
+    else
+        bad "the agreeing ruff pin is not reported as a match"
+    fi
+    if grep -qE "ci\.yml:6 +ruff 9\.9\.9 .*MISMATCH" "$TC3"; then
+        ok "a workflow 'version:' under a known action is attributed to its tool"
+    else
+        bad "the ruff-action version: input was not detected at ci.yml:6"
+    fi
+    if grep -q '1\.99\.0' "$TC3"; then
+        bad "a bare version: under an unknown action was attributed to a tool"
+    else
+        ok "a bare version: under an unknown action is not attributed to anything"
+    fi
+    if grep -qE '^toolcheck: every baseline tool is at its pin; 2 project mismatches$' "$TC3"; then
+        ok "the summary separates the box's health from the project's pins"
+    else
+        bad "the summary line does not separate the two halves"
+    fi
+
+    # --project-only is the mode every launch path uses: the same project rows,
+    # with the box half read from the boot snapshot instead of swept live.
+    TC3P="${TMP_ROOT}/toolcheck-project-only.out"
+    "$AGENTBOX" toolcheck "$CLEAN_REPO" --project-only > "$TC3P" 2>&1
+    tc3p_rc=$?
+    cat "$TC3P"
+    if [ "$tc3p_rc" -eq 11 ] && grep -qE "\.tool-versions:1 +node ${NODE_PROJ} .*MISMATCH" "$TC3P"; then
+        ok "--project-only reports the same mismatch from the cached box half"
+    else
+        bad "--project-only exited ${tc3p_rc} without the node mismatch"
+    fi
+    if grep -q '^TOOL  *PINNED' "$TC3P"; then
+        bad "--project-only printed the live sweep's table, which it did not run"
+    else
+        ok "--project-only does not print a table it never swept"
+    fi
+
+    rm -f "${CLEAN_REPO}/.tool-versions" "${CLEAN_REPO}/.github/workflows/ci.yml"
+    rmdir "${CLEAN_REPO}/.github/workflows" "${CLEAN_REPO}/.github" 2>/dev/null || true
+    if [ ! -e "${CLEAN_REPO}/.tool-versions" ]; then
+        ok "5e removed the pin files it planted in the repository"
+    else
+        bad "5e left a pin file in the repository for later steps to trip over"
+    fi
+fi
 # ---- end slot:5e ----
 
 # ---- slot:5f (owner TB) ----
+# ===========================================================================
+step "5f. hostile bytes in a project pin file are never echoed or executed"
+# ===========================================================================
+#
+# The shape of step 8i, applied to the other direction: 8i asks what the guest
+# can send to the host's terminal, this asks what the repository can send to the
+# guest's scanner and through it to the same terminal.
+#
+# The symlink half tests the MECHANISM and not a permission error: the target is
+# a canary the box user can really read, so a scanner that followed the link
+# would print the canary. Pointing it at /etc/shadow would pass whatever the
+# code did — the file does not exist on the host and is unreadable in the guest.
+TC_PWNED=/tmp/abx-toolcheck-pwned
+TC_CANARY=/etc/abx-toolcheck-canary
+guest sudo rm -f "$TC_PWNED"
+guest sudo sh -c "printf 'ABX-TOOLCHECK-CANARY\n' > ${TC_CANARY}; chmod 644 ${TC_CANARY}"
+if guest test -r "$TC_CANARY"; then
+    ok "the canary is readable by the box user, so following the link would show"
+else
+    bad "the canary is not readable in the guest; the symlink assertion would be vacuous"
+fi
+
+# shellcheck disable=SC2016  # the substitution and the backticks must NOT expand
+# here: they are the hostile bytes under test, and the whole point is that they
+# reach the guest's scanner as text and are never expanded by anything.
+printf 'node $(touch %s)1.2.3\nruff \033[31mred\033[0m\nnode `id`\n' "$TC_PWNED" \
+    > "${CLEAN_REPO}/.tool-versions"
+ln -sfn "$TC_CANARY" "${CLEAN_REPO}/.python-version"
+TC4="${TMP_ROOT}/toolcheck-hostile.out"
+"$AGENTBOX" toolcheck "$CLEAN_REPO" > "$TC4" 2>&1 || true
+cat "$TC4"
+
+if guest test -e "$TC_PWNED"; then
+    bad "a command substitution in a pin file ran in the guest"
+else
+    ok "nothing in the pin file was executed"
+fi
+if LC_ALL=C grep -q $'\033' "$TC4"; then
+    bad "an escape sequence from the repository reached the host's terminal"
+else
+    ok "control bytes were stripped before crossing to the host"
+fi
+if grep -q '<unparseable>' "$TC4"; then
+    ok "the bad token is reported as unparseable, with its file and line"
+else
+    bad "the bad token was not reported as unparseable"
+fi
+if grep -q 'ABX-TOOLCHECK-CANARY' "$TC4"; then
+    bad "a symlinked pin file was followed and its target printed"
+else
+    ok "the symlink's target never appeared in the output"
+fi
+if grep -q 'refused: \.python-version is a symlink' "$TC4"; then
+    ok "and the symlink is refused BY NAME, not silently skipped"
+else
+    bad "no positive refusal line for the symlinked pin file"
+fi
+if grep -qE '^toolcheck: .*(1 unreadable|3 unreadable)' "$TC4"; then
+    ok "the summary counts the unreadable tokens without repeating them"
+else
+    bad "the summary does not count the unreadable tokens"
+fi
+
+rm -f "${CLEAN_REPO}/.tool-versions" "${CLEAN_REPO}/.python-version"
+guest sudo rm -f "$TC_CANARY" "$TC_PWNED"
+if [ ! -e "${CLEAN_REPO}/.python-version" ] && ! guest test -e "$TC_CANARY"; then
+    ok "5f removed the pin files and the canary it planted"
+else
+    bad "5f left a planted file behind"
+fi
 # ---- end slot:5f ----
 
 # ===========================================================================
@@ -2350,6 +2602,77 @@ fi
 # ---- end slot:8d2 ----
 
 # ---- slot:8d3 (owner TB) ----
+# ===========================================================================
+step "8d3. a project pin mismatch reaches the run that is about to start"
+# ===========================================================================
+#
+# Item 2's operative clause is that a mismatch is reported BEFORE WORK STARTS,
+# and this is the only check of it. It cannot live in step 5: the report is
+# written when a run assembles its brief, and the first run in this suite is a
+# thousand lines below step 5, so a grep there would find an empty briefs
+# directory and — with no ok/bad around it — record nothing at all.
+#
+# It starts its own run rather than reading 8d's: the pin file has to be in place
+# when the run begins, and the report is asserted by THIS run's id rather than
+# through a glob that would pass on any run's report. The fake token from 8d is
+# still in place, so the run reaches the CLI, fails there, and costs nothing.
+#
+# The report file is written by guest/agent-run.sh. There is no durable copy of
+# the ASSEMBLED brief — the host's ~/.agent-box/briefs/<runid>.md is the brief as
+# given, before the conventions and this section go in front of it — so the run's
+# own toolchain-report.txt is the artefact that proves the text reached it.
+TC8_PINS="${BOX_DIR}/guest/toolchain.pins"
+TC8_NODE_PIN=$(sed -n 's/^NODE_VERSION="\(.*\)"$/\1/p' "$TC8_PINS" 2>/dev/null | head -1)
+TC8_PROJ="22.19.0"
+[ "$TC8_NODE_PIN" = "$TC8_PROJ" ] && TC8_PROJ="20.19.0"
+printf 'node %s\n' "$TC8_PROJ" > "${CLEAN_REPO}/.tool-versions"
+if [ -f "${CLEAN_REPO}/.tool-versions" ]; then
+    ok "the mismatching pin file is in the repository on the host before the run starts"
+else
+    bad "the pin file was not written; the run would have nothing to report"
+fi
+
+TC8_OUT="${TMP_ROOT}/toolchain-run.out"
+run_bounded 300 "$TC8_OUT" "$AGENTBOX" run "$CLEAN_REPO" "${TMP_ROOT}/noop-brief.md" --wait
+cat "$TC8_OUT"
+TC8_RUNID=$(sed -n 's/^agentbox: run \([0-9-]*\) started.*/\1/p' "$TC8_OUT" | head -1)
+printf 'runid: %s\n' "${TC8_RUNID:-<none>}"
+if [ -n "$TC8_RUNID" ]; then
+    ok "the run started and printed its id"
+else
+    bad "the run printed no id; the report cannot be asserted by runid"
+fi
+
+if [ -n "$TC8_RUNID" ]; then
+    TC8_REPORT="${TMP_ROOT}/toolchain-report.out"
+    guest sh -c "cat \$HOME/.agent-box/runs/${TC8_RUNID}/toolchain-report.txt" > "$TC8_REPORT" 2>&1
+    cat "$TC8_REPORT"
+    if grep -qE "\.tool-versions:1 +node ${TC8_PROJ} .*MISMATCH" "$TC8_REPORT"; then
+        ok "the run's own toolchain-report.txt names the file, the line and both versions"
+    else
+        bad "run ${TC8_RUNID} has no toolchain-report.txt naming the mismatch"
+    fi
+    TC8_MODE=$(guest sh -c "stat -c '%a' \$HOME/.agent-box/runs/${TC8_RUNID}/toolchain-report.txt" 2>/dev/null | tr -d '\r')
+    if [ "$TC8_MODE" = "600" ]; then
+        ok "and it is mode 600, like every other file in a run's directory"
+    else
+        bad "the report is mode '${TC8_MODE}', expected 600"
+    fi
+    TC8_CONSOLE="${TMP_ROOT}/toolchain-console.out"
+    guest sh -c "cat \$HOME/.agent-box/runs/${TC8_RUNID}/console.log" > "$TC8_CONSOLE" 2>&1
+    if grep -q 'agent-run: toolchain: project pin findings were added to the brief' "$TC8_CONSOLE"; then
+        ok "and the run said so on its console, so the operator can see it happened"
+    else
+        bad "the run's console never said the findings were added to the brief"
+    fi
+fi
+
+rm -f "${CLEAN_REPO}/.tool-versions"
+if [ ! -e "${CLEAN_REPO}/.tool-versions" ]; then
+    ok "8d3 removed the pin file it planted"
+else
+    bad "8d3 left its pin file in the repository"
+fi
 # ---- end slot:8d3 ----
 
 # ===========================================================================
