@@ -117,6 +117,28 @@ nodejs.org
 # becomes possible.
 .storage.googleapis.com
 
+# dprint's formatter plugins. The dprint binary formats NOTHING on its own: the
+# rules for each language are WASM modules it fetches on first use and caches in
+# ~/.cache/dprint. Measured in a box before this line existed, with the pinned
+# 0.57.4 installed and a project pinning the markdown plugin:
+#
+#   $ dprint check
+#   Error resolving plugin https://plugins.dprint.dev/markdown-0.24.0.wasm:
+#     Connection Failed: No route to host (os error 113)      (exit 12)
+#
+# So without this entry a baseline tool is present and unusable, and a project
+# whose CI runs `dprint check` is not reproducible in a box. Admitted as an exact
+# name, not a dot line: only this host serves the plugins.
+#
+# What it costs, stated plainly: like every name here it is an outbound channel
+# the agent's shell can also reach. It is a smaller one than pypi.org,
+# files.pythonhosted.org, registry.npmjs.org and github.com, already on this list,
+# each of which serves arbitrary executable code rather than WASM that dprint runs
+# with no filesystem and no network of its own. The remaining exposure is a
+# swapped module, which is why guest/conventions.md tells the agent to pin a
+# plugin as `url@<sha256>` and guest/project-pins.py reports one that is not.
+plugins.dprint.dev
+
 # Deliberately NOT allowed, and disabled by DISABLE_TELEMETRY=1 and
 # DISABLE_ERROR_REPORTING=1 in the guest environment instead:
 #   sentry.io, statsig.com, statsig.anthropic.com

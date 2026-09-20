@@ -45,6 +45,14 @@ watching the terminal. Five conventions apply on top of the brief below.
    project wins: install its version before you trust a result, and write it
    down under convention 2.
 
+   One case needs a word of its own. `dprint` formats nothing by itself: its
+   rules are WASM modules it downloads from `plugins.dprint.dev`, which this box
+   allows so that a project's own `dprint check` works. A plugin URL may end in
+   `@<sha256>`, and dprint verifies it when it does. If the project's
+   `dprint.json` pins its plugins that way, leave them alone. If you add or
+   change one, pin it — `toolcheck` reports an unpinned plugin URL as UNPINNED,
+   and an unpinned URL means whatever that host serves is what runs.
+
 5. **Hand work to the host with `abx handoff`.** Commit first; the body goes on
    stdin and needs three headings: `## Changed`, `## Verify` (the exact
    commands, as they are to be run) and `## Unproven` (what you did not or
