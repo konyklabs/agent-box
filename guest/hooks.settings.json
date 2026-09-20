@@ -1,5 +1,19 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/opt/agent-box/guest/channel.sh hook SessionStart", "timeout": 15 }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "/opt/agent-box/guest/channel.sh hook UserPromptSubmit", "timeout": 15 }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "*",
@@ -12,7 +26,8 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "/opt/agent-box/guest/hook-event.sh" }
+          { "type": "command", "command": "/opt/agent-box/guest/hook-event.sh" },
+          { "type": "command", "command": "/opt/agent-box/guest/channel.sh hook PostToolUse", "timeout": 10 }
         ]
       }
     ],
@@ -27,7 +42,8 @@
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "/opt/agent-box/guest/hook-event.sh" }
+          { "type": "command", "command": "/opt/agent-box/guest/hook-event.sh" },
+          { "type": "command", "command": "/opt/agent-box/guest/channel.sh hook Stop", "timeout": 10 }
         ]
       }
     ],
