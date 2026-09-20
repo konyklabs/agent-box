@@ -276,28 +276,38 @@ proc_detail() {
     printf '%s' "$out"
 }
 
-# The pids this run might own:
+# The pids this run might own. TWO sources, and they are the two the spec's kill
+# set is defined from — process group ∪ env-marked, intersected with
+# started-after-baseline:
 #
 #   1. its process group. `set -m` in agent-run.sh gives the CLI its own group
 #      whose pgid is the CLI's pid, and a group lives as long as one member
 #      does, so `pgrep -g` still enumerates it after the leader has been
 #      reaped — which is the state every sweep runs in.
-#   2. the pids it recorded earlier and that are still alive: at sweep time the
-#      CLI is gone and a descendant walk from it finds nothing, so what the
-#      sampler saw is the only record of a process that has since reparented.
-#   3. any process whose own env block names THIS run's events directory, which
+#   2. any process whose own env block names THIS run's events directory, which
 #      is how a child that left the group with setsid is still found. Tested
 #      with `grep -q` and nothing else (see the one line below): that file holds
 #      the OAuth token of every process started with it, so its contents are
 #      never read into a variable, never printed, and never matched loosely.
 #
-# A standing interactive session's processes are in none of these: they are in
+# What is deliberately NOT a source here: the pids the ledger recorded earlier.
+# Both sources above carry evidence about the process that holds the number
+# right now; a recorded pid carries none — the number the sampler wrote down and
+# the process wearing it after the kernel recycled it are the same number and
+# different processes. So the ledger is a REPORTING source (the sweep's
+# `already gone` and `ownership no longer provable` lines) and never a candidate,
+# because a candidate is something this script may record as the run's and
+# signal. A descendant that has left the group keeps its env block, marker
+# included, so source 2 still finds it; one that has neither proof shows up as
+# the `port` row `collect_ports` writes for a listener no visible process owns.
+#
+# A standing interactive session's processes are in neither source: they are in
 # no run's process group and they carry the SESSION's directory, not a run's.
 # That is what makes "a dev server the operator started is never swept" a
 # property of the candidate set rather than a promise in a document.
 candidate_pids() {
-    local pgid="${1:?}" run_dir="${2:?}" threshold="${3:-}" observed="${4:-}"
-    local out="" p d line kind value scanned=0
+    local pgid="${1:?}" run_dir="${2:?}" threshold="${3:-}"
+    local out="" p d scanned=0
     case "$pgid" in ''|*[!0-9]*) pgid=0 ;; esac
     if [ "$pgid" -gt 1 ] && command -v pgrep >/dev/null 2>&1; then
         for p in $(pgrep -g "$pgid" 2>/dev/null); do
@@ -305,18 +315,6 @@ candidate_pids() {
             out="${out}${p}
 "
         done
-    fi
-    # The ones already in the ledger, still alive.
-    if [ -n "$observed" ]; then
-        while IFS="$FS" read -r kind value; do
-            [ "$kind" = "proc" ] || continue
-            case "$value" in ''|*[!0-9]*) continue ;; esac
-            kill -0 "$value" 2>/dev/null || continue
-            out="${out}${value}
-"
-        done <<EOF
-$observed
-EOF
     fi
     # The marker scan, bounded three ways: the cap, the start-time guard before
     # the grep, and grep's own failure on a file this user may not read (which
@@ -612,10 +610,18 @@ EOF
 
     up=$(ledger_baseline_uptime "$file") || up=""
     threshold=$(starttime_threshold "$up") || threshold=""
-    pids=$(candidate_pids "$pgid" "$run_dir" "$threshold" "$known")
+    pids=$(candidate_pids "$pgid" "$run_dir" "$threshold")
     pids=$(expand_and_filter_pids "$pids" "")
 
-    rows=$(collect_procs "$pids")
+    # EVERY accumulation is newline-terminated, the first one included. Command
+    # substitution strips the trailing newline, so appending the next collector's
+    # output straight onto this string glues its first row onto the previous
+    # one's last row and the reader below loses one row per join — silently, and
+    # the row it loses is the first `port`, the one class nothing else reports.
+    # A collector that prints nothing contributes one empty line, which the
+    # reader skips on its `[ -n "$kind" ]` guard.
+    rows="$(collect_procs "$pids")
+"
     if sockets_readable; then
         rows="${rows}$(collect_ports "$pids" "$base")
 "
@@ -755,8 +761,17 @@ EOF
     done <<EOF
 $state
 EOF
-    pids=$(candidate_pids "$pgid" "$dir" "$threshold" "")
-    pids=$(printf '%s\n%s\n' "$pids" "$(printf '%s' "$observed_pids" | tr ' ' '\n')" | sort -u)
+    # The candidate set, and nothing else, becomes the kill set: the process
+    # group and the env marker, each of which is evidence about the process
+    # holding that number NOW. The pids the ledger recorded are NOT merged in
+    # here. A recorded pid is a number, and after the kernel has recycled it the
+    # number belongs to a stranger who — being younger than this run's baseline
+    # by construction — passes the start-time guard by construction too, so the
+    # guard cannot save it: the sweep would INT→TERM→KILL the operator's standing
+    # session or a concurrent run's CLI, with its whole descendant tree, and
+    # report `closed N processes`. That is the failure the guard exists to
+    # prevent, so the ledger is read for reporting only, below.
+    pids=$(candidate_pids "$pgid" "$dir" "$threshold")
     pids=$(expand_and_filter_pids "$pids" "$spare_pids")
 
     # Without pgrep there is no process group and no descendant walk, so the only
@@ -772,8 +787,9 @@ EOF
     # read is neither signalled nor hidden, and one that predates the baseline
     # is not this run's business at all — it is not recorded either way, because
     # a line about a stranger's process is a false claim about this run.
-    local kill_set=""
+    local kill_set="" cand_set=" "
     for p in $pids; do
+        cand_set="${cand_set}${p} "
         kill -0 "$p" 2>/dev/null || continue
         own=$(proc_ownership "$p" "$threshold")
         case "$own" in
@@ -782,6 +798,32 @@ EOF
                 surv_proc=$((surv_proc + 1))
                 ledger_append "$file" survived proc "$p" "unverifiable" || true ;;
             *) ;;
+        esac
+    done
+
+    # The ledger's own pids, reported and never signalled. One that is alive and
+    # in the candidate set has already been judged above; one that is alive and
+    # is not gets the same three answers, and the same rule — never kill on a pid
+    # number alone, never hide it either (A16):
+    #
+    #   no        it predates the baseline, so the number was recycled and the
+    #             process is a stranger beyond doubt: no line at all, for the
+    #             reason the triage above records none.
+    #   unproven  its start time cannot be read: `unverifiable`, A16's word.
+    #   yes       it is young enough to be ours but is in neither the group nor
+    #             the marker set, so nothing here proves it still is ours.
+    for p in $observed_pids; do
+        kill -0 "$p" 2>/dev/null || continue
+        case "$cand_set" in *" ${p} "*) continue ;; esac
+        own=$(proc_ownership "$p" "$threshold")
+        case "$own" in
+            no) continue ;;
+            unproven)
+                surv_proc=$((surv_proc + 1))
+                ledger_append "$file" survived proc "$p" "unverifiable" || true ;;
+            *)
+                surv_proc=$((surv_proc + 1))
+                ledger_append "$file" survived proc "$p" "ownership no longer provable" || true ;;
         esac
     done
 
@@ -1003,11 +1045,16 @@ survivor_rows() {
         [ -s "$file" ] || continue
         state=$(ledger_state "$file")
         [ -n "$state" ] || continue
-        local present=0 absent=0
+        local present=0 absent=0 answer
         while IFS="$FS" read -r phase kind value ts detail; do
             [ -n "$kind" ] || continue
             case "$phase" in observed|survived) ;; *) continue ;; esac
-            if resource_present "$kind" "$value" "$sock_ok" "$bound" "$worktrees" "$tmuxes"; then
+            resource_present "$kind" "$value" "$sock_ok" "$bound" "$worktrees" "$tmuxes"
+            answer=$?
+            # 2 is "nobody could look" and counts for neither side: it must not
+            # be absent evidence, because absent evidence settles the run.
+            [ "$answer" -ne 2 ] || continue
+            if [ "$answer" -eq 0 ]; then
                 present=$((present + 1))
                 [ "$rows" -lt "$SURVIVOR_ROW_CAP" ] || continue
                 rows=$((rows + 1))
@@ -1081,8 +1128,13 @@ resource_present() {
         port)
             # An unreadable socket table is not an empty one: with no reading,
             # the honest answer is not "gone", so the row is neither reported
-            # as present nor counted as absent evidence for `owned-clear`.
-            [ "$sock_ok" -eq 1 ] || return 1
+            # as present nor counted as absent evidence for `owned-clear`. That
+            # is what status 2 means here, and it is the reason this function has
+            # three answers rather than two — a `return 1` would make an
+            # unreadable table into positive evidence that the listener is gone,
+            # settle the run with `owned-clear`, and take its ports out of every
+            # later report for the life of the box.
+            [ "$sock_ok" -eq 1 ] || return 2
             printf '%s\n' "$bound" | grep -qxF "$value" ;;
         worktree)
             printf '%s\n' "$worktrees" | grep -qxF "$value" ;;

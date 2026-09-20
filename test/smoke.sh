@@ -2925,15 +2925,24 @@ rm -f /tmp/abx-smoke-spawned
 : > /tmp/abx-standin-spawn
 SH
 
-# A standing interactive session: a tmux session named `claude` WITH the session
-# directory that makes it the operator's, holding a listener of its own. This is
-# the process a run's sweep must never touch, and the session directory is what
-# takes it out of the candidate set.
+# A standing interactive session of this slot's OWN: a tmux session WITH the
+# session directory that makes it the operator's, holding a listener of its own.
+# This is the process a run's sweep must never touch, and the session directory
+# is what takes it out of the candidate set.
+#
+# Not named `claude`: that name and `~/.agent-box/sessions/claude` are the real
+# standing session's, which slot 8l owns and which sits EARLIER in this file, so
+# creating it here would collide with a live one (`tmux new-session` would fail as
+# a duplicate) and the teardown below would delete it under 8l's feet. The
+# exemption this proves is name-agnostic by design — `collect_tmux` exempts a
+# session by the presence of its session DIRECTORY, not by its name — so a name
+# of our own tests the mechanism rather than a literal.
+STANDING_SESSION=abx-standing-8j2
 STANDING_PORT=$((FORWARD_PORT + 500))
 guest bash -l > /dev/null 2>&1 <<SH
-mkdir -p "\$HOME/.agent-box/sessions/claude"
-chmod 700 "\$HOME/.agent-box/sessions/claude"
-tmux new-session -d -s claude -- python3 -m http.server ${STANDING_PORT} --bind 127.0.0.1
+mkdir -p "\$HOME/.agent-box/sessions/${STANDING_SESSION}"
+chmod 700 "\$HOME/.agent-box/sessions/${STANDING_SESSION}"
+tmux new-session -d -s ${STANDING_SESSION} -- python3 -m http.server ${STANDING_PORT} --bind 127.0.0.1
 SH
 
 # An EARLIER run whose ledger holds the fake token inside a `detail`, and a tmux
@@ -3034,8 +3043,16 @@ done
 [ -d "\$HOME/abx-smoke-wt" ] && printf 'WT=still-there\n'
 git -C /work worktree list --porcelain | grep -q 'abx-smoke-wt' && printf 'WT_REGISTERED=yes\n'
 tmux has-session -t '=abx-smoke-srv' 2>/dev/null && printf 'TMUX=still-there\n'
-tmux has-session -t '=claude' 2>/dev/null && printf 'STANDING_TMUX=yes\n'
-pgrep -f 'run-ledger.sh observe' >/dev/null 2>&1 && printf 'SAMPLER=still-there\n'
+tmux has-session -t '=${STANDING_SESSION}' 2>/dev/null && printf 'STANDING_TMUX=yes\n'
+# The sampler is a SUBSHELL of agent-run.sh — \`( ... ) &\` — so its own
+# /proc/PID/cmdline is agent-run.sh's, and it spends all but a fraction of each
+# 15-second pass inside \`sleep\`. Probing for 'run-ledger.sh observe' therefore
+# looks for a string that exists for a few milliseconds per pass and reports a
+# clean box for a sampler that will append to a finished run's ledger for four
+# hours. What is asked for instead is any live process still wearing this run's
+# own command line, which a leaked sampler does for as long as it lives.
+SAMPLER_LEFT=\$(pgrep -f "agent-run.sh --runid ${J2_RUNID}" 2>/dev/null | tr '\n' ' ')
+[ -z "\$SAMPLER_LEFT" ] || printf 'SAMPLER=still-there:%s\n' "\$SAMPLER_LEFT"
 exit 0
 SH
 cat "$J2_AFTER"
@@ -3085,10 +3102,10 @@ if grep -qx 'SWEPT=1' "$J2_AFTER"; then
 else
     bad "the ledger does not carry exactly one swept line"
 fi
-if grep -qx 'SAMPLER=still-there' "$J2_AFTER"; then
-    bad "the sampler outlived the run"
+if grep -q '^SAMPLER=still-there' "$J2_AFTER"; then
+    bad "a process of the run's own script outlived it: the sampler was not stopped"
 else
-    ok "no sampler outlived the run"
+    ok "no sampler outlived the run: no process still carries the run's command line"
 fi
 if grep -qx "BOUND=${STANDING_PORT}" "$J2_AFTER" && grep -qx 'STANDING_TMUX=yes' "$J2_AFTER"; then
     ok "a process the standing session started survived the run's sweep, and so did its session"
@@ -3132,14 +3149,14 @@ fi
 printf -- '\n--- 8j2 cleans up after itself ---\n'
 guest bash -l > /dev/null 2>&1 <<SH
 rm -f /tmp/abx-standin-spawn /tmp/abx-smoke-spawned
-tmux kill-session -t '=claude' 2>/dev/null || true
+tmux kill-session -t '=${STANDING_SESSION}' 2>/dev/null || true
 tmux kill-session -t '=abx-earlier-srv' 2>/dev/null || true
 tmux kill-session -t '=abx-smoke-srv' 2>/dev/null || true
 pkill -f "http.server ${STANDING_PORT}" 2>/dev/null || true
 pkill -f "http.server ${GROUP_PORT:-0}" 2>/dev/null || true
 pkill -f "http.server ${ESCAPEE_PORT:-0}" 2>/dev/null || true
 git -C /work worktree remove --force "\$HOME/abx-smoke-wt" 2>/dev/null || true
-rm -rf "\$HOME/.agent-box/sessions/claude" "\$HOME/.agent-box/runs/${EARLIER_RUN}" "\$HOME/abx-smoke-wt"
+rm -rf "\$HOME/.agent-box/sessions/${STANDING_SESSION}" "\$HOME/.agent-box/runs/${EARLIER_RUN}" "\$HOME/abx-smoke-wt"
 cp /tmp/abx-claude-fail "\$HOME/.local/bin/claude"
 chmod +x "\$HOME/.local/bin/claude"
 exit 0
