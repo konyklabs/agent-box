@@ -70,6 +70,18 @@ warn() { printf '[agent-box toolchain] WARN: %s\n' "$*" >&2; }
 TIMEOUT_CMD=$(command -v timeout 2>/dev/null) || TIMEOUT_CMD=""
 PROBE_SECS=15
 
+# semgrep phones home unless told not to, and this script runs behind the box's
+# default-deny firewall: the call is blackholed, not refused, so `semgrep
+# --version` hangs until the probe's timeout kills it and reads as "not at its
+# pin". Measured in a real guest, cloud-init's environment (PATH and HOME, no
+# profile): without these two the probe exits 124 with no output; with them it
+# prints 1.177.0 and exits 0. That is why semgrep, alone of twelve tools,
+# reinstalled itself on every boot. The box's login shells get these from
+# /etc/profile.d and /etc/environment, neither of which a provisioning shell
+# reads, so the script sets them for itself.
+export SEMGREP_SEND_METRICS=off
+export SEMGREP_ENABLE_VERSION_CHECK=0
+
 bounded() {
     local secs="$1"; shift
     if [ -n "$TIMEOUT_CMD" ]; then
@@ -264,9 +276,18 @@ write_marker() {
 # named and treated as "not at its pin", which is what it is.
 answers_with() {
     local want="$1" bin="$2" out rc
-    out=$(bounded "$PROBE_SECS" "$bin" --version 2>&1); rc=$?
+    # The probe runs with a known PATH, because one of these tools needs one:
+    # semgrep shells out to `uname -s` and dies without it ("Fatal error:
+    # exception Failure: run ['uname' '-s']: No such file or directory", exit 2),
+    # measured in a real guest. Read as "not at its pin", that made semgrep the
+    # one tool that reinstalled itself on every boot while the other eleven were
+    # skipped — the idempotency this function decides. Nothing else about the
+    # environment is changed: the metrics and version-check switches this script
+    # sets for semgrep still come from the caller.
+    local probe_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    out=$(PATH="${PATH:-}:${probe_path}" bounded "$PROBE_SECS" "$bin" --version 2>&1); rc=$?
     if [ "$rc" -ne 0 ]; then
-        out=$(bounded "$PROBE_SECS" "$bin" -version 2>&1); rc=$?
+        out=$(PATH="${PATH:-}:${probe_path}" bounded "$PROBE_SECS" "$bin" -version 2>&1); rc=$?
     fi
     if [ "$rc" -eq 124 ]; then
         warn "${bin}: the version probe did not answer within ${PROBE_SECS}s"
